@@ -8,6 +8,7 @@ const sharp = require('sharp');
 const {
   replaceWeightRegions,
   calculateFontSize,
+  sampleTextStyle,
 } = require('../../src/services/imageEditor.service');
 
 describe('imageEditor.service', () => {
@@ -18,6 +19,47 @@ describe('imageEditor.service', () => {
 
     it('keeps height-based sizing for a normal proportional OCR box', () => {
       expect(calculateFontSize(144, 34, '900.00')).toBeCloseTo(29.24, 1);
+    });
+  });
+
+  describe('sampleTextStyle', () => {
+    it('preserves different source ink colors and derives usable typography', async () => {
+      const regularSvg = Buffer.from(
+        '<svg width="180" height="50" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="180" height="50" fill="rgb(205,210,215)" />' +
+          '<text x="8" y="35" font-family="Arial" font-size="26" font-weight="400" ' +
+          'fill="rgb(82,87,92)">450.32</text></svg>'
+      );
+      const boldSvg = Buffer.from(
+        '<svg width="180" height="50" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="180" height="50" fill="white" />' +
+          '<text x="8" y="35" font-family="Arial" font-size="26" font-weight="700" ' +
+          'fill="rgb(12,15,18)">268.78</text></svg>'
+      );
+      const regularImage = sharp(regularSvg);
+      const boldImage = sharp(boldSvg);
+      const regularMeta = await regularImage.metadata();
+      const boldMeta = await boldImage.metadata();
+
+      const regular = await sampleTextStyle(
+        regularImage,
+        regularMeta,
+        { x0: 8, y0: 10, x1: 95, y1: 39 },
+        '450.32'
+      );
+      const bold = await sampleTextStyle(
+        boldImage,
+        boldMeta,
+        { x0: 8, y0: 10, x1: 95, y1: 39 },
+        '268.78'
+      );
+
+      const regularRed = Number(regular.fill.match(/\d+/)[0]);
+      const boldRed = Number(bold.fill.match(/\d+/)[0]);
+      expect(regularRed).toBeGreaterThan(boldRed + 40);
+      expect(regular.fontWeight).toBeLessThanOrEqual(bold.fontWeight);
+      expect(regular.fontSize).toBeGreaterThan(8);
+      expect(bold.fontSize).toBeGreaterThan(8);
     });
   });
 
@@ -52,6 +94,7 @@ describe('imageEditor.service', () => {
         {
           bbox: { x0: 18, y0: 22, x1: 58, y1: 37 },
           replacementText: '300.00',
+          originalText: '268.78',
         },
       ]);
       const after = await sharp(edited).raw().toBuffer({ resolveWithObject: true });
@@ -68,5 +111,42 @@ describe('imageEditor.service', () => {
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it('clears old glyph pixels beyond a truncated OCR style box', async () => {
+    const input = await sharp({
+      create: {
+        width: 80,
+        height: 45,
+        channels: 3,
+        background: { r: 245, g: 245, b: 245 },
+      },
+    })
+      .composite([
+        {
+          input: Buffer.from(
+            '<svg width="80" height="45" xmlns="http://www.w3.org/2000/svg">' +
+              '<rect x="18" y="20" width="32" height="8" fill="rgb(40,40,40)" />' +
+              '</svg>'
+          ),
+        },
+      ])
+      .png()
+      .toBuffer();
+
+    const edited = await replaceWeightRegions(input, [
+      {
+        bbox: { x0: 18, y0: 20, x1: 32, y1: 28 },
+        clearBbox: { x0: 17, y0: 19, x1: 52, y1: 30 },
+        originalText: '57',
+        replacementText: '80',
+      },
+    ]);
+    const { data, info } = await sharp(edited).raw().toBuffer({ resolveWithObject: true });
+    const offset = (24 * info.width + 48) * info.channels;
+
+    expect(data[offset]).toBeGreaterThan(230);
+    expect(data[offset + 1]).toBeGreaterThan(230);
+    expect(data[offset + 2]).toBeGreaterThan(230);
   });
 });

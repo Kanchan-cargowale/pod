@@ -3,29 +3,22 @@
 const PORTRAIT_ROTATION_RATIO = 1.1;
 
 /**
- * Returns a user-facing issue when a landscape courier label appears to be
- * stored sideways after any EXIF auto-orientation has already been applied.
+ * Portrait dimensions alone do not prove that the printed content is
+ * sideways. They only tell the processor that quarter-turn OCR fallbacks may
+ * be useful if the as-uploaded orientation cannot locate a weight value.
  *
  * @param {{width?: number, height?: number, orientation?: number}} meta
- * @returns {{code:string, reason:string, orientation:number|null}|null}
+ * @returns {boolean}
  */
-function findRotationIssue(meta = {}) {
+function shouldTryQuarterTurns(meta = {}) {
   const width = Number(meta.width);
   const height = Number(meta.height);
-  const looksSideways =
+  return (
     Number.isFinite(width) &&
     Number.isFinite(height) &&
     width > 0 &&
-    height > width * PORTRAIT_ROTATION_RATIO;
-
-  if (!looksSideways) return null;
-
-  return {
-    code: 'image_rotation',
-    orientation: null,
-    reason:
-      'Fix image rotation before uploading: rotate the image so the label text reads left-to-right, save it, and upload it again. No value was changed.',
-  };
+    height > width * PORTRAIT_ROTATION_RATIO
+  );
 }
 
-module.exports = { findRotationIssue };
+module.exports = { shouldTryQuarterTurns };

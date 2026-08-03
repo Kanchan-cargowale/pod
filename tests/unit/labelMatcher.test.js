@@ -6,6 +6,7 @@ const {
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
+  isWeightAnchorText,
 } = require('../../src/services/labelMatcher.service');
 
 // This word list is a trimmed, real subset of what Tesseract.js actually
@@ -95,6 +96,25 @@ describe('labelMatcher.service', () => {
       expect(headerAnchors[0].words.map((word) => word.text)).toEqual(['ACTUAL']);
       expect(headerAnchors[1].words.map((word) => word.text)).toEqual(['CHARGED', 'WEIGHT']);
     });
+
+    it('accepts common damaged and split OCR readings of WEIGHT', () => {
+      expect(isWeightAnchorText('WE1GHT(kg)')).toBe(true);
+      expect(isWeightAnchorText('WElGHT')).toBe(true);
+      expect(isWeightAnchorText('WEGHT')).toBe(true);
+
+      const splitWords = [
+        { text: 'WEI', confidence: 71, bbox: { x0: 400, y0: 200, x1: 450, y1: 225 } },
+        { text: 'GHT', confidence: 68, bbox: { x0: 455, y0: 201, x1: 510, y1: 225 } },
+      ];
+      const anchors = findWeightAnchors(splitWords);
+      expect(anchors).toHaveLength(1);
+      expect(anchors[0].words.map((word) => word.text)).toEqual(['WEI', 'GHT']);
+    });
+
+    it('does not mistake FREIGHT PAYMENT for a weight column', () => {
+      expect(isWeightAnchorText('Freight')).toBe(false);
+      expect(isWeightAnchorText('Frelght')).toBe(false);
+    });
   });
 
   describe('findWeightValueRegions', () => {
@@ -126,6 +146,57 @@ describe('labelMatcher.service', () => {
         horizontalTolerancePx: 100,
       });
       expect(regions).toHaveLength(0);
+    });
+
+    it('keeps adjacent ACTUAL and CHARGED values in their own columns', () => {
+      const anchors = [
+        {
+          bbox: { x0: 300, y0: 258, x1: 360, y1: 280, height: 22 },
+          words: [{ text: 'ACTUAL', bbox: { x0: 300, y0: 258, x1: 360, y1: 280 } }],
+        },
+        {
+          bbox: { x0: 404, y0: 249, x1: 462, y1: 272, height: 23 },
+          words: [{ text: 'CHARGED', bbox: { x0: 404, y0: 249, x1: 462, y1: 272 } }],
+        },
+      ];
+      const words = [
+        { text: '117.5', confidence: 94, bbox: { x0: 300, y0: 292, x1: 328, y1: 309 } },
+        { text: '152.0', confidence: 96, bbox: { x0: 404, y0: 286, x1: 430, y1: 304 } },
+      ];
+      const regions = findWeightValueRegions(words, anchors, {
+        imageHeight: 860,
+        verticalWindowRatio: 0.18,
+        horizontalTolerancePx: 120,
+      });
+
+      expect(
+        regions
+          .map((region) => ({ text: region.originalText, x0: region.bbox.x0 }))
+          .sort((a, b) => a.x0 - b.x0)
+      ).toEqual([
+        { text: '117.5', x0: 300 },
+        { text: '152.0', x0: 404 },
+      ]);
+    });
+
+    it('uses a damaged decimal-shaped OCR token directly below a confirmed header', () => {
+      const anchors = [
+        {
+          bbox: { x0: 247, y0: 170, x1: 277, y1: 179, height: 9 },
+          words: [{ text: 'CHARGED', bbox: { x0: 247, y0: 170, x1: 277, y1: 179 } }],
+        },
+      ];
+      const words = [
+        { text: '»N.n', confidence: 0, bbox: { x0: 246, y0: 193, x1: 263, y1: 201 } },
+      ];
+      const regions = findWeightValueRegions(words, anchors, {
+        imageHeight: 1024,
+        verticalWindowRatio: 0.18,
+        horizontalTolerancePx: 120,
+      });
+
+      expect(regions).toHaveLength(1);
+      expect(regions[0].originalText).toBe('»N.n');
     });
   });
 

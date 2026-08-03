@@ -5,6 +5,11 @@ const sharp = require('sharp');
 const FONT_SIZE_RATIO = 0.86; // font-size relative to bbox height
 const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advance
 const TEXT_LEFT_PADDING_RATIO = 0.08; // inset replacement text inside the cleared value area
+const DEFAULT_TEXT_STYLE = {
+  fontFamily: 'Arial, Helvetica, sans-serif',
+  fontWeight: 400,
+  fill: 'rgb(0,0,0)',
+};
 
 function escapeXml(str) {
   return String(str)
@@ -53,8 +58,178 @@ async function sampleBackgroundColor(image, meta, bbox) {
   }
 }
 
+async function sampleLocalPaperColor(image, meta, bbox) {
+  const boxWidth = bbox.x1 - bbox.x0;
+  const boxHeight = bbox.y1 - bbox.y0;
+  const paddingX = Math.max(4, Math.round(boxWidth * 0.35));
+  const paddingY = Math.max(3, Math.round(boxHeight));
+  const left = Math.max(0, Math.floor(bbox.x0 - paddingX));
+  const top = Math.max(0, Math.floor(bbox.y0 - paddingY));
+  const right = Math.min(meta.width, Math.ceil(bbox.x1 + paddingX));
+  const bottom = Math.min(meta.height, Math.ceil(bbox.y1 + paddingY));
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 0 || height <= 0) return { r: 255, g: 255, b: 255 };
+
+  try {
+    const { data, info } = await image
+      .clone()
+      .extract({ left, top, width, height })
+      .removeAlpha()
+      .toColourspace('srgb')
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const pixels = [];
+    for (let i = 0; i < data.length; i += info.channels) {
+      const pixel = { r: data[i], g: data[i + 1], b: data[i + 2] };
+      pixel.luma = luminance(pixel);
+      pixels.push(pixel);
+    }
+
+    // Keep the lighter half of the neighbourhood so glyphs and table rules
+    // cannot darken the fill, while preserving the local paper/shadow color.
+    const paperCutoff = percentile(pixels.map((pixel) => pixel.luma), 0.5);
+    const paperPixels = pixels.filter((pixel) => pixel.luma >= paperCutoff);
+    return {
+      r: medianChannel(paperPixels, 'r'),
+      g: medianChannel(paperPixels, 'g'),
+      b: medianChannel(paperPixels, 'b'),
+    };
+  } catch (err) {
+    return sampleBackgroundColor(image, meta, bbox);
+  }
+}
+
 function rgbToCss({ r, g, b }) {
   return `rgb(${r},${g},${b})`;
+}
+
+function luminance({ r, g, b }) {
+  return r * 0.2126 + g * 0.7152 + b * 0.0722;
+}
+
+function percentile(values, ratio) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))];
+}
+
+function medianChannel(pixels, channel) {
+  return Math.round(percentile(pixels.map((pixel) => pixel[channel]), 0.5));
+}
+
+function estimateFontFamily(inkWidth, inkHeight, originalText) {
+  const characterCount = Math.max(1, String(originalText || '').length);
+  const characterAspect = inkWidth / Math.max(1, inkHeight * characterCount);
+
+  if (characterAspect < 0.42) return 'Arial Narrow, Arial, sans-serif';
+  if (characterAspect > 0.82) return 'Courier New, monospace';
+  return DEFAULT_TEXT_STYLE.fontFamily;
+}
+
+function numericAdvanceUnits(text, fontFamily) {
+  const isNarrow = fontFamily.startsWith('Arial Narrow');
+  const isMonospace = fontFamily.startsWith('Courier New');
+  if (isMonospace) return Math.max(1, String(text).length * 0.6);
+
+  const digitWidth = isNarrow ? 0.445 : 0.556;
+  const punctuationWidth = isNarrow ? 0.225 : 0.278;
+  return Math.max(
+    digitWidth,
+    [...String(text)].reduce(
+      (total, character) => total + (/\d/.test(character) ? digitWidth : punctuationWidth),
+      0
+    )
+  );
+}
+
+/**
+ * Recovers the appearance of the original numeric word from its pixels.
+ * OCR boxes are often much taller than the glyphs, so the ink itself is a
+ * more reliable source for font size, darkness, width and stroke weight.
+ */
+async function sampleTextStyle(image, meta, bbox, originalText) {
+  const left = Math.max(0, Math.floor(bbox.x0));
+  const top = Math.max(0, Math.floor(bbox.y0));
+  const width = Math.min(meta.width - left, Math.max(1, Math.ceil(bbox.x1) - left));
+  const height = Math.min(meta.height - top, Math.max(1, Math.ceil(bbox.y1) - top));
+
+  if (width <= 0 || height <= 0) {
+    return { ...DEFAULT_TEXT_STYLE, fontSize: calculateFontSize(width, height, originalText) };
+  }
+
+  try {
+    const { data, info } = await image
+      .clone()
+      .extract({ left, top, width, height })
+      .removeAlpha()
+      .toColourspace('srgb')
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const pixels = [];
+    for (let y = 0; y < info.height; y += 1) {
+      for (let x = 0; x < info.width; x += 1) {
+        const offset = (y * info.width + x) * info.channels;
+        const pixel = { x, y, r: data[offset], g: data[offset + 1], b: data[offset + 2] };
+        pixel.luma = luminance(pixel);
+        pixels.push(pixel);
+      }
+    }
+
+    // The lightest part of the word box represents local paper even when a
+    // photograph has a shadow or the paper itself is gray.
+    const localBackground = percentile(pixels.map((pixel) => pixel.luma), 0.82);
+    const darkestInk = percentile(pixels.map((pixel) => pixel.luma), 0.05);
+    const contrastRange = Math.max(0, localBackground - darkestInk);
+    const inkThreshold = Math.max(10, contrastRange * 0.24);
+    const inkPixels = pixels.filter(
+      (pixel) => localBackground - pixel.luma >= inkThreshold
+    );
+
+    if (inkPixels.length < 3 || contrastRange < 10) {
+      return {
+        ...DEFAULT_TEXT_STYLE,
+        fontSize: calculateFontSize(width, height, originalText),
+      };
+    }
+
+    const xs = inkPixels.map((pixel) => pixel.x);
+    const ys = inkPixels.map((pixel) => pixel.y);
+    const inkWidth = Math.max(...xs) - Math.min(...xs) + 1;
+    const inkHeight = Math.max(...ys) - Math.min(...ys) + 1;
+    const fontFamily = estimateFontFamily(inkWidth, inkHeight, originalText);
+
+    // Use only solid stroke pixels for the fill color. Including anti-aliased
+    // edge pixels would make the replacement lighter than the source print.
+    const coreThreshold = Math.max(inkThreshold, contrastRange * 0.62);
+    const corePixels = inkPixels.filter(
+      (pixel) => localBackground - pixel.luma >= coreThreshold
+    );
+    const colorPixels = corePixels.length >= 3 ? corePixels : inkPixels;
+    const fill = rgbToCss({
+      r: medianChannel(colorPixels, 'r'),
+      g: medianChannel(colorPixels, 'g'),
+      b: medianChannel(colorPixels, 'b'),
+    });
+
+    const inkArea = Math.max(1, inkWidth * inkHeight);
+    const strokeDensity = inkPixels.length / inkArea;
+    // Camera blur spreads bold strokes over a larger area but lowers their
+    // darkest-pixel density, so scanned bold text needs a lower cutoff than
+    // clean screen-rendered text.
+    const fontWeight = strokeDensity >= 0.25 ? 700 : 400;
+    const widthBasedSize = inkWidth / numericAdvanceUnits(originalText, fontFamily);
+    const heightBasedSize = inkHeight / 0.72;
+    const fontSize = Math.max(8, Math.min(widthBasedSize, heightBasedSize));
+
+    return { fontFamily, fontWeight, fill, fontSize };
+  } catch (err) {
+    return {
+      ...DEFAULT_TEXT_STYLE,
+      fontSize: calculateFontSize(width, height, originalText),
+    };
+  }
 }
 
 /**
@@ -75,7 +250,7 @@ function calculateFontSize(width, height, replacementText) {
  * preserving every other pixel. Returns the edited image as a Buffer.
  *
  * @param {string|Buffer} filePath source image path or normalized image buffer
- * @param {Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, replacementText:string}>} replacements
+ * @param {Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, clearBbox?:{x0:number,y0:number,x1:number,y1:number}, replacementText:string}>} replacements
  */
 async function replaceWeightRegions(filePath, replacements) {
   const image = sharp(filePath);
@@ -84,7 +259,15 @@ async function replaceWeightRegions(filePath, replacements) {
   const rects = [];
   const texts = [];
 
-  for (const { bbox, replacementText } of replacements) {
+  for (const {
+    bbox,
+    clearBbox = bbox,
+    replacementText,
+    originalText = replacementText,
+    styleReferenceText = originalText,
+    fontScale = 1,
+    textLeftPaddingRatio = TEXT_LEFT_PADDING_RATIO,
+  } of replacements) {
     const width = bbox.x1 - bbox.x0;
     const height = bbox.y1 - bbox.y0;
     if (width <= 0 || height <= 0) continue;
@@ -93,15 +276,18 @@ async function replaceWeightRegions(filePath, replacements) {
     // table borders, especially the vertical line immediately left of a
     // weight value. Integer edges plus crispEdges prevent SVG antialiasing
     // from leaking the background fill into neighbouring pixels.
-    const rectX = Math.max(0, Math.floor(bbox.x0));
-    const rectY = Math.max(0, Math.floor(bbox.y0));
-    const rectRight = Math.min(meta.width, Math.ceil(bbox.x1));
-    const rectBottom = Math.min(meta.height, Math.ceil(bbox.y1));
+    const rectX = Math.max(0, Math.floor(clearBbox.x0));
+    const rectY = Math.max(0, Math.floor(clearBbox.y0));
+    const rectRight = Math.min(meta.width, Math.ceil(clearBbox.x1));
+    const rectBottom = Math.min(meta.height, Math.ceil(clearBbox.y1));
     const rectW = rectRight - rectX;
     const rectH = rectBottom - rectY;
 
     // eslint-disable-next-line no-await-in-loop
-    const bg = await sampleBackgroundColor(image, meta, bbox);
+    const usesExpandedClearing = clearBbox !== bbox;
+    const bg = usesExpandedClearing
+      ? await sampleLocalPaperColor(image, meta, clearBbox)
+      : await sampleBackgroundColor(image, meta, bbox);
     const fill = rgbToCss(bg);
 
     rects.push(
@@ -109,13 +295,18 @@ async function replaceWeightRegions(filePath, replacements) {
         `fill="${fill}" shape-rendering="crispEdges" />`
     );
 
-    const fontSize = calculateFontSize(width, height, replacementText);
+    // Sample before adding the clearing rectangle so the original glyphs are
+    // still available for per-image style matching.
+    // eslint-disable-next-line no-await-in-loop
+    const textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
     const baselineY = bbox.y1 - height * 0.16;
-    const textX = bbox.x0 + width * TEXT_LEFT_PADDING_RATIO;
+    const textX = bbox.x0 + width * textLeftPaddingRatio;
+    const renderedFontSize = textStyle.fontSize * fontScale;
 
     texts.push(
-      `<text x="${textX}" y="${baselineY}" font-family="Arial, Helvetica, sans-serif" ` +
-        `font-size="${fontSize.toFixed(1)}" font-weight="600" fill="#000000">` +
+      `<text x="${textX}" y="${baselineY}" font-family="${textStyle.fontFamily}" ` +
+        `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
+        `fill="${textStyle.fill}">` +
         `${escapeXml(replacementText)}</text>`
     );
   }
@@ -137,4 +328,10 @@ async function replaceWeightRegions(filePath, replacements) {
     .toBuffer();
 }
 
-module.exports = { replaceWeightRegions, sampleBackgroundColor, calculateFontSize };
+module.exports = {
+  replaceWeightRegions,
+  sampleBackgroundColor,
+  sampleLocalPaperColor,
+  sampleTextStyle,
+  calculateFontSize,
+};

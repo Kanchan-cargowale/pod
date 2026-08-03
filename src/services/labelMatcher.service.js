@@ -8,6 +8,48 @@ const {
 } = require('../constants/regex');
 const { levenshtein } = require('../utils/levenshtein');
 
+function normalizeHeaderText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[|1l]/g, 'i')
+    .replace(/[^a-z]/g, '');
+}
+
+function containsFuzzyWord(text, target, maxDistance = 1) {
+  const normalized = normalizeHeaderText(text);
+  if (!normalized) return false;
+  if (normalized.includes(target)) return true;
+
+  const minLength = Math.max(1, target.length - maxDistance);
+  const maxLength = Math.min(normalized.length, target.length + maxDistance);
+  for (let length = minLength; length <= maxLength; length += 1) {
+    for (let start = 0; start <= normalized.length - length; start += 1) {
+      if (levenshtein(normalized.slice(start, start + length), target) <= maxDistance) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isWeightAnchorText(text) {
+  const normalized = normalizeHeaderText(text);
+  // "Freight Payment" is common immediately above the real weight table and
+  // differs from "weight" by only one leading character.
+  if (normalized.includes('freight')) return false;
+  return WEIGHT_ANCHOR.test(String(text || '')) || containsFuzzyWord(text, 'weight');
+}
+
+function isWeightQualifierText(text) {
+  if (WEIGHT_COLUMN_QUALIFIER.test(String(text || '').trim())) return true;
+  const normalized = normalizeHeaderText(text);
+  return ['actual', 'charged', 'chargeable'].some(
+    (target) =>
+      Math.abs(normalized.length - target.length) <= 1 &&
+      levenshtein(normalized, target) <= 1
+  );
+}
+
 /**
  * @typedef {Object} OcrWord
  * @property {string} text
@@ -179,9 +221,41 @@ function findShipmentIdInFilename(filename, idSet) {
  * @param {OcrWord[]} words
  */
 function findWeightAnchors(words) {
-  const anchorWords = words.filter(
-    (w) => WEIGHT_ANCHOR.test(w.text) || WEIGHT_COLUMN_QUALIFIER.test(w.text.trim())
+  const anchorWordSet = new Set(
+    words.filter((word) => isWeightAnchorText(word.text) || isWeightQualifierText(word.text))
   );
+
+  // Tesseract can split a damaged header into tokens such as "WEI" + "GHT".
+  // Rejoin only close, same-line neighbours so unrelated page words cannot
+  // accidentally become a weight header.
+  for (let i = 0; i < words.length; i += 1) {
+    for (let j = i + 1; j < words.length; j += 1) {
+      const first = words[i];
+      const second = words[j];
+      const firstHeight = first.bbox.y1 - first.bbox.y0;
+      const secondHeight = second.bbox.y1 - second.bbox.y0;
+      const maxHeight = Math.max(firstHeight, secondHeight);
+      const firstCenterY = (first.bbox.y0 + first.bbox.y1) / 2;
+      const secondCenterY = (second.bbox.y0 + second.bbox.y1) / 2;
+      if (Math.abs(firstCenterY - secondCenterY) > maxHeight * 0.7) continue;
+
+      const left = first.bbox.x0 <= second.bbox.x0 ? first : second;
+      const right = left === first ? second : first;
+      const gap = right.bbox.x0 - left.bbox.x1;
+      if (gap < -maxHeight * 0.5 || gap > maxHeight * 1.2) continue;
+
+      const combinedText = normalizeHeaderText(`${left.text}${right.text}`);
+      const isSplitWeight =
+        Math.abs(combinedText.length - 'weight'.length) <= 1 &&
+        levenshtein(combinedText, 'weight') <= 1;
+      if (isSplitWeight) {
+        anchorWordSet.add(left);
+        anchorWordSet.add(right);
+      }
+    }
+  }
+
+  const anchorWords = [...anchorWordSet];
   if (!anchorWords.length) return [];
 
   // Sort by reading order (top-to-bottom, then left-to-right).
@@ -246,19 +320,42 @@ function findWeightValueRegions(words, anchors, ctx) {
   const horizontalTolerancePx = ctx.horizontalTolerancePx ?? 120;
   const maxVerticalGap = ctx.imageHeight * verticalWindowRatio;
 
-  const numericWords = words.filter((w) => NUMERIC_TOKEN.test(w.text.trim()));
+  const numericWords = words
+    .map((word) => {
+      const text = word.text.trim();
+      if (NUMERIC_TOKEN.test(text)) return { word, strict: true };
+
+      // At very low resolution Tesseract can read a value such as 80.09 as
+      // "N.n". A short decimal-shaped token is still usable geometrically
+      // when it sits directly below a confirmed weight header.
+      const compact = text.replace(/\s/g, '');
+      const letters = (compact.match(/[a-z]/gi) || []).length;
+      const looksLikeDamagedDecimal =
+        compact.length >= 2 &&
+        compact.length <= 10 &&
+        /[.,]/.test(compact) &&
+        letters <= 3;
+      return looksLikeDamagedDecimal ? { word, strict: false } : null;
+    })
+    .filter(Boolean);
 
   const regions = [];
   const claimed = new Set();
 
   for (const anchor of anchors) {
-    const minX = anchor.bbox.x0 - horizontalTolerancePx;
-    const maxX = anchor.bbox.x1 + horizontalTolerancePx;
+    const anchorWidth = anchor.bbox.x1 - anchor.bbox.x0;
+    const effectiveTolerance = Math.min(
+      horizontalTolerancePx,
+      Math.max(12, anchorWidth * 0.35)
+    );
+    const minX = anchor.bbox.x0 - effectiveTolerance;
+    const maxX = anchor.bbox.x1 + effectiveTolerance;
 
     let bestCandidate = null;
     let bestGap = Infinity;
 
-    for (const word of numericWords) {
+    for (const candidate of numericWords) {
+      const { word } = candidate;
       if (claimed.has(word)) continue;
       const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
       if (centerX < minX || centerX > maxX) continue;
@@ -266,23 +363,39 @@ function findWeightValueRegions(words, anchors, ctx) {
       const gap = word.bbox.y0 - anchor.bbox.y1;
       if (gap < 0 || gap > maxVerticalGap) continue;
 
-      if (gap < bestGap) {
+      if (gap < bestGap || (gap === bestGap && candidate.strict && !bestCandidate?.strict)) {
         bestGap = gap;
-        bestCandidate = word;
+        bestCandidate = candidate;
       }
     }
 
     if (bestCandidate) {
-      claimed.add(bestCandidate);
+      const { word } = bestCandidate;
+      claimed.add(word);
       regions.push({
-        bbox: { ...bestCandidate.bbox },
-        originalText: bestCandidate.text.trim(),
+        bbox: { ...word.bbox },
+        originalText: word.text.trim(),
         anchorText: anchor.words.map((w) => w.text).join(' '),
       });
     }
   }
 
-  return regions;
+  if (regions.length <= 1) return regions;
+
+  // Ignore isolated numeric text under later prose such as "final charged
+  // weight can vary". Genuine ACTUAL/CHARGED values form one horizontal row.
+  const rowTolerance = Math.max(20, ctx.imageHeight * 0.04);
+  const sortedRegions = [...regions].sort((a, b) => a.bbox.y0 - b.bbox.y0);
+  const rowGroups = [];
+  for (const region of sortedRegions) {
+    const group = rowGroups.find(
+      (candidate) => Math.abs(candidate[0].bbox.y0 - region.bbox.y0) <= rowTolerance
+    );
+    if (group) group.push(region);
+    else rowGroups.push([region]);
+  }
+  rowGroups.sort((a, b) => b.length - a.length || a[0].bbox.y0 - b[0].bbox.y0);
+  return rowGroups[0];
 }
 
 /**
@@ -306,4 +419,6 @@ module.exports = {
   findWeightValueRegions,
   formatReplacementWeight,
   buildMergedNumericCandidates,
+  isWeightAnchorText,
+  isWeightQualifierText,
 };

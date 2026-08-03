@@ -11,12 +11,6 @@
   const submitBtn = document.getElementById('submit-btn');
   const formError = document.getElementById('form-error');
   const mappingWarnings = document.getElementById('mapping-warnings');
-  const healthPill = document.getElementById('health-pill');
-  const healthText = document.getElementById('health-text');
-  const checkImages = document.getElementById('check-images');
-  const checkMapping = document.getElementById('check-mapping');
-  const checkApi = document.getElementById('check-api');
-
   const workspaceTitle = document.getElementById('workspace-title');
   const emptyState = document.getElementById('empty-state');
   const progressFill = document.getElementById('progress-bar-fill');
@@ -26,8 +20,8 @@
   const statProcessed = document.getElementById('stat-processed');
   const statMatched = document.getElementById('stat-matched');
   const statUnmatched = document.getElementById('stat-unmatched');
-  const statElapsed = document.getElementById('stat-elapsed');
-  const statStatus = document.getElementById('stat-status');
+  const activityIndicator = document.getElementById('activity-indicator');
+  const activityText = document.getElementById('activity-text');
   const resultCount = document.getElementById('result-count');
   const resultsGrid = document.getElementById('results-grid');
   const downloadLink = document.getElementById('download-link');
@@ -42,9 +36,7 @@
     apiOnline: false,
     currentFilter: 'all',
     currentJobId: null,
-    startedAt: null,
     pollTimer: null,
-    elapsedTimer: null,
     lastResults: [],
     isDownloading: false,
   };
@@ -146,16 +138,11 @@
       state.apiOnline = false;
     }
 
-    healthPill.classList.toggle('is-online', state.apiOnline);
-    healthPill.classList.toggle('is-offline', !state.apiOnline);
-    healthText.textContent = state.apiOnline ? 'API online' : 'API offline';
-    checkApi.classList.toggle('is-ready', state.apiOnline);
   }
 
   function updateImageSelection() {
     const files = [...imagesInput.files];
     imagesCount.textContent = files.length === 1 ? '1 selected' : `${files.length} selected`;
-    checkImages.classList.toggle('is-ready', files.length > 0);
     imagesList.innerHTML = '';
 
     const visibleFiles = files.slice(0, 5);
@@ -180,9 +167,8 @@
 
   function updateMappingSelection() {
     const file = mappingInput.files[0];
-    mappingName.textContent = file ? file.name : 'Drop mapping workbook';
+    mappingName.textContent = file ? file.name : 'Choose Excel workbook';
     mappingState.textContent = file ? formatBytes(file.size) : 'Required';
-    checkMapping.classList.toggle('is-ready', Boolean(file));
   }
 
   async function submitBatch(event) {
@@ -206,6 +192,10 @@
 
     setSubmitting(true, 'Uploading');
     resetJobView();
+    emptyState.hidden = true;
+    workspaceTitle.textContent = 'Uploading files';
+    jobIdLabel.textContent = 'Sending your batch';
+    setActivityState('uploading');
 
     try {
       const response = await fetch('/api/jobs', { method: 'POST', body: formData });
@@ -214,22 +204,23 @@
       if (!response.ok) {
         showError(body.error || 'Upload failed.');
         setSubmitting(false);
+        renderResults();
         return;
       }
 
       state.currentJobId = body.jobId;
-      state.startedAt = Date.now();
       workspaceTitle.textContent = 'Processing batch';
-      jobIdLabel.textContent = body.jobId;
+      jobIdLabel.textContent = `0 of ${body.totalFiles ?? 0} files`;
       statTotal.textContent = body.totalFiles ?? 0;
       emptyState.hidden = true;
       setSubmitting(true, 'Processing');
+      setActivityState('processing');
       showMappingWarnings(body.mappingWarnings || []);
-      startElapsedTimer();
       pollJob(body.jobId);
     } catch (error) {
       showError('Could not upload the batch. Check the server log for details.');
       setSubmitting(false);
+      renderResults();
     }
   }
 
@@ -258,23 +249,24 @@
         if (job.status === 'completed' || job.status === 'failed') {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
-          stopElapsedTimer();
           setSubmitting(false);
 
           if (job.status === 'completed') {
             workspaceTitle.textContent = 'Batch complete';
+            setActivityState('completed');
             downloadLink.href = `/api/jobs/${jobId}/download`;
             downloadLink.hidden = false;
           } else {
             workspaceTitle.textContent = 'Batch failed';
+            setActivityState('failed');
             showError(job.error || 'Job failed.');
           }
         }
       } catch (error) {
         clearInterval(state.pollTimer);
         state.pollTimer = null;
-        stopElapsedTimer();
         setSubmitting(false);
+        setActivityState('failed');
         showError(error.message || 'Lost connection while polling job status.');
       }
     };
@@ -295,10 +287,10 @@
     statProcessed.textContent = processed;
     statMatched.textContent = job.matchedFiles || 0;
     statUnmatched.textContent = job.unmatchedFiles || 0;
-    statStatus.textContent = job.status || 'idle';
     progressPercent.textContent = `${percent}%`;
     progressFill.style.width = `${percent}%`;
-    jobIdLabel.textContent = jobId;
+    jobIdLabel.textContent = `${processed} of ${total} files`;
+    setActivityState(job.status || 'processing');
 
     renderResults();
   }
@@ -429,19 +421,16 @@
 
   function resetJobView() {
     if (state.pollTimer) clearInterval(state.pollTimer);
-    stopElapsedTimer();
 
     state.currentJobId = null;
-    state.startedAt = null;
     state.lastResults = [];
-    workspaceTitle.textContent = 'Starting batch';
-    jobIdLabel.textContent = 'Waiting for job id';
+    workspaceTitle.textContent = 'Preparing batch';
+    jobIdLabel.textContent = 'Getting files ready';
     statTotal.textContent = '0';
     statProcessed.textContent = '0';
     statMatched.textContent = '0';
     statUnmatched.textContent = '0';
-    statElapsed.textContent = '0s';
-    statStatus.textContent = 'queued';
+    setActivityState('queued');
     progressPercent.textContent = '0%';
     progressFill.style.width = '0%';
     downloadLink.hidden = true;
@@ -455,9 +444,9 @@
     updateMappingSelection();
     clearMessages();
     resetJobView();
-    workspaceTitle.textContent = 'No active job';
-    jobIdLabel.textContent = 'Waiting for upload';
-    statStatus.textContent = 'idle';
+    workspaceTitle.textContent = 'Ready when you are';
+    jobIdLabel.textContent = 'Choose files to begin';
+    setActivityState('idle');
     state.currentFilter = 'all';
     filterTabs.forEach((tab) => tab.classList.toggle('is-active', tab.dataset.filter === 'all'));
     setSubmitting(false);
@@ -468,19 +457,18 @@
     submitBtn.querySelector('span:last-child').textContent = label;
   }
 
-  function startElapsedTimer() {
-    stopElapsedTimer();
-    state.elapsedTimer = setInterval(() => {
-      statElapsed.textContent = formatDuration(Date.now() - state.startedAt);
-    }, 1000);
-  }
-
-  function stopElapsedTimer() {
-    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
-    state.elapsedTimer = null;
-    if (state.startedAt) {
-      statElapsed.textContent = formatDuration(Date.now() - state.startedAt);
-    }
+  function setActivityState(status) {
+    const normalized = String(status || 'idle');
+    const labels = {
+      idle: 'Ready',
+      uploading: 'Uploading files',
+      queued: 'Preparing',
+      processing: 'Processing files',
+      completed: 'Complete',
+      failed: 'Needs attention',
+    };
+    activityText.textContent = labels[normalized] || 'Processing files';
+    activityIndicator.className = `activity-pill is-${normalized}`;
   }
 
   function clearMessages() {
@@ -512,10 +500,4 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
-  function formatDuration(milliseconds) {
-    const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
-  }
 })();
