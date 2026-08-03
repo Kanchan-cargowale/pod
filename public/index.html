@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Courier Label Editor</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="Courier Label Editor home">
+          <span class="brand-mark" aria-hidden="true">PE</span>
+          <span>
+          <span class="brand-name">POD Edit</span>
+          <span class="brand-subtitle">Courier weight workspace</span>
+        </span>
+      </a>
+
+      <div class="topbar-actions">
+        <span class="health-pill" id="health-pill">
+          <span class="health-dot" aria-hidden="true"></span>
+          <span id="health-text">Checking API</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <section class="setup-panel" aria-labelledby="setup-title">
+      <div class="section-heading">
+        <p class="eyebrow">Input</p>
+        <h1 id="setup-title">New batch</h1>
+      </div>
+
+      <form id="upload-form" class="upload-form">
+        <div class="field">
+          <div class="field-heading">
+            <label for="images">Label images</label>
+            <span id="images-count">0 selected</span>
+          </div>
+          <div class="dropzone" id="images-drop">
+            <input type="file" id="images" name="images" accept=".jpg,.jpeg,.png" multiple required />
+            <div class="dropzone-body">
+              <span class="dropzone-icon" aria-hidden="true">IMG</span>
+              <span class="dropzone-title">Choose label images</span>
+              <span class="dropzone-meta">JPG or PNG · multiple allowed</span>
+            </div>
+          </div>
+          <ul class="file-list" id="images-list" aria-live="polite"></ul>
+        </div>
+
+        <div class="field">
+          <div class="field-heading">
+            <label for="mapping">Weight workbook</label>
+            <span id="mapping-state">Required</span>
+          </div>
+          <div class="dropzone dropzone-compact" id="mapping-drop">
+            <input type="file" id="mapping" name="mapping" accept=".xlsx,.xls" required />
+            <div class="dropzone-body">
+              <span class="dropzone-icon" aria-hidden="true">XLS</span>
+              <span class="dropzone-title" id="mapping-name">Choose mapping workbook</span>
+              <span class="dropzone-meta">Excel · LR/ID and Weight columns</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="readiness-panel" aria-label="Upload readiness">
+          <div class="check-row" id="check-images">
+            <span class="check-dot" aria-hidden="true"></span>
+            <span>Images ready</span>
+          </div>
+          <div class="check-row" id="check-mapping">
+            <span class="check-dot" aria-hidden="true"></span>
+            <span>Workbook ready</span>
+          </div>
+          <div class="check-row" id="check-api">
+            <span class="check-dot" aria-hidden="true"></span>
+            <span>Backend online</span>
+          </div>
+        </div>
+
+        <button type="submit" id="submit-btn" class="btn btn-primary">
+          <span class="btn-icon" aria-hidden="true">UP</span>
+          <span>Process batch</span>
+        </button>
+
+        <div id="form-error" class="message message-error" hidden></div>
+        <div id="mapping-warnings" class="message message-warning" hidden></div>
+      </form>
+    </section>
+
+    <section class="workspace" aria-labelledby="workspace-title">
+      <div class="workspace-header">
+        <div>
+          <p class="eyebrow">Results</p>
+          <h2 id="workspace-title">No active job</h2>
+        </div>
+        <a id="download-link" class="btn btn-secondary" hidden download>
+          <span class="btn-icon" aria-hidden="true">ZIP</span>
+          <span>Download ZIP</span>
+        </a>
+      </div>
+
+      <div class="progress-panel" id="progress-panel">
+        <div class="meter-row">
+          <div>
+            <span class="meter-label">Progress</span>
+            <strong id="progress-percent">0%</strong>
+          </div>
+          <span class="job-id" id="job-id">Waiting for upload</span>
+        </div>
+        <div class="progress-track" aria-hidden="true">
+          <div class="progress-fill" id="progress-bar-fill"></div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat">
+            <span class="stat-value" id="stat-total">0</span>
+            <span class="stat-label">Total</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value" id="stat-processed">0</span>
+            <span class="stat-label">Processed</span>
+          </div>
+          <div class="stat stat-ok">
+            <span class="stat-value" id="stat-matched">0</span>
+            <span class="stat-label">Matched</span>
+          </div>
+          <div class="stat stat-warn">
+            <span class="stat-value" id="stat-unmatched">0</span>
+            <span class="stat-label">Review</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value" id="stat-elapsed">0s</span>
+            <span class="stat-label">Elapsed</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value" id="stat-status">idle</span>
+            <span class="stat-label">Status</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="results-toolbar">
+        <div class="filter-tabs" role="tablist" aria-label="Result filter">
+          <button type="button" class="filter-tab is-active" data-filter="all">All</button>
+          <button type="button" class="filter-tab" data-filter="ok">Matched</button>
+          <button type="button" class="filter-tab" data-filter="review">Review</button>
+          <button type="button" class="filter-tab" data-filter="error">Errors</button>
+        </div>
+        <span id="result-count" class="result-count">0 results</span>
+      </div>
+
+      <div id="empty-state" class="empty-state">
+        <div class="empty-preview" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <p>Upload a batch to see live matches, replacements, previews, and review notes.</p>
+      </div>
+
+      <div id="results-grid" class="results-grid" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <template id="result-card-template">
+    <article class="result-card">
+      <button type="button" class="thumb-button" aria-label="Open preview">
+        <img class="card-image" loading="lazy" />
+        <div class="card-placeholder">
+          <span class="placeholder-icon">!</span>
+          <span class="placeholder-text">No preview</span>
+        </div>
+      </button>
+
+      <div class="result-card-body">
+        <div class="card-title-row">
+          <div class="card-filename"></div>
+          <span class="status-badge"></span>
+        </div>
+
+        <dl class="result-details">
+          <div class="detail-row shipment-row">
+            <dt>ID</dt>
+            <dd class="card-id-value">-</dd>
+          </div>
+          <div class="detail-row weight-row">
+            <dt>Weight</dt>
+            <dd class="weight-values"></dd>
+          </div>
+        </dl>
+
+        <div class="card-reason"></div>
+      </div>
+    </article>
+  </template>
+
+  <dialog id="preview-dialog" class="preview-dialog">
+    <div class="dialog-header">
+      <strong id="preview-title">Preview</strong>
+      <button type="button" class="icon-button" id="preview-close" aria-label="Close preview">X</button>
+    </div>
+    <img id="preview-image" alt="" />
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

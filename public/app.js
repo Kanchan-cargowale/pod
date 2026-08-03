@@ -1,0 +1,521 @@
+(() => {
+  const form = document.getElementById('upload-form');
+  const imagesInput = document.getElementById('images');
+  const mappingInput = document.getElementById('mapping');
+  const imagesDrop = document.getElementById('images-drop');
+  const mappingDrop = document.getElementById('mapping-drop');
+  const imagesCount = document.getElementById('images-count');
+  const imagesList = document.getElementById('images-list');
+  const mappingName = document.getElementById('mapping-name');
+  const mappingState = document.getElementById('mapping-state');
+  const submitBtn = document.getElementById('submit-btn');
+  const formError = document.getElementById('form-error');
+  const mappingWarnings = document.getElementById('mapping-warnings');
+  const healthPill = document.getElementById('health-pill');
+  const healthText = document.getElementById('health-text');
+  const checkImages = document.getElementById('check-images');
+  const checkMapping = document.getElementById('check-mapping');
+  const checkApi = document.getElementById('check-api');
+
+  const workspaceTitle = document.getElementById('workspace-title');
+  const emptyState = document.getElementById('empty-state');
+  const progressFill = document.getElementById('progress-bar-fill');
+  const progressPercent = document.getElementById('progress-percent');
+  const jobIdLabel = document.getElementById('job-id');
+  const statTotal = document.getElementById('stat-total');
+  const statProcessed = document.getElementById('stat-processed');
+  const statMatched = document.getElementById('stat-matched');
+  const statUnmatched = document.getElementById('stat-unmatched');
+  const statElapsed = document.getElementById('stat-elapsed');
+  const statStatus = document.getElementById('stat-status');
+  const resultCount = document.getElementById('result-count');
+  const resultsGrid = document.getElementById('results-grid');
+  const downloadLink = document.getElementById('download-link');
+  const cardTemplate = document.getElementById('result-card-template');
+  const filterTabs = [...document.querySelectorAll('.filter-tab')];
+  const previewDialog = document.getElementById('preview-dialog');
+  const previewImage = document.getElementById('preview-image');
+  const previewTitle = document.getElementById('preview-title');
+  const previewClose = document.getElementById('preview-close');
+
+  const state = {
+    apiOnline: false,
+    currentFilter: 'all',
+    currentJobId: null,
+    startedAt: null,
+    pollTimer: null,
+    elapsedTimer: null,
+    lastResults: [],
+    isDownloading: false,
+  };
+
+  checkHealth();
+  wireDropzone(imagesDrop, imagesInput, updateImageSelection);
+  wireDropzone(mappingDrop, mappingInput, updateMappingSelection);
+  wireFilters();
+  wirePreviewDialog();
+
+  form.addEventListener('submit', submitBatch);
+  downloadLink.addEventListener('click', downloadZipAndReset);
+
+  async function downloadZipAndReset(event) {
+    event.preventDefault();
+    if (state.isDownloading || !downloadLink.href) return;
+
+    state.isDownloading = true;
+    downloadLink.setAttribute('aria-disabled', 'true');
+
+    try {
+      const response = await fetch(downloadLink.href, { cache: 'no-store' });
+      if (!response.ok) {
+        const body = await parseJsonResponse(response);
+        throw new Error(body.error || 'Could not download the ZIP.');
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') || '';
+      const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+      const filename = filenameMatch?.[1] || `courier-labels-${state.currentJobId}.zip`;
+      const objectUrl = URL.createObjectURL(blob);
+      const saveLink = document.createElement('a');
+      saveLink.href = objectUrl;
+      saveLink.download = filename;
+      document.body.append(saveLink);
+      saveLink.click();
+      saveLink.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+
+      resetToEmptyState();
+    } catch (error) {
+      showError(error.message || 'Could not download the ZIP.');
+    } finally {
+      state.isDownloading = false;
+      downloadLink.removeAttribute('aria-disabled');
+    }
+  }
+
+  function wireDropzone(dropzone, input, onChange) {
+    input.addEventListener('change', onChange);
+
+    ['dragenter', 'dragover'].forEach((eventName) => {
+      dropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropzone.classList.add('drag-over');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach((eventName) => {
+      dropzone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropzone.classList.remove('drag-over');
+      });
+    });
+
+    dropzone.addEventListener('drop', (event) => {
+      const files = event.dataTransfer?.files;
+      if (!files?.length) return;
+      input.files = files;
+      onChange();
+    });
+  }
+
+  function wireFilters() {
+    filterTabs.forEach((tab) => {
+      tab.addEventListener('click', () => {
+        state.currentFilter = tab.dataset.filter;
+        filterTabs.forEach((item) => item.classList.toggle('is-active', item === tab));
+        renderResults();
+      });
+    });
+  }
+
+  function wirePreviewDialog() {
+    previewClose.addEventListener('click', () => previewDialog.close());
+    previewDialog.addEventListener('click', (event) => {
+      if (event.target === previewDialog) previewDialog.close();
+    });
+  }
+
+  async function checkHealth() {
+    try {
+      const response = await fetch('/health', { cache: 'no-store' });
+      if (!response.ok) throw new Error('Health check failed');
+      const body = await response.json();
+      state.apiOnline = body.status === 'ok';
+    } catch (error) {
+      state.apiOnline = false;
+    }
+
+    healthPill.classList.toggle('is-online', state.apiOnline);
+    healthPill.classList.toggle('is-offline', !state.apiOnline);
+    healthText.textContent = state.apiOnline ? 'API online' : 'API offline';
+    checkApi.classList.toggle('is-ready', state.apiOnline);
+  }
+
+  function updateImageSelection() {
+    const files = [...imagesInput.files];
+    imagesCount.textContent = files.length === 1 ? '1 selected' : `${files.length} selected`;
+    checkImages.classList.toggle('is-ready', files.length > 0);
+    imagesList.innerHTML = '';
+
+    const visibleFiles = files.slice(0, 5);
+    visibleFiles.forEach((file) => {
+      const item = document.createElement('li');
+      const fileName = document.createElement('span');
+      const fileSize = document.createElement('span');
+      fileName.className = 'file-name';
+      fileSize.className = 'file-size';
+      fileName.textContent = file.name;
+      fileSize.textContent = formatBytes(file.size);
+      item.append(fileName, fileSize);
+      imagesList.append(item);
+    });
+
+    if (files.length > visibleFiles.length) {
+      const item = document.createElement('li');
+      item.textContent = `${files.length - visibleFiles.length} more files queued`;
+      imagesList.append(item);
+    }
+  }
+
+  function updateMappingSelection() {
+    const file = mappingInput.files[0];
+    mappingName.textContent = file ? file.name : 'Drop mapping workbook';
+    mappingState.textContent = file ? formatBytes(file.size) : 'Required';
+    checkMapping.classList.toggle('is-ready', Boolean(file));
+  }
+
+  async function submitBatch(event) {
+    event.preventDefault();
+    clearMessages();
+    await checkHealth();
+
+    if (!imagesInput.files.length || !mappingInput.files.length) {
+      showError('Choose at least one label image and one mapping workbook.');
+      return;
+    }
+
+    if (!state.apiOnline) {
+      showError('The backend is not reachable. Start the server and try again.');
+      return;
+    }
+
+    const formData = new FormData();
+    [...imagesInput.files].forEach((file) => formData.append('images', file));
+    formData.append('mapping', mappingInput.files[0]);
+
+    setSubmitting(true, 'Uploading');
+    resetJobView();
+
+    try {
+      const response = await fetch('/api/jobs', { method: 'POST', body: formData });
+      const body = await parseJsonResponse(response);
+
+      if (!response.ok) {
+        showError(body.error || 'Upload failed.');
+        setSubmitting(false);
+        return;
+      }
+
+      state.currentJobId = body.jobId;
+      state.startedAt = Date.now();
+      workspaceTitle.textContent = 'Processing batch';
+      jobIdLabel.textContent = body.jobId;
+      statTotal.textContent = body.totalFiles ?? 0;
+      emptyState.hidden = true;
+      setSubmitting(true, 'Processing');
+      showMappingWarnings(body.mappingWarnings || []);
+      startElapsedTimer();
+      pollJob(body.jobId);
+    } catch (error) {
+      showError('Could not upload the batch. Check the server log for details.');
+      setSubmitting(false);
+    }
+  }
+
+  async function parseJsonResponse(response) {
+    try {
+      return await response.json();
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function pollJob(jobId) {
+    if (state.pollTimer) clearInterval(state.pollTimer);
+
+    const tick = async () => {
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`, { cache: 'no-store' });
+        const job = await parseJsonResponse(response);
+
+        if (!response.ok) {
+          throw new Error(job.error || 'Status request failed');
+        }
+
+        renderJob(jobId, job);
+
+        if (job.status === 'completed' || job.status === 'failed') {
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+          stopElapsedTimer();
+          setSubmitting(false);
+
+          if (job.status === 'completed') {
+            workspaceTitle.textContent = 'Batch complete';
+            downloadLink.href = `/api/jobs/${jobId}/download`;
+            downloadLink.hidden = false;
+          } else {
+            workspaceTitle.textContent = 'Batch failed';
+            showError(job.error || 'Job failed.');
+          }
+        }
+      } catch (error) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+        stopElapsedTimer();
+        setSubmitting(false);
+        showError(error.message || 'Lost connection while polling job status.');
+      }
+    };
+
+    tick();
+    state.pollTimer = setInterval(tick, 1500);
+  }
+
+  function renderJob(jobId, job) {
+    state.currentJobId = jobId;
+    state.lastResults = job.results || [];
+
+    const total = job.totalFiles || 0;
+    const processed = job.processedFiles || 0;
+    const percent = total ? Math.round((processed / total) * 100) : 0;
+
+    statTotal.textContent = total;
+    statProcessed.textContent = processed;
+    statMatched.textContent = job.matchedFiles || 0;
+    statUnmatched.textContent = job.unmatchedFiles || 0;
+    statStatus.textContent = job.status || 'idle';
+    progressPercent.textContent = `${percent}%`;
+    progressFill.style.width = `${percent}%`;
+    jobIdLabel.textContent = jobId;
+
+    renderResults();
+  }
+
+  function renderResults() {
+    const filtered = state.lastResults.filter(matchesCurrentFilter);
+    resultsGrid.innerHTML = '';
+    resultCount.textContent = filtered.length === 1 ? '1 result' : `${filtered.length} results`;
+    emptyState.hidden = state.lastResults.length > 0 || Boolean(state.currentJobId);
+
+    filtered.forEach((result) => {
+      resultsGrid.append(buildCard(state.currentJobId, result));
+    });
+  }
+
+  function matchesCurrentFilter(result) {
+    if (state.currentFilter === 'all') return true;
+    if (state.currentFilter === 'ok') return result.status === 'ok';
+    if (state.currentFilter === 'error') return result.status === 'error';
+    return result.status !== 'ok' && result.status !== 'error';
+  }
+
+  function buildCard(jobId, result) {
+    const node = cardTemplate.content.cloneNode(true);
+    const card = node.querySelector('.result-card');
+    const thumbButton = node.querySelector('.thumb-button');
+    const img = node.querySelector('.card-image');
+    const placeholder = node.querySelector('.card-placeholder');
+    const badge = node.querySelector('.status-badge');
+    const filename = node.querySelector('.card-filename');
+    const idValue = node.querySelector('.card-id-value');
+    const shipmentRow = node.querySelector('.shipment-row');
+    const weightRow = node.querySelector('.weight-row');
+    const weightValues = node.querySelector('.weight-values');
+    const reason = node.querySelector('.card-reason');
+
+    const status = result.status || 'unknown';
+    const previewUrl = `/api/jobs/${jobId}/preview/${encodeURIComponent(result.filename)}`;
+
+    card.dataset.status = status;
+    filename.textContent = result.filename || 'Unknown file';
+    filename.title = result.filename || '';
+    badge.textContent = formatStatus(status);
+    badge.classList.add(status);
+
+    if (status === 'ok') {
+      img.src = previewUrl;
+      img.alt = `Edited label preview for ${result.filename}`;
+      placeholder.remove();
+      thumbButton.addEventListener('click', () => openPreview(previewUrl, result.filename));
+      idValue.textContent = result.shipmentId || '-';
+      renderWeightChanges(weightValues, result);
+      reason.remove();
+    } else {
+      img.remove();
+      placeholder.style.display = 'grid';
+      if (result.errorCode === 'image_rotation') {
+        placeholder.querySelector('.placeholder-text').textContent = 'Fix image rotation';
+      }
+      thumbButton.disabled = true;
+      idValue.textContent = result.shipmentId || '-';
+      if (!result.shipmentId) shipmentRow.remove();
+      weightRow.remove();
+      reason.textContent = buildReasonText(result);
+    }
+
+    return node;
+  }
+
+  function renderWeightChanges(container, result) {
+    const regions = result.replacedRegions || [];
+
+    if (!regions.length) {
+      const value = document.createElement('span');
+      value.className = 'weight-new';
+      value.textContent = result.newWeight ?? 'Updated';
+      container.append(value);
+      return;
+    }
+
+    regions.forEach((region) => {
+      const row = document.createElement('span');
+      row.className = 'weight-change';
+
+      const oldValue = document.createElement('span');
+      oldValue.className = 'weight-old';
+      oldValue.textContent = region.originalText || '-';
+
+      const arrow = document.createElement('span');
+      arrow.textContent = 'to';
+
+      const newValue = document.createElement('span');
+      newValue.className = 'weight-new';
+      newValue.textContent = region.newText || result.newWeight || '-';
+
+      row.append(oldValue, arrow, newValue);
+      container.append(row);
+    });
+  }
+
+  function buildReasonText(result) {
+    let text = result.reason || 'This label needs review.';
+
+    if (result.status === 'unmatched' && result.detectedNumbers?.length) {
+      const numbers = result.detectedNumbers.slice(0, 14).join(', ');
+      const suffix = result.detectedNumbers.length > 14 ? '...' : '';
+      text += ` Numbers found: ${numbers}${suffix}`;
+    }
+
+    if (result.status === 'id_matched_no_weight_region' && result.detectedWeightAnchors?.length) {
+      text += ` Weight headers found: ${result.detectedWeightAnchors.join(' | ')}`;
+    }
+
+    return text;
+  }
+
+  function openPreview(src, title) {
+    previewImage.src = src;
+    previewImage.alt = `Edited label preview for ${title}`;
+    previewTitle.textContent = title || 'Preview';
+
+    if (typeof previewDialog.showModal === 'function') {
+      previewDialog.showModal();
+    } else {
+      window.open(src, '_blank', 'noopener');
+    }
+  }
+
+  function resetJobView() {
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    stopElapsedTimer();
+
+    state.currentJobId = null;
+    state.startedAt = null;
+    state.lastResults = [];
+    workspaceTitle.textContent = 'Starting batch';
+    jobIdLabel.textContent = 'Waiting for job id';
+    statTotal.textContent = '0';
+    statProcessed.textContent = '0';
+    statMatched.textContent = '0';
+    statUnmatched.textContent = '0';
+    statElapsed.textContent = '0s';
+    statStatus.textContent = 'queued';
+    progressPercent.textContent = '0%';
+    progressFill.style.width = '0%';
+    downloadLink.hidden = true;
+    downloadLink.removeAttribute('href');
+    renderResults();
+  }
+
+  function resetToEmptyState() {
+    form.reset();
+    updateImageSelection();
+    updateMappingSelection();
+    clearMessages();
+    resetJobView();
+    workspaceTitle.textContent = 'No active job';
+    jobIdLabel.textContent = 'Waiting for upload';
+    statStatus.textContent = 'idle';
+    state.currentFilter = 'all';
+    filterTabs.forEach((tab) => tab.classList.toggle('is-active', tab.dataset.filter === 'all'));
+    setSubmitting(false);
+  }
+
+  function setSubmitting(isSubmitting, label = 'Process batch') {
+    submitBtn.disabled = isSubmitting;
+    submitBtn.querySelector('span:last-child').textContent = label;
+  }
+
+  function startElapsedTimer() {
+    stopElapsedTimer();
+    state.elapsedTimer = setInterval(() => {
+      statElapsed.textContent = formatDuration(Date.now() - state.startedAt);
+    }, 1000);
+  }
+
+  function stopElapsedTimer() {
+    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
+    state.elapsedTimer = null;
+    if (state.startedAt) {
+      statElapsed.textContent = formatDuration(Date.now() - state.startedAt);
+    }
+  }
+
+  function clearMessages() {
+    formError.hidden = true;
+    formError.textContent = '';
+    mappingWarnings.hidden = true;
+    mappingWarnings.textContent = '';
+  }
+
+  function showError(message) {
+    formError.textContent = message;
+    formError.hidden = false;
+  }
+
+  function showMappingWarnings(warnings) {
+    if (!warnings.length) return;
+    mappingWarnings.textContent = warnings.slice(0, 4).join(' ');
+    mappingWarnings.hidden = false;
+  }
+
+  function formatStatus(status) {
+    return String(status || 'unknown').replaceAll('_', ' ');
+  }
+
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes)) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function formatDuration(milliseconds) {
+    const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
+  }
+})();

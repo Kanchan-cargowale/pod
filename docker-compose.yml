@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  label-editor:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - WORKER_POOL_SIZE=4
+      - OCR_MIN_CONFIDENCE=40
+    volumes:
+      - label-storage:/app/storage
+    restart: unless-stopped
+
+volumes:
+  label-storage:

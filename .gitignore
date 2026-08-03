@@ -1,0 +1,10 @@
+node_modules/
+storage/uploads/*
+storage/outputs/*
+storage/jobs/*
+!storage/uploads/.gitkeep
+!storage/outputs/.gitkeep
+!storage/jobs/.gitkeep
+.env
+*.log
+tessdata/*.traineddata
