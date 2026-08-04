@@ -7,7 +7,7 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..', '..');
 
 module.exports = {
-  port: Number(process.env.PORT || 3000),
+  port: Number(process.env.PORT || 8080),
   storageDir: process.env.STORAGE_DIR || path.join(ROOT, 'storage'),
   uploadsDir: path.join(process.env.STORAGE_DIR || path.join(ROOT, 'storage'), 'uploads'),
   outputsDir: path.join(process.env.STORAGE_DIR || path.join(ROOT, 'storage'), 'outputs'),
