@@ -6,6 +6,7 @@ const {
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
+  findLeftStyleReference,
   isWeightAnchorText,
 } = require('../../src/services/labelMatcher.service');
 
@@ -197,6 +198,29 @@ describe('labelMatcher.service', () => {
 
       expect(regions).toHaveLength(1);
       expect(regions[0].originalText).toBe('»N.n');
+    });
+  });
+
+  describe('findLeftStyleReference', () => {
+    it('selects same-row dimensions text left of the weight value', () => {
+      const target = { x0: 300, y0: 292, x1: 328, y1: 309 };
+      const words = [
+        { text: '43x33x21', bbox: { x0: 180, y0: 291, x1: 245, y1: 309 } },
+        { text: '20.0', bbox: { x0: 405, y0: 292, x1: 435, y1: 309 } },
+      ];
+
+      expect(findLeftStyleReference(words, target)).toEqual({
+        text: '43x33x21',
+        bbox: { x0: 180, y0: 291, x1: 245, y1: 309 },
+      });
+    });
+
+    it('returns null without a suitable same-row value', () => {
+      const target = { x0: 300, y0: 292, x1: 328, y1: 309 };
+      const words = [
+        { text: '43x33x21', bbox: { x0: 180, y0: 220, x1: 245, y1: 238 } },
+      ];
+      expect(findLeftStyleReference(words, target)).toBeNull();
     });
   });
 

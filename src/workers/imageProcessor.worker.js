@@ -14,6 +14,7 @@ const {
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
+  findLeftStyleReference,
   buildMergedNumericCandidates,
 } = require('../services/labelMatcher.service');
 const config = require('../config');
@@ -230,7 +231,9 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     const regionHeight = region.bbox.y1 - region.bbox.y0;
     const replacementText = formatReplacementWeight(newWeight, region.originalText);
     const originalTextIsReliable = /^\d{1,6}(?:\.\d{1,3})?$/.test(region.originalText);
-    const usesTinyScanFallback = regionHeight <= 12 && !originalTextIsReliable;
+    const styleReference = findLeftStyleReference(words, region.bbox);
+    const usesTinyScanFallback =
+      !styleReference && regionHeight <= 12 && !originalTextIsReliable;
     const clearBbox =
       usesTinyScanFallback
         ? {
@@ -250,9 +253,12 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       clearBbox,
       replacementText,
       originalText: region.originalText,
-      styleReferenceText: usesTinyScanFallback
-        ? replacementText.replace(/\d/g, '0')
-        : region.originalText,
+      styleReferenceText: styleReference
+        ? styleReference.text
+        : usesTinyScanFallback
+          ? replacementText.replace(/\d/g, '0')
+          : region.originalText,
+      styleReferenceBbox: styleReference?.bbox,
       fontScale: usesTinyScanFallback ? 0.82 : 1,
       textLeftPaddingRatio: usesTinyScanFallback ? 0.03 : undefined,
     };
