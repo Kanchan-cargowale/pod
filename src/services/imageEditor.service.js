@@ -1,6 +1,28 @@
 'use strict';
 
+const fs = require('fs');
+const opentype = require('opentype.js');
 const sharp = require('sharp');
+
+function loadBundledFont(weight) {
+  const fontPath = require.resolve(
+    `@fontsource/roboto/files/roboto-latin-${weight}-normal.woff`
+  );
+  const buffer = fs.readFileSync(fontPath);
+  const arrayBuffer = buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength
+  );
+  return opentype.parse(arrayBuffer);
+}
+
+// Convert numbers to vector outlines instead of asking librsvg/Pango to find
+// a system font. The production sandbox has no installed fonts, which caused
+// every character to be emitted as the hollow "missing glyph" square.
+const BUNDLED_FONTS = {
+  400: loadBundledFont(400),
+  700: loadBundledFont(700),
+};
 
 const FONT_SIZE_RATIO = 0.86; // font-size relative to bbox height
 const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advance
@@ -13,13 +35,6 @@ const DEFAULT_TEXT_STYLE = {
   fontWeight: 400,
   fill: 'rgb(0,0,0)',
 };
-
-function escapeXml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 
 /**
  * Samples a representative background color for a bounding box by
@@ -147,6 +162,30 @@ function numericAdvanceUnits(text, fontFamily) {
       0
     )
   );
+}
+
+function numericTextPath(text, x, baselineY, fontSize, fontWeight, condensed) {
+  const font = BUNDLED_FONTS[fontWeight >= 600 ? 700 : 400];
+  const scale = fontSize / font.unitsPerEm;
+  const horizontalScale = condensed ? 0.82 : 1;
+  let cursorX = x;
+  const pathData = [];
+
+  // charToGlyph bypasses OpenType's shaping engine. Numeric weights need no
+  // ligatures or script substitutions, and this produces one guaranteed
+  // outline for every validated ASCII digit/decimal character.
+  for (const character of text) {
+    const glyph = font.charToGlyph(character);
+    pathData.push(glyph.getPath(cursorX, baselineY, fontSize).toPathData(2));
+    cursorX += glyph.advanceWidth * scale;
+  }
+
+  return {
+    d: pathData.join(''),
+    transform: horizontalScale === 1
+      ? ''
+      : `translate(${x} 0) scale(${horizontalScale} 1) translate(${-x} 0)`,
+  };
 }
 
 /**
@@ -316,16 +355,20 @@ async function replaceWeightRegions(filePath, replacements) {
     const baselineY = bbox.y1 - height * 0.16;
     const textX = bbox.x0 + width * textLeftPaddingRatio;
     const renderedFontSize = textStyle.fontSize * fontScale;
-    const isCondensed = textStyle.fontFamily === 'sans-serif-condensed';
-    const fontFamily = isCondensed ? 'sans-serif' : textStyle.fontFamily;
-    const textTransform = isCondensed ? ` transform="scale(0.82 1)"` : '';
-    const transformedX = isCondensed ? textX / 0.82 : textX;
+    const outlinedText = numericTextPath(
+      numericReplacement,
+      textX,
+      baselineY,
+      renderedFontSize,
+      textStyle.fontWeight,
+      textStyle.fontFamily === 'sans-serif-condensed'
+    );
+    const transform = outlinedText.transform
+      ? ` transform="${outlinedText.transform}"`
+      : '';
 
     texts.push(
-      `<text x="${transformedX}" y="${baselineY}" font-family="${fontFamily}" ` +
-        `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
-        `fill="${textStyle.fill}"${textTransform}>` +
-        `${escapeXml(numericReplacement)}</text>`
+      `<path d="${outlinedText.d}" fill="${textStyle.fill}"${transform} />`
     );
   }
 
@@ -352,4 +395,5 @@ module.exports = {
   sampleLocalPaperColor,
   sampleTextStyle,
   calculateFontSize,
+  numericTextPath,
 };

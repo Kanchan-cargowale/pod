@@ -9,6 +9,7 @@ const {
   replaceWeightRegions,
   calculateFontSize,
   sampleTextStyle,
+  numericTextPath,
 } = require('../../src/services/imageEditor.service');
 
 describe('imageEditor.service', () => {
@@ -61,6 +62,15 @@ describe('imageEditor.service', () => {
       expect(regular.fontSize).toBeGreaterThan(8);
       expect(bold.fontSize).toBeGreaterThan(8);
     });
+  });
+
+  it('creates real bundled-font outlines without runtime font lookup', () => {
+    const outlined = numericTextPath('40.00', 20, 35, 18, 400, false);
+
+    expect(outlined.d).toMatch(/^M/);
+    expect(outlined.d).toMatch(/[QL]/);
+    expect(outlined.d).not.toContain('undefined');
+    expect((outlined.d.match(/M/g) || []).length).toBeGreaterThanOrEqual(5);
   });
 
   it('renders numeric replacement glyphs inside the original weight position', async () => {
