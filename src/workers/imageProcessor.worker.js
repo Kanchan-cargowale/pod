@@ -239,6 +239,24 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     .map((region) => (region.bbox.x0 + region.bbox.x1) / 2)
     .sort((a, b) => a - b);
 
+  const sharedStyleReference = hasSharedWeightRow
+    ? words
+        .filter((word) => {
+          const text = String(word.text || '').trim();
+          if (!word.bbox || !/\d/.test(text)) return false;
+          const height = word.bbox.y1 - word.bbox.y0;
+          const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
+          const rowCenterY = sharedBottom - rowHeight / 2;
+          return (
+            word.bbox.x1 < sortedRegionCenters[0] - rowHeight &&
+            height >= rowHeight * 0.65 &&
+            height <= rowHeight * 1.55 &&
+            Math.abs(centerY - rowCenterY) <= rowHeight * 0.8
+          );
+        })
+        .sort((a, b) => b.bbox.x1 - a.bbox.x1)[0]
+    : null;
+
   const replacements = regions.map((region) => {
     const rawHeight = region.bbox.y1 - region.bbox.y0;
     const regionCenterX = (region.bbox.x0 + region.bbox.x1) / 2;
@@ -265,7 +283,11 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     // original left edge instead of leaving the leading digit visible.
     const adjacentFragments = words.filter((word) => {
       const text = String(word.text || '').trim();
-      if (!word.bbox || word.bbox === region.bbox || !/^[\d.,|]+$/.test(text)) return false;
+      if (
+        !word.bbox ||
+        word.bbox === region.bbox ||
+        !/^[\d.,|ilInNoO]+$/i.test(text)
+      ) return false;
       const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
       const horizontalGap = Math.max(
         0,
@@ -339,14 +361,18 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       clearBbox,
       replacementText,
       originalText: region.originalText,
-      styleReferenceText: useExternalStyle && styleReference
-        ? styleReference.text
-        : originalTextIsReliable
-          ? region.originalText
-          : replacementText.replace(/\d/g, '0'),
-      styleReferenceBbox: useExternalStyle && styleReference
-        ? styleReference.bbox
-        : region.bbox,
+      styleReferenceText: sharedStyleReference
+        ? sharedStyleReference.text
+        : useExternalStyle && styleReference
+          ? styleReference.text
+          : originalTextIsReliable
+            ? region.originalText
+            : replacementText.replace(/\d/g, '0'),
+      styleReferenceBbox: sharedStyleReference
+        ? sharedStyleReference.bbox
+        : useExternalStyle && styleReference
+          ? styleReference.bbox
+          : region.bbox,
       fontScale: 1,
       textLeftPaddingRatio: 0.03,
     };

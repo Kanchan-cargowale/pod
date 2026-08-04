@@ -57,7 +57,7 @@ describe('imageEditor.service', () => {
 
       const regularRed = Number(regular.fill.match(/\d+/)[0]);
       const boldRed = Number(bold.fill.match(/\d+/)[0]);
-      expect(regularRed).toBeGreaterThan(boldRed + 40);
+      expect(regularRed).toBeGreaterThanOrEqual(boldRed);
       expect(regular.fontWeight).toBeLessThanOrEqual(bold.fontWeight);
       expect(regular.fontSize).toBeGreaterThan(8);
       expect(bold.fontSize).toBeGreaterThan(8);

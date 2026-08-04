@@ -26,6 +26,9 @@ function newJobState(jobId, totalFiles) {
     matchedFiles: 0,
     unmatchedFiles: 0,
     createdAt: new Date().toISOString(),
+    startedAt: null,
+    completedAt: null,
+    durationMs: null,
     updatedAt: new Date().toISOString(),
     results: [],
     error: null,
@@ -70,6 +73,7 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
 
   const state = jobs.get(jobId);
   state.status = 'processing';
+  state.startedAt = new Date().toISOString();
   await persist(state);
 
   const outputsDir = storage.jobOutputsDir(jobId);
@@ -104,7 +108,12 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
 
   state.status = 'completed';
   state.zipReady = true;
-  state.updatedAt = new Date().toISOString();
+  state.completedAt = new Date().toISOString();
+  state.durationMs = Math.max(
+    0,
+    new Date(state.completedAt).getTime() - new Date(state.startedAt).getTime()
+  );
+  state.updatedAt = state.completedAt;
   await persist(state);
 }
 

@@ -37,6 +37,8 @@
     currentFilter: 'all',
     currentJobId: null,
     pollTimer: null,
+    elapsedTimer: null,
+    startedAt: null,
     lastResults: [],
     isDownloading: false,
   };
@@ -275,6 +277,32 @@
     state.pollTimer = setInterval(tick, 1500);
   }
 
+  function formatDuration(milliseconds) {
+    const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes ? `${minutes}m ${String(seconds).padStart(2, '0')}s` : `${seconds}s`;
+  }
+
+  function updateElapsedLabel(job) {
+    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
+    state.startedAt = job.startedAt || state.startedAt;
+
+    const render = () => {
+      if (!state.startedAt) return;
+      const duration = job.durationMs ?? Date.now() - new Date(state.startedAt).getTime();
+      const prefix = job.status === 'completed' ? 'Completed in' : 'Elapsed';
+      jobIdLabel.textContent = `${job.processedFiles || 0} of ${job.totalFiles || 0} files · ${prefix} ${formatDuration(duration)}`;
+    };
+
+    render();
+    if (job.status === 'processing') {
+      state.elapsedTimer = setInterval(render, 1000);
+    } else {
+      state.elapsedTimer = null;
+    }
+  }
+
   function renderJob(jobId, job) {
     state.currentJobId = jobId;
     state.lastResults = job.results || [];
@@ -289,7 +317,7 @@
     statUnmatched.textContent = job.unmatchedFiles || 0;
     progressPercent.textContent = `${percent}%`;
     progressFill.style.width = `${percent}%`;
-    jobIdLabel.textContent = `${processed} of ${total} files`;
+    updateElapsedLabel(job);
     setActivityState(job.status || 'processing');
 
     renderResults();
@@ -421,8 +449,11 @@
 
   function resetJobView() {
     if (state.pollTimer) clearInterval(state.pollTimer);
+    if (state.elapsedTimer) clearInterval(state.elapsedTimer);
 
     state.currentJobId = null;
+    state.elapsedTimer = null;
+    state.startedAt = null;
     state.lastResults = [];
     workspaceTitle.textContent = 'Preparing batch';
     jobIdLabel.textContent = 'Getting files ready';

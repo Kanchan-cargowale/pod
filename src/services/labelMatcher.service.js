@@ -380,7 +380,19 @@ function findWeightValueRegions(words, anchors, ctx) {
       if (centerX < minX || centerX > maxX) continue;
 
       const gap = word.bbox.y0 - anchor.bbox.y1;
-      if (gap < 0 || gap > maxVerticalGap) continue;
+      const anchorHeight = Math.max(1, anchor.bbox.y1 - anchor.bbox.y0);
+      const normalizedCandidate = normalizeHeaderText(word.text);
+      const containsHeaderVocabulary =
+        normalizedCandidate.includes('weight') ||
+        normalizedCandidate.includes('actual') ||
+        normalizedCandidate.includes('charged');
+      // Values belong on the row below the full header. A minimum gap keeps
+      // OCR fragments such as WEIGHT(kg) from being edited as if numeric data.
+      if (
+        gap < Math.max(2, anchorHeight * 0.12) ||
+        gap > maxVerticalGap ||
+        containsHeaderVocabulary
+      ) continue;
 
       if (gap < bestGap || (gap === bestGap && candidate.strict && !bestCandidate?.strict)) {
         bestGap = gap;
