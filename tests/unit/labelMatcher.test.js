@@ -179,6 +179,31 @@ describe('labelMatcher.service', () => {
       ]);
     });
 
+    it('rejects damaged WEIGHT header fragments as editable values', () => {
+      const anchors = [
+        {
+          bbox: { x0: 300, y0: 250, x1: 390, y1: 285, height: 35 },
+          words: [
+            { text: 'ACTUAL', bbox: { x0: 300, y0: 250, x1: 355, y1: 265 } },
+            { text: 'WEIGHT(kg)', bbox: { x0: 300, y0: 268, x1: 390, y1: 285 } },
+          ],
+        },
+      ];
+      const words = [
+        { text: 'WEIGHT(k', confidence: 70, bbox: { x0: 302, y0: 287, x1: 375, y1: 302 } },
+        { text: '111.0', confidence: 95, bbox: { x0: 303, y0: 315, x1: 345, y1: 330 } },
+      ];
+
+      const regions = findWeightValueRegions(words, anchors, {
+        imageHeight: 900,
+        verticalWindowRatio: 0.18,
+        horizontalTolerancePx: 120,
+      });
+
+      expect(regions).toHaveLength(1);
+      expect(regions[0].originalText).toBe('111.0');
+    });
+
     it('does not treat a product specification in the next cell as a weight', () => {
       const anchors = [
         {
@@ -201,7 +226,7 @@ describe('labelMatcher.service', () => {
       expect(regions[0].originalText).toBe('242.6');
     });
 
-    it('uses a damaged decimal-shaped OCR token directly below a confirmed header', () => {
+    it('rejects a damaged decimal token with no confirmed digit', () => {
       const anchors = [
         {
           bbox: { x0: 247, y0: 170, x1: 277, y1: 179, height: 9 },
@@ -217,8 +242,7 @@ describe('labelMatcher.service', () => {
         horizontalTolerancePx: 120,
       });
 
-      expect(regions).toHaveLength(1);
-      expect(regions[0].originalText).toBe('»N.n');
+      expect(regions).toHaveLength(0);
     });
   });
 

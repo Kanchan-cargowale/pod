@@ -322,19 +322,21 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       ? region.originalText.length
       : Math.max(4, replacementText.length);
     const clearWidth = Math.max(
-      rawWidth,
-      rowHeight * Math.max(2.2, estimatedOldLength * 0.68)
+      rawWidth + rowHeight * 0.7,
+      rowHeight * Math.max(2.6, estimatedOldLength * 0.82)
     );
     normalizedBbox.x0 = Math.max(normalizedBbox.x0, cellLeft + safeInset);
     normalizedBbox.x1 = Math.min(normalizedBbox.x1, cellRight - safeInset);
     const clearBbox = {
-      x0: Math.max(cellLeft + safeInset, normalizedBbox.x0 - 1),
-      y0: Math.max(0, normalizedBbox.y0 - 2),
+      x0: Math.max(cellLeft + safeInset, recoveredX0 - rowHeight * 0.3),
+      // Clear blur/strike remnants around the complete glyph envelope, while
+      // staying below the confirmed header band.
+      y0: Math.max(0, normalizedBbox.y0 - rowHeight * 0.28),
       x1: Math.min(
         cellRight - safeInset,
-        normalizedBbox.x0 + clearWidth + Math.max(2, rowHeight * 0.35)
+        normalizedBbox.x0 + clearWidth + rowHeight * 0.45
       ),
-      y1: Math.min(analysis.meta.height, normalizedBbox.y1 + 2),
+      y1: Math.min(analysis.meta.height, normalizedBbox.y1 + rowHeight * 0.3),
     };
 
     const styleReference = words

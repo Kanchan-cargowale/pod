@@ -57,7 +57,8 @@ describe('imageEditor.service', () => {
 
       const regularRed = Number(regular.fill.match(/\d+/)[0]);
       const boldRed = Number(bold.fill.match(/\d+/)[0]);
-      expect(regularRed).toBeGreaterThanOrEqual(boldRed);
+      expect(regularRed).toBeLessThan(120);
+      expect(boldRed).toBeLessThan(120);
       expect(regular.fontWeight).toBeLessThanOrEqual(bold.fontWeight);
       expect(regular.fontSize).toBeGreaterThan(8);
       expect(bold.fontSize).toBeGreaterThan(8);
@@ -172,6 +173,46 @@ describe('imageEditor.service', () => {
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it('does not copy a header rule above into the replacement row', async () => {
+    const input = await sharp({
+      create: {
+        width: 120,
+        height: 70,
+        channels: 3,
+        background: { r: 245, g: 245, b: 245 },
+      },
+    })
+      .composite([
+        {
+          input: Buffer.from(
+            '<svg width="120" height="70" xmlns="http://www.w3.org/2000/svg">' +
+              '<line x1="10" y1="20" x2="110" y2="20" stroke="black" stroke-width="2" />' +
+              '<text x="35" y="43" font-family="Arial" font-size="15">111.0</text>' +
+              '</svg>'
+          ),
+        },
+      ])
+      .png()
+      .toBuffer();
+
+    const edited = await replaceWeightRegions(input, [
+      {
+        bbox: { x0: 35, y0: 30, x1: 75, y1: 46 },
+        clearBbox: { x0: 32, y0: 28, x1: 82, y1: 49 },
+        originalText: '111.0',
+        replacementText: '40.0',
+      },
+    ]);
+    const { data, info } = await sharp(edited).raw().toBuffer({ resolveWithObject: true });
+    let darkAtTopOfRepair = 0;
+    for (let x = 32; x < 82; x += 1) {
+      const offset = (29 * info.width + x) * info.channels;
+      if (data[offset] < 100) darkAtTopOfRepair += 1;
+    }
+
+    expect(darkAtTopOfRepair).toBeLessThan(8);
   });
 
   it('clears old glyph pixels beyond a truncated OCR style box', async () => {

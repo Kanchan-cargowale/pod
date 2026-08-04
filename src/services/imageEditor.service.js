@@ -131,18 +131,46 @@ async function buildPaperRepairPatch(image, meta, bbox) {
   const height = bottom - top;
   if (width <= 0 || height <= 0) return null;
 
-  const sampleGap = 2;
-  const sampleHeight = Math.max(2, Math.min(height, top - sampleGap));
-  const sourceTop = Math.max(0, top - sampleGap - sampleHeight);
+  // Never copy from above or below: those strips commonly contain a header
+  // rule and reproduce it as a cross-line through the replacement. Build a
+  // smooth same-row paper gradient from narrow side samples instead.
+  const sampleWidth = Math.max(2, Math.min(6, Math.floor(width / 3)));
+  const sideSamples = [];
+  const candidates = [
+    { left: left - sampleWidth - 2, top, width: sampleWidth, height },
+    { left: right + 2, top, width: sampleWidth, height },
+  ].filter(
+    (sample) =>
+      sample.left >= 0 &&
+      sample.left + sample.width <= meta.width &&
+      sample.top >= 0 &&
+      sample.top + sample.height <= meta.height
+  );
+
   try {
-    const source = await image
-      .clone()
-      .extract({ left, top: sourceTop, width, height: sampleHeight })
-      .resize(width, height, { kernel: sharp.kernel.nearest })
-      .removeAlpha()
-      .toColourspace('srgb')
-      .toBuffer();
-    return { input: source, left, top };
+    for (const sample of candidates) {
+      // eslint-disable-next-line no-await-in-loop
+      const color = await sampleLocalPaperColor(image, meta, {
+        x0: sample.left,
+        y0: sample.top,
+        x1: sample.left + sample.width,
+        y1: sample.top + sample.height,
+      });
+      sideSamples.push(color);
+    }
+    if (!sideSamples.length) return null;
+    const start = sideSamples[0];
+    const end = sideSamples[1] || start;
+    const svg = Buffer.from(
+      `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">` +
+        `<defs><linearGradient id="paper" x1="0" y1="0" x2="1" y2="0">` +
+        `<stop offset="0" stop-color="${rgbToCss(start)}"/>` +
+        `<stop offset="1" stop-color="${rgbToCss(end)}"/>` +
+        `</linearGradient></defs>` +
+        `<rect width="${width}" height="${height}" fill="url(#paper)"/>` +
+        `</svg>`
+    );
+    return { input: svg, left, top };
   } catch (err) {
     return null;
   }

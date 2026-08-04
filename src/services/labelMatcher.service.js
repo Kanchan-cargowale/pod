@@ -346,14 +346,22 @@ function findWeightValueRegions(words, anchors, ctx) {
       // "N.n". A short decimal-shaped token is still usable geometrically
       // when it sits directly below a confirmed weight header.
       const compact = text.replace(/\s/g, '');
+      const normalized = normalizeHeaderText(compact);
       const letters = (compact.match(/[a-z]/gi) || []).length;
       const damagedNumericCore = compact.replace(/^[^\d.,|ilInNoO]+/i, '');
+      const containsHeaderVocabulary =
+        normalized.includes('weight') ||
+        normalized.includes('actual') ||
+        normalized.includes('charged') ||
+        normalized.includes('kg');
       const looksLikeDamagedDecimal =
+        !containsHeaderVocabulary &&
         damagedNumericCore.length >= 2 &&
         damagedNumericCore.length <= 10 &&
         /^[\d.,|ilInNoO]+$/i.test(damagedNumericCore) &&
+        /\d/.test(damagedNumericCore) &&
         /[.,]/.test(damagedNumericCore) &&
-        letters <= 3;
+        letters <= 2;
       return looksLikeDamagedDecimal ? { word, strict: false } : null;
     })
     .filter(Boolean);
@@ -381,6 +389,11 @@ function findWeightValueRegions(words, anchors, ctx) {
 
       const gap = word.bbox.y0 - anchor.bbox.y1;
       const anchorHeight = Math.max(1, anchor.bbox.y1 - anchor.bbox.y0);
+      const anchorWordBottom = Math.max(
+        anchor.bbox.y1,
+        ...anchor.words.map((anchorWord) => anchorWord.bbox?.y1 ?? anchor.bbox.y1)
+      );
+      const candidateTopGap = word.bbox.y0 - anchorWordBottom;
       const normalizedCandidate = normalizeHeaderText(word.text);
       const containsHeaderVocabulary =
         normalizedCandidate.includes('weight') ||
@@ -389,7 +402,7 @@ function findWeightValueRegions(words, anchors, ctx) {
       // Values belong on the row below the full header. A minimum gap keeps
       // OCR fragments such as WEIGHT(kg) from being edited as if numeric data.
       if (
-        gap < Math.max(2, anchorHeight * 0.12) ||
+        candidateTopGap < Math.max(3, anchorHeight * 0.18) ||
         gap > maxVerticalGap ||
         containsHeaderVocabulary
       ) continue;
