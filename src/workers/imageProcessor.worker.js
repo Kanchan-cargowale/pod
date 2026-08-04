@@ -272,7 +272,10 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     const cellRight = nextCenter == null
       ? Math.min(analysis.meta.width, region.bbox.x1 + Math.max(8, rawHeight * 2.8))
       : (regionCenterX + nextCenter) / 2;
-    const safeInset = Math.max(2, Math.round(rawHeight * 0.18));
+    // Keep both erasure and replacement text well inside the value cell. OCR
+    // boxes often begin on the vertical rule itself, so a 2px inset is not
+    // enough on photographed labels with thick or skewed lines.
+    const safeInset = Math.max(6, Math.round(rawHeight * 0.55));
     const replacementText = formatReplacementWeight(newWeight, region.originalText);
     const originalTextIsReliable = /^\d{1,6}(?:\.\d{1,3})?$/.test(region.originalText);
     const targetCenterY = hasSharedWeightRow
@@ -376,7 +379,9 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
           ? styleReference.bbox
           : region.bbox,
       fontScale: 1,
-      textLeftPaddingRatio: 0.03,
+      // The bbox already starts after the protected rule inset; retain an
+      // additional small internal gap so antialiased glyph edges never touch it.
+      textLeftPaddingRatio: 0.08,
     };
   });
 
