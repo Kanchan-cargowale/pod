@@ -6,7 +6,10 @@ const FONT_SIZE_RATIO = 0.86; // font-size relative to bbox height
 const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advance
 const TEXT_LEFT_PADDING_RATIO = 0.08; // inset replacement text inside the cleared value area
 const DEFAULT_TEXT_STYLE = {
-  fontFamily: 'Arial, Helvetica, sans-serif',
+  // Generic SVG families are resolved reliably by libvips/Pango in every
+  // environment. Named fallback lists can be treated as one missing family
+  // and render numeric text as hollow replacement boxes.
+  fontFamily: 'sans-serif',
   fontWeight: 400,
   fill: 'rgb(0,0,0)',
 };
@@ -122,14 +125,17 @@ function estimateFontFamily(inkWidth, inkHeight, originalText) {
   const characterCount = Math.max(1, String(originalText || '').length);
   const characterAspect = inkWidth / Math.max(1, inkHeight * characterCount);
 
-  if (characterAspect < 0.42) return 'Arial Narrow, Arial, sans-serif';
-  if (characterAspect > 0.82) return 'Courier New, monospace';
+  // Keep the measured width classification, but only emit portable generic
+  // families. Stretching sans-serif preserves a narrow source appearance
+  // without depending on Arial Narrow being installed in the runtime.
+  if (characterAspect < 0.42) return 'sans-serif-condensed';
+  if (characterAspect > 0.82) return 'monospace';
   return DEFAULT_TEXT_STYLE.fontFamily;
 }
 
 function numericAdvanceUnits(text, fontFamily) {
-  const isNarrow = fontFamily.startsWith('Arial Narrow');
-  const isMonospace = fontFamily.startsWith('Courier New');
+  const isNarrow = fontFamily === 'sans-serif-condensed';
+  const isMonospace = fontFamily === 'monospace';
   if (isMonospace) return Math.max(1, String(text).length * 0.6);
 
   const digitWidth = isNarrow ? 0.445 : 0.556;
@@ -270,7 +276,15 @@ async function replaceWeightRegions(filePath, replacements) {
   } of replacements) {
     const width = bbox.x1 - bbox.x0;
     const height = bbox.y1 - bbox.y0;
-    if (width <= 0 || height <= 0) continue;
+    const numericReplacement = String(replacementText).trim();
+    if (
+      width <= 0 ||
+      height <= 0 ||
+      !/^\d+(?:\.\d+)?$/.test(numericReplacement) ||
+      !Number.isFinite(Number(numericReplacement))
+    ) {
+      continue;
+    }
 
     // Clear only the OCR word box. Expanding this rectangle can erase nearby
     // table borders, especially the vertical line immediately left of a
@@ -302,12 +316,16 @@ async function replaceWeightRegions(filePath, replacements) {
     const baselineY = bbox.y1 - height * 0.16;
     const textX = bbox.x0 + width * textLeftPaddingRatio;
     const renderedFontSize = textStyle.fontSize * fontScale;
+    const isCondensed = textStyle.fontFamily === 'sans-serif-condensed';
+    const fontFamily = isCondensed ? 'sans-serif' : textStyle.fontFamily;
+    const textTransform = isCondensed ? ` transform="scale(0.82 1)"` : '';
+    const transformedX = isCondensed ? textX / 0.82 : textX;
 
     texts.push(
-      `<text x="${textX}" y="${baselineY}" font-family="${textStyle.fontFamily}" ` +
+      `<text x="${transformedX}" y="${baselineY}" font-family="${fontFamily}" ` +
         `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
-        `fill="${textStyle.fill}">` +
-        `${escapeXml(replacementText)}</text>`
+        `fill="${textStyle.fill}"${textTransform}>` +
+        `${escapeXml(numericReplacement)}</text>`
     );
   }
 

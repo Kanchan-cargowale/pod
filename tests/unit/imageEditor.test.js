@@ -63,6 +63,57 @@ describe('imageEditor.service', () => {
     });
   });
 
+  it('renders numeric replacement glyphs inside the original weight position', async () => {
+    const input = await sharp({
+      create: {
+        width: 180,
+        height: 70,
+        channels: 3,
+        background: { r: 250, g: 250, b: 250 },
+      },
+    })
+      .composite([
+        {
+          input: Buffer.from(
+            '<svg width="180" height="70" xmlns="http://www.w3.org/2000/svg">' +
+              '<text x="52" y="43" font-family="sans-serif" font-size="18" fill="rgb(35,35,35)">42.50</text>' +
+              '</svg>'
+          ),
+        },
+      ])
+      .png()
+      .toBuffer();
+
+    const target = { x0: 52, y0: 26, x1: 102, y1: 46 };
+    const edited = await replaceWeightRegions(input, [
+      {
+        bbox: target,
+        replacementText: '80.00',
+        originalText: '42.50',
+      },
+    ]);
+    const { data, info } = await sharp(edited)
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const darkPixels = [];
+    for (let y = target.y0; y <= target.y1; y += 1) {
+      for (let x = target.x0; x < target.x1 + 18; x += 1) {
+        const offset = (y * info.width + x) * info.channels;
+        if (data[offset] < 140 && data[offset + 1] < 140 && data[offset + 2] < 140) {
+          darkPixels.push({ x, y });
+        }
+      }
+    }
+
+    expect(darkPixels.length).toBeGreaterThan(20);
+    expect(Math.min(...darkPixels.map(({ x }) => x))).toBeGreaterThanOrEqual(target.x0);
+    expect(Math.max(...darkPixels.map(({ x }) => x))).toBeLessThan(target.x1 + 18);
+    expect(Math.min(...darkPixels.map(({ y }) => y))).toBeGreaterThanOrEqual(target.y0);
+    expect(Math.max(...darkPixels.map(({ y }) => y))).toBeLessThanOrEqual(target.y1);
+  });
+
   it('does not erase the table border immediately left of a weight value', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'label-editor-'));
     const inputPath = path.join(tempDir, 'border-test.png');
