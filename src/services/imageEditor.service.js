@@ -265,7 +265,6 @@ async function replaceWeightRegions(filePath, replacements) {
     replacementText,
     originalText = replacementText,
     styleReferenceText = originalText,
-    styleReferenceBbox = bbox,
     fontScale = 1,
     textLeftPaddingRatio = TEXT_LEFT_PADDING_RATIO,
   } of replacements) {
@@ -299,12 +298,7 @@ async function replaceWeightRegions(filePath, replacements) {
     // Sample before adding the clearing rectangle so the original glyphs are
     // still available for per-image style matching.
     // eslint-disable-next-line no-await-in-loop
-    const textStyle = await sampleTextStyle(
-      image,
-      meta,
-      styleReferenceBbox,
-      styleReferenceText
-    );
+    const textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
     const baselineY = bbox.y1 - height * 0.16;
     const textX = bbox.x0 + width * textLeftPaddingRatio;
     const renderedFontSize = textStyle.fontSize * fontScale;

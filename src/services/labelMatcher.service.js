@@ -412,45 +412,12 @@ function formatReplacementWeight(newWeight, originalText) {
   return String(Math.round(Number(newWeight) * 100) / 100);
 }
 
-/** Select nearby, same-row numeric text to the left as the typography source. */
-function findLeftStyleReference(words, targetBbox) {
-  const targetHeight = Math.max(1, targetBbox.y1 - targetBbox.y0);
-  const targetCenterY = (targetBbox.y0 + targetBbox.y1) / 2;
-
-  const candidates = words
-    .filter(({ text, bbox }) => {
-      if (!bbox || !/\d/.test(String(text || '')) || bbox.x1 > targetBbox.x0) return false;
-      const height = bbox.y1 - bbox.y0;
-      const centerY = (bbox.y0 + bbox.y1) / 2;
-      return (
-        height >= targetHeight * 0.45 &&
-        height <= targetHeight * 2.2 &&
-        Math.abs(centerY - targetCenterY) <= Math.max(targetHeight, height) * 0.8
-      );
-    })
-    .map((word) => {
-      const height = word.bbox.y1 - word.bbox.y0;
-      const horizontalGap = targetBbox.x0 - word.bbox.x1;
-      const rowDelta = Math.abs((word.bbox.y0 + word.bbox.y1) / 2 - targetCenterY);
-      const dimensionBonus = /\d\s*[x×]\s*\d/i.test(word.text) ? targetHeight * 2 : 0;
-      return {
-        word,
-        score: horizontalGap + rowDelta * 3 + Math.abs(height - targetHeight) * 2 - dimensionBonus,
-      };
-    })
-    .sort((a, b) => a.score - b.score);
-
-  if (!candidates.length) return null;
-  return { text: candidates[0].word.text.trim(), bbox: { ...candidates[0].word.bbox } };
-}
-
 module.exports = {
   findShipmentId,
   findShipmentIdInFilename,
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
-  findLeftStyleReference,
   buildMergedNumericCandidates,
   isWeightAnchorText,
   isWeightQualifierText,
