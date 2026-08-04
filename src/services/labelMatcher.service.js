@@ -282,7 +282,24 @@ function findWeightAnchors(words) {
         0,
         Math.max(g.bbox.x0, word.bbox.x0) - Math.min(g.bbox.x1, word.bbox.x1)
       );
-      const adjacentOnSameLine = sameLine && horizontalGap <= maxHeight * 1.5;
+      const groupHasWeight = g.words.some((entry) => isWeightAnchorText(entry.text));
+      const wordIsWeight = isWeightAnchorText(word.text);
+      const groupHasQualifier = g.words.some((entry) => isWeightQualifierText(entry.text));
+      const wordIsQualifier = isWeightQualifierText(word.text);
+      // Join ACTUAL/CHARGED with WEIGHT only. Never join ACTUAL and CHARGED
+      // horizontally into one wide anchor spanning neighbouring table cells.
+      const combinedGroupText = normalizeHeaderText(
+        `${g.words.map((entry) => entry.text).join('')}${word.text}`
+      );
+      const formsSplitWeight =
+        Math.abs(combinedGroupText.length - 'weight'.length) <= 1 &&
+        levenshtein(combinedGroupText, 'weight') <= 1;
+      const formsOneHeader =
+        (groupHasWeight && wordIsQualifier) ||
+        (wordIsWeight && groupHasQualifier) ||
+        formsSplitWeight;
+      const adjacentOnSameLine =
+        sameLine && formsOneHeader && horizontalGap <= maxHeight * 1.5;
 
       return stackedInSameColumn || adjacentOnSameLine;
     });
@@ -330,10 +347,12 @@ function findWeightValueRegions(words, anchors, ctx) {
       // when it sits directly below a confirmed weight header.
       const compact = text.replace(/\s/g, '');
       const letters = (compact.match(/[a-z]/gi) || []).length;
+      const damagedNumericCore = compact.replace(/^[^\d.,|ilInNoO]+/i, '');
       const looksLikeDamagedDecimal =
-        compact.length >= 2 &&
-        compact.length <= 10 &&
-        /[.,]/.test(compact) &&
+        damagedNumericCore.length >= 2 &&
+        damagedNumericCore.length <= 10 &&
+        /^[\d.,|ilInNoO]+$/i.test(damagedNumericCore) &&
+        /[.,]/.test(damagedNumericCore) &&
         letters <= 3;
       return looksLikeDamagedDecimal ? { word, strict: false } : null;
     })

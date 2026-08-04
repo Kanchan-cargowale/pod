@@ -7,7 +7,6 @@ const { parentPort } = require('worker_threads');
 const ocrService = require('../services/ocr.service');
 const imageEditor = require('../services/imageEditor.service');
 const { shouldTryQuarterTurns } = require('../services/imageOrientation.service');
-const { inferActualSiblingRegion } = require('../services/weightRegionFallback.service');
 const {
   findShipmentId,
   findShipmentIdInFilename,
@@ -195,16 +194,6 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
   const { input: processingInput, words, match, anchors } = analysis;
   let { regions } = analysis;
 
-  if (regions.length === 1) {
-    const inferredRegions = await inferActualSiblingRegion(
-      processingInput,
-      anchors,
-      regions,
-      analysis.meta
-    );
-    regions = [...inferredRegions, ...regions];
-  }
-
   if (!match) {
     return {
       status: 'unmatched',
@@ -246,8 +235,26 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
         .sort((a, b) => a - b)[Math.floor((baselineSource.length - 1) / 2)]
     : null;
 
+  const sortedRegionCenters = regions
+    .map((region) => (region.bbox.x0 + region.bbox.x1) / 2)
+    .sort((a, b) => a - b);
+
   const replacements = regions.map((region) => {
     const rawHeight = region.bbox.y1 - region.bbox.y0;
+    const regionCenterX = (region.bbox.x0 + region.bbox.x1) / 2;
+    const centerIndex = sortedRegionCenters.indexOf(regionCenterX);
+    const previousCenter = sortedRegionCenters[centerIndex - 1];
+    const nextCenter = sortedRegionCenters[centerIndex + 1];
+    // Midpoints between independently confirmed weight columns are hard cell
+    // limits. A single confirmed region gets conservative local limits only;
+    // it must never expand into SAID TO CONTAIN or another neighbouring cell.
+    const cellLeft = previousCenter == null
+      ? Math.max(0, region.bbox.x0 - Math.max(3, rawHeight * 0.35))
+      : (previousCenter + regionCenterX) / 2;
+    const cellRight = nextCenter == null
+      ? Math.min(analysis.meta.width, region.bbox.x1 + Math.max(8, rawHeight * 2.8))
+      : (regionCenterX + nextCenter) / 2;
+    const safeInset = Math.max(2, Math.round(rawHeight * 0.18));
     const replacementText = formatReplacementWeight(newWeight, region.originalText);
     const originalTextIsReliable = /^\d{1,6}(?:\.\d{1,3})?$/.test(region.originalText);
     const targetCenterY = hasSharedWeightRow
@@ -296,12 +303,15 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       rawWidth,
       rowHeight * Math.max(2.2, estimatedOldLength * 0.68)
     );
+    normalizedBbox.x0 = Math.max(normalizedBbox.x0, cellLeft + safeInset);
+    normalizedBbox.x1 = Math.min(normalizedBbox.x1, cellRight - safeInset);
     const clearBbox = {
-      // Preserve the detected left edge and row while clearing the complete
-      // old number. Never expand left into the vertical table border.
-      x0: normalizedBbox.x0,
+      x0: Math.max(cellLeft + safeInset, normalizedBbox.x0 - 1),
       y0: Math.max(0, normalizedBbox.y0 - 2),
-      x1: Math.min(analysis.meta.width, normalizedBbox.x0 + clearWidth + 2),
+      x1: Math.min(
+        cellRight - safeInset,
+        normalizedBbox.x0 + clearWidth + Math.max(2, rowHeight * 0.35)
+      ),
       y1: Math.min(analysis.meta.height, normalizedBbox.y1 + 2),
     };
 

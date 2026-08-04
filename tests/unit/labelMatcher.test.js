@@ -179,6 +179,28 @@ describe('labelMatcher.service', () => {
       ]);
     });
 
+    it('does not treat a product specification in the next cell as a weight', () => {
+      const anchors = [
+        {
+          bbox: { x0: 285, y0: 250, x1: 380, y1: 275, height: 25 },
+          words: [{ text: 'ACTUAL WEIGHT', bbox: { x0: 285, y0: 250, x1: 380, y1: 275 } }],
+        },
+      ];
+      const words = [
+        { text: '242.6', confidence: 95, bbox: { x0: 288, y0: 296, x1: 330, y1: 312 } },
+        { text: '25A-51.2V', confidence: 93, bbox: { x0: 410, y0: 296, x1: 485, y1: 312 } },
+      ];
+
+      const regions = findWeightValueRegions(words, anchors, {
+        imageHeight: 900,
+        verticalWindowRatio: 0.18,
+        horizontalTolerancePx: 120,
+      });
+
+      expect(regions).toHaveLength(1);
+      expect(regions[0].originalText).toBe('242.6');
+    });
+
     it('uses a damaged decimal-shaped OCR token directly below a confirmed header', () => {
       const anchors = [
         {

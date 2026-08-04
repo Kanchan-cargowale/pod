@@ -122,6 +122,32 @@ function rgbToCss({ r, g, b }) {
   return `rgb(${r},${g},${b})`;
 }
 
+async function buildPaperRepairPatch(image, meta, bbox) {
+  const left = Math.max(0, Math.floor(bbox.x0));
+  const top = Math.max(0, Math.floor(bbox.y0));
+  const right = Math.min(meta.width, Math.ceil(bbox.x1));
+  const bottom = Math.min(meta.height, Math.ceil(bbox.y1));
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 0 || height <= 0) return null;
+
+  const sampleGap = 2;
+  const sampleHeight = Math.max(2, Math.min(height, top - sampleGap));
+  const sourceTop = Math.max(0, top - sampleGap - sampleHeight);
+  try {
+    const source = await image
+      .clone()
+      .extract({ left, top: sourceTop, width, height: sampleHeight })
+      .resize(width, height, { kernel: sharp.kernel.nearest })
+      .removeAlpha()
+      .toColourspace('srgb')
+      .toBuffer();
+    return { input: source, left, top };
+  } catch (err) {
+    return null;
+  }
+}
+
 function luminance({ r, g, b }) {
   return r * 0.2126 + g * 0.7152 + b * 0.0722;
 }
@@ -302,6 +328,7 @@ async function replaceWeightRegions(filePath, replacements) {
   const meta = await image.metadata();
 
   const rects = [];
+  const repairPatches = [];
   const texts = [];
 
   for (const {
@@ -337,17 +364,25 @@ async function replaceWeightRegions(filePath, replacements) {
     const rectW = rectRight - rectX;
     const rectH = rectBottom - rectY;
 
+    // Copy nearby paper texture into the old-glyph area. This preserves scan
+    // grain, shadows and color gradients instead of exposing a flat strip.
     // eslint-disable-next-line no-await-in-loop
-    const usesExpandedClearing = clearBbox !== bbox;
-    const bg = usesExpandedClearing
-      ? await sampleLocalPaperColor(image, meta, clearBbox)
-      : await sampleBackgroundColor(image, meta, bbox);
-    const fill = rgbToCss(bg);
-
-    rects.push(
-      `<rect x="${rectX}" y="${rectY}" width="${rectW}" height="${rectH}" ` +
-        `fill="${fill}" shape-rendering="crispEdges" />`
-    );
+    const repairPatch = await buildPaperRepairPatch(image, meta, {
+      x0: rectX,
+      y0: rectY,
+      x1: rectRight,
+      y1: rectBottom,
+    });
+    if (repairPatch) {
+      repairPatches.push(repairPatch);
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      const bg = await sampleLocalPaperColor(image, meta, clearBbox);
+      rects.push(
+        `<rect x="${rectX}" y="${rectY}" width="${rectW}" height="${rectH}" ` +
+          `fill="${rgbToCss(bg)}" shape-rendering="crispEdges" />`
+      );
+    }
 
     // Sample before adding the clearing rectangle so the original glyphs are
     // still available for per-image style matching.
@@ -378,7 +413,7 @@ async function replaceWeightRegions(filePath, replacements) {
     );
   }
 
-  if (!rects.length) {
+  if (!rects.length && !repairPatches.length) {
     // Nothing matched on this label - return the original bytes untouched.
     return image.toBuffer();
   }
@@ -391,7 +426,10 @@ async function replaceWeightRegions(filePath, replacements) {
   );
 
   return image
-    .composite([{ input: overlaySvg, top: 0, left: 0 }])
+    .composite([
+      ...repairPatches,
+      { input: overlaySvg, top: 0, left: 0 },
+    ])
     .toBuffer();
 }
 
