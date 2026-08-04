@@ -225,36 +225,120 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     };
   }
 
+  const regionHeights = regions
+    .map((region) => region.bbox.y1 - region.bbox.y0)
+    .filter((height) => height > 0)
+    .sort((a, b) => a - b);
+  const hasSharedWeightRow = regions.length > 1;
+  // The shortest detected box is the most reliable glyph-height signal when
+  // OCR has merged a value with header/rule ink into one abnormally tall box.
+  const rowHeight = hasSharedWeightRow
+    ? Math.max(8, regionHeights[0])
+    : regionHeights[0];
+  const plausibleRegions = regions.filter((region) => {
+    const height = region.bbox.y1 - region.bbox.y0;
+    return height <= rowHeight * 1.8;
+  });
+  const baselineSource = plausibleRegions.length ? plausibleRegions : regions;
+  const sharedBottom = hasSharedWeightRow
+    ? baselineSource
+        .map((region) => region.bbox.y1)
+        .sort((a, b) => a - b)[Math.floor((baselineSource.length - 1) / 2)]
+    : null;
+
   const replacements = regions.map((region) => {
-    const regionWidth = region.bbox.x1 - region.bbox.x0;
-    const regionHeight = region.bbox.y1 - region.bbox.y0;
+    const rawHeight = region.bbox.y1 - region.bbox.y0;
     const replacementText = formatReplacementWeight(newWeight, region.originalText);
     const originalTextIsReliable = /^\d{1,6}(?:\.\d{1,3})?$/.test(region.originalText);
-    const usesTinyScanFallback = regionHeight <= 12 && !originalTextIsReliable;
-    const clearBbox =
-      usesTinyScanFallback
-        ? {
-            // Never expand left: these low-resolution OCR boxes begin only
-            // one pixel inside the table's vertical border.
-            x0: region.bbox.x0,
-            y0: Math.max(0, region.bbox.y0 - 1),
-            x1: Math.min(
-              analysis.meta.width,
-              region.bbox.x1 + Math.max(4, regionWidth * 0.4)
-            ),
-            y1: Math.min(analysis.meta.height, region.bbox.y1 + 2),
-          }
-        : undefined;
+    const targetCenterY = hasSharedWeightRow
+      ? sharedBottom - rowHeight / 2
+      : (region.bbox.y0 + region.bbox.y1) / 2;
+    // OCR may split an old value such as "1.40" into "1" and "i.". Recover
+    // immediately adjacent numeric fragments so clearing starts at the true
+    // original left edge instead of leaving the leading digit visible.
+    const adjacentFragments = words.filter((word) => {
+      const text = String(word.text || '').trim();
+      if (!word.bbox || word.bbox === region.bbox || !/^[\d.,|]+$/.test(text)) return false;
+      const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
+      const horizontalGap = Math.max(
+        0,
+        Math.max(region.bbox.x0, word.bbox.x0) - Math.min(region.bbox.x1, word.bbox.x1)
+      );
+      return (
+        Math.abs(centerY - targetCenterY) <= rowHeight * 0.65 &&
+        horizontalGap <= rowHeight * 0.45
+      );
+    });
+    const recoveredX0 = Math.min(
+      region.bbox.x0,
+      ...adjacentFragments.map((word) => word.bbox.x0)
+    );
+    const recoveredX1 = Math.max(
+      region.bbox.x1,
+      ...adjacentFragments.map((word) => word.bbox.x1)
+    );
+    const rawWidth = recoveredX1 - recoveredX0;
+    const normalizedBbox = hasSharedWeightRow
+      ? {
+          x0: recoveredX0,
+          y0: sharedBottom - rowHeight,
+          x1: Math.max(
+            recoveredX1,
+            recoveredX0 + rowHeight * Math.max(2.2, replacementText.length * 0.62)
+          ),
+          y1: sharedBottom,
+        }
+      : { ...region.bbox, x0: recoveredX0, x1: recoveredX1 };
+    const estimatedOldLength = originalTextIsReliable
+      ? region.originalText.length
+      : Math.max(4, replacementText.length);
+    const clearWidth = Math.max(
+      rawWidth,
+      rowHeight * Math.max(2.2, estimatedOldLength * 0.68)
+    );
+    const clearBbox = {
+      // Preserve the detected left edge and row while clearing the complete
+      // old number. Never expand left into the vertical table border.
+      x0: normalizedBbox.x0,
+      y0: Math.max(0, normalizedBbox.y0 - 2),
+      x1: Math.min(analysis.meta.width, normalizedBbox.x0 + clearWidth + 2),
+      y1: Math.min(analysis.meta.height, normalizedBbox.y1 + 2),
+    };
+
+    const styleReference = words
+      .filter((word) => {
+        const text = String(word.text || '').trim();
+        if (
+          !word.bbox ||
+          !/\d/.test(text) ||
+          word.bbox.x1 > normalizedBbox.x0 - rowHeight
+        ) return false;
+        const height = word.bbox.y1 - word.bbox.y0;
+        const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
+        return (
+          height >= rowHeight * 0.55 &&
+          height <= rowHeight * 1.8 &&
+          Math.abs(centerY - targetCenterY) <= rowHeight * 1.1
+        );
+      })
+      .sort((a, b) => b.bbox.x1 - a.bbox.x1)[0];
+    const useExternalStyle = !originalTextIsReliable || rawHeight > rowHeight * 1.8;
+
     return {
-      bbox: region.bbox,
+      bbox: normalizedBbox,
       clearBbox,
       replacementText,
       originalText: region.originalText,
-      styleReferenceText: usesTinyScanFallback
-        ? replacementText.replace(/\d/g, '0')
-        : region.originalText,
-      fontScale: usesTinyScanFallback ? 0.82 : 1,
-      textLeftPaddingRatio: usesTinyScanFallback ? 0.03 : undefined,
+      styleReferenceText: useExternalStyle && styleReference
+        ? styleReference.text
+        : originalTextIsReliable
+          ? region.originalText
+          : replacementText.replace(/\d/g, '0'),
+      styleReferenceBbox: useExternalStyle && styleReference
+        ? styleReference.bbox
+        : region.bbox,
+      fontScale: 1,
+      textLeftPaddingRatio: 0.03,
     };
   });
 
