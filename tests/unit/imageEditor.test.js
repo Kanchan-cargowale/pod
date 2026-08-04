@@ -9,6 +9,8 @@ const {
   replaceWeightRegions,
   calculateFontSize,
   sampleTextStyle,
+  shrinkClearRectAroundRules,
+  computePageStyle,
 } = require('../../src/services/imageEditor.service');
 
 describe('imageEditor.service', () => {
@@ -60,6 +62,116 @@ describe('imageEditor.service', () => {
       expect(regular.fontWeight).toBeLessThanOrEqual(bold.fontWeight);
       expect(regular.fontSize).toBeGreaterThan(8);
       expect(bold.fontSize).toBeGreaterThan(8);
+    });
+
+    it('uses the darkest ink cluster so blurred gray prints are not rendered faded', async () => {
+      // Simulates camera blur: core glyph pixels around rgb(60) surrounded by
+      // a wide anti-aliased halo around rgb(150) on near-white paper.
+      const svg = Buffer.from(
+        '<svg width="60" height="30" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="60" height="30" fill="rgb(235,235,235)" />' +
+          '<rect x="10" y="8" width="16" height="14" fill="rgb(150,150,150)" />' +
+          '<rect x="13" y="11" width="10" height="8" fill="rgb(60,60,60)" />' +
+          '<rect x="30" y="8" width="16" height="14" fill="rgb(150,150,150)" />' +
+          '<rect x="33" y="11" width="10" height="8" fill="rgb(60,60,60)" />' +
+          '</svg>'
+      );
+      const image = sharp(svg);
+      const meta = await image.metadata();
+
+      const style = await sampleTextStyle(
+        image,
+        meta,
+        { x0: 5, y0: 4, x1: 55, y1: 26 },
+        '80.00'
+      );
+
+      const red = Number(style.fill.match(/\d+/)[0]);
+      expect(red).toBeLessThan(100); // dark cluster (~60), not the halo (~150)
+      expect(style.measured).toBe(true);
+    });
+  });
+
+  describe('shrinkClearRectAroundRules', () => {
+    it('keeps a vertical rule swallowed by the OCR box intact', () => {
+      const width = 60;
+      const height = 40;
+      const gray = new Uint8Array(width * height).fill(255);
+      for (let y = 0; y < height; y += 1) {
+        gray[y * width + 10] = 0;
+        gray[y * width + 11] = 0;
+      }
+      const rect = shrinkClearRectAroundRules(
+        gray,
+        { width, height },
+        { x: 9, y: 18, right: 50, bottom: 30 },
+        { r: 255, g: 255, b: 255 }
+      );
+      expect(rect.x).toBeGreaterThanOrEqual(12);
+      expect(rect.right).toBe(50);
+    });
+
+    it('leaves glyph-like strokes alone (short dark runs are not rules)', () => {
+      const width = 60;
+      const height = 40;
+      const gray = new Uint8Array(width * height).fill(255);
+      // A 7px tall glyph stroke at the left probe zone - too short to be a rule.
+      for (let y = 20; y < 27; y += 1) gray[y * width + 12] = 0;
+      const rect = { x: 9, y: 18, right: 50, bottom: 30 };
+      const shrunk = shrinkClearRectAroundRules(
+        gray,
+        { width, height },
+        rect,
+        { r: 255, g: 255, b: 255 }
+      );
+      expect(shrunk).toEqual(rect);
+    });
+  });
+
+  describe('computePageStyle', () => {
+    it('derives size and ink color from sibling numeric text on the same page', async () => {
+      const svg = Buffer.from(
+        '<svg width="200" height="120" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="200" height="120" fill="white" />' +
+          '<text x="20" y="102" font-family="Arial" font-size="26" font-weight="700" ' +
+          'fill="rgb(10,12,14)">450.00</text></svg>'
+      );
+      const image = sharp(svg);
+      const meta = await image.metadata();
+
+      const pageStyle = await computePageStyle(
+        image,
+        meta,
+        [{ bbox: { x0: 20, y0: 78, x1: 130, y1: 105 }, text: '450.00' }],
+        { x0: 15, y0: 20, x1: 70, y1: 42 },
+        new Map()
+      );
+
+      expect(pageStyle).not.toBeNull();
+      expect(pageStyle.fontSize).toBeGreaterThan(14);
+      expect(pageStyle.fontSize).toBeLessThan(60);
+      expect(pageStyle.fillLuma).toBeLessThan(60);
+    });
+
+    it('ignores sibling text with a wildly different glyph height', async () => {
+      const svg = Buffer.from(
+        '<svg width="300" height="200" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="300" height="200" fill="white" />' +
+          '<text x="10" y="180" font-family="Arial" font-size="80" fill="black">307775718</text>' +
+          '</svg>'
+      );
+      const image = sharp(svg);
+      const meta = await image.metadata();
+
+      const pageStyle = await computePageStyle(
+        image,
+        meta,
+        [{ bbox: { x0: 10, y0: 110, x1: 290, y1: 185 }, text: '307775718' }],
+        { x0: 15, y0: 20, x1: 70, y1: 36 },
+        new Map()
+      );
+
+      expect(pageStyle).toBeNull();
     });
   });
 
@@ -148,5 +260,96 @@ describe('imageEditor.service', () => {
     expect(data[offset]).toBeGreaterThan(230);
     expect(data[offset + 1]).toBeGreaterThan(230);
     expect(data[offset + 2]).toBeGreaterThan(230);
+  });
+
+  it('keeps the table border when the OCR box itself swallows the line', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'label-editor-'));
+    const inputPath = path.join(tempDir, 'border-swallowed.png');
+
+    try {
+      await sharp({
+        create: { width: 120, height: 80, channels: 3, background: { r: 255, g: 255, b: 255 } },
+      })
+        .composite([
+          {
+            input: Buffer.from(
+              '<svg width="120" height="80" xmlns="http://www.w3.org/2000/svg">' +
+                '<line x1="10" y1="0" x2="10" y2="80" stroke="black" stroke-width="2" />' +
+                '<text x="16" y="42" font-family="Arial" font-size="16">268.78</text>' +
+                '</svg>'
+            ),
+          },
+        ])
+        .png()
+        .toFile(inputPath);
+
+      const before = await sharp(inputPath).raw().toBuffer({ resolveWithObject: true });
+      // OCR box starts 3px left of the glyphs, merging the border into the box.
+      const edited = await replaceWeightRegions(inputPath, [
+        {
+          bbox: { x0: 8, y0: 28, x1: 70, y1: 44 },
+          replacementText: '300.00',
+          originalText: '268.78',
+        },
+      ]);
+      const after = await sharp(edited).raw().toBuffer({ resolveWithObject: true });
+
+      const channels = before.info.channels;
+      for (let y = 0; y < before.info.height; y += 1) {
+        for (const x of [9, 10]) {
+          const offset = (y * before.info.width + x) * channels;
+          expect(after.data.subarray(offset, offset + channels)).toEqual(
+            before.data.subarray(offset, offset + channels)
+          );
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('matches the ink of sibling numbers when the value itself is faded', async () => {
+    // Faded gray weight value, but the box-dimension figure below is solid black.
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="220" height="140" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="220" height="140" fill="white" />' +
+          '<text x="20" y="46" font-family="Arial" font-size="20" ' +
+          'fill="rgb(150,150,150)">12.50</text>' +
+          '<text x="20" y="116" font-family="Arial" font-size="20" font-weight="700" ' +
+          'fill="rgb(15,15,15)">304515</text>' +
+          '</svg>'
+      )
+    )
+      .png()
+      .toBuffer();
+
+    const valueBbox = { x0: 20, y0: 30, x1: 95, y1: 48 };
+    const replacement = {
+      bbox: valueBbox,
+      replacementText: '88.00',
+      originalText: '12.50',
+    };
+    const darkestPixel = async (buffer) => {
+      const { data, info } = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
+      let darkest = 255;
+      for (let y = 30; y < 48; y += 1) {
+        for (let x = 20; x < 95; x += 1) {
+          const offset = (y * info.width + x) * info.channels;
+          darkest = Math.min(darkest, data[offset], data[offset + 1], data[offset + 2]);
+        }
+      }
+      return darkest;
+    };
+
+    const withoutRefs = await replaceWeightRegions(input, [replacement]);
+    const withRefs = await replaceWeightRegions(input, [replacement], {
+      styleReferences: [{ bbox: { x0: 20, y0: 98, x1: 95, y1: 118 }, text: '304515' }],
+    });
+
+    const fadedDarkest = await darkestPixel(withoutRefs);
+    const matchedDarkest = await darkestPixel(withRefs);
+    expect(matchedDarkest).toBeLessThan(fadedDarkest - 60);
+    expect(matchedDarkest).toBeLessThan(80);
   });
 });

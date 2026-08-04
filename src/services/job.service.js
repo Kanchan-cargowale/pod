@@ -26,6 +26,9 @@ function newJobState(jobId, totalFiles) {
     matchedFiles: 0,
     unmatchedFiles: 0,
     createdAt: new Date().toISOString(),
+    startedAt: null, // set when OCR/editing actually begins
+    completedAt: null,
+    durationMs: null, // completedAt - startedAt, for "how long did it take"
     updatedAt: new Date().toISOString(),
     results: [],
     error: null,
@@ -58,6 +61,8 @@ async function createJob({ imagePaths, idWeightMap, tempUploadsDir }) {
     const current = jobs.get(jobId) || state;
     current.status = 'failed';
     current.error = err.message;
+    current.completedAt = new Date().toISOString();
+    current.durationMs = Date.now() - new Date(current.startedAt || current.createdAt).getTime();
     current.updatedAt = new Date().toISOString();
     await persist(current);
   });
@@ -70,6 +75,7 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
 
   const state = jobs.get(jobId);
   state.status = 'processing';
+  state.startedAt = new Date().toISOString();
   await persist(state);
 
   const outputsDir = storage.jobOutputsDir(jobId);
@@ -104,6 +110,8 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
 
   state.status = 'completed';
   state.zipReady = true;
+  state.completedAt = new Date().toISOString();
+  state.durationMs = Date.now() - new Date(state.startedAt || state.createdAt).getTime();
   state.updatedAt = new Date().toISOString();
   await persist(state);
 }

@@ -5,6 +5,13 @@ const sharp = require('sharp');
 const FONT_SIZE_RATIO = 0.86; // font-size relative to bbox height
 const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advance
 const TEXT_LEFT_PADDING_RATIO = 0.08; // inset replacement text inside the cleared value area
+const BORDER_GUARD_PX = 8; // how far inside the clear box a table rule may sit
+const BORDER_OUTSIDE_PX = 4; // how far outside the clear box we look for rules
+const MIN_RULE_RUN_RATIO = 1.2; // rule lines run much longer than glyph strokes
+const MAX_PAGE_STYLE_REFERENCES = 40; // sibling numbers sampled per value
+const PAGE_STYLE_HEIGHT_RATIO_MIN = 0.45; // ignore much smaller page text
+const PAGE_STYLE_HEIGHT_RATIO_MAX = 2.4; // ignore much larger page text (e.g. barcode IDs)
+const PAGE_STYLE_SIZE_DEVIATION = 0.45; // trust own ink unless it disagrees wildly
 const DEFAULT_TEXT_STYLE = {
   fontFamily: 'Arial, Helvetica, sans-serif',
   fontWeight: 400,
@@ -42,17 +49,22 @@ async function sampleBackgroundColor(image, meta, bbox) {
       .toBuffer({ resolveWithObject: true });
 
     const channels = info.channels;
-    const samples = { r: [], g: [], b: [] };
+    const pixels = [];
     for (let i = 0; i < data.length; i += channels) {
-      samples.r.push(data[i]);
-      samples.g.push(data[i + 1]);
-      samples.b.push(data[i + 2]);
+      const pixel = { r: data[i], g: data[i + 1], b: data[i + 2] };
+      pixel.luma = luminance(pixel);
+      pixels.push(pixel);
     }
-    const median = (arr) => {
-      const sorted = [...arr].sort((a, b) => a - b);
-      return sorted[Math.floor(sorted.length / 2)];
+    // A horizontal table rule can cross the sample strip above the value.
+    // Drop the darkest 40% of pixels before taking the median so line ink
+    // cannot tint the background used to repaint the cleared cell.
+    const cutoff = percentile(pixels.map((pixel) => pixel.luma), 0.4);
+    const lightPixels = pixels.filter((pixel) => pixel.luma >= cutoff);
+    return {
+      r: medianChannel(lightPixels, 'r'),
+      g: medianChannel(lightPixels, 'g'),
+      b: medianChannel(lightPixels, 'b'),
     };
-    return { r: median(samples.r), g: median(samples.g), b: median(samples.b) };
   } catch (err) {
     return { r: 255, g: 255, b: 255 };
   }
@@ -155,7 +167,13 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
   const height = Math.min(meta.height - top, Math.max(1, Math.ceil(bbox.y1) - top));
 
   if (width <= 0 || height <= 0) {
-    return { ...DEFAULT_TEXT_STYLE, fontSize: calculateFontSize(width, height, originalText) };
+    return {
+      ...DEFAULT_TEXT_STYLE,
+      fillRgb: { r: 0, g: 0, b: 0 },
+      fillLuma: 0,
+      measured: false,
+      fontSize: calculateFontSize(width, height, originalText),
+    };
   }
 
   try {
@@ -190,6 +208,9 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
     if (inkPixels.length < 3 || contrastRange < 10) {
       return {
         ...DEFAULT_TEXT_STYLE,
+        fillRgb: { r: 0, g: 0, b: 0 },
+        fillLuma: 0,
+        measured: false,
         fontSize: calculateFontSize(width, height, originalText),
       };
     }
@@ -200,18 +221,21 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
     const inkHeight = Math.max(...ys) - Math.min(...ys) + 1;
     const fontFamily = estimateFontFamily(inkWidth, inkHeight, originalText);
 
-    // Use only solid stroke pixels for the fill color. Including anti-aliased
-    // edge pixels would make the replacement lighter than the source print.
-    const coreThreshold = Math.max(inkThreshold, contrastRange * 0.62);
-    const corePixels = inkPixels.filter(
-      (pixel) => localBackground - pixel.luma >= coreThreshold
-    );
+    // Use the darkest quarter of the ink for the fill color. A plain median
+    // of the "core" pixels lands on gray anti-aliased edge pixels for blurred
+    // camera photos, which made replacement text look washed out next to the
+    // original print. The eye matches the darkest stroke pixels, so sample
+    // those and take the median per channel inside that dark cluster.
+    const inkLumas = inkPixels.map((pixel) => pixel.luma);
+    const coreCutoff = percentile(inkLumas, 0.25);
+    const corePixels = inkPixels.filter((pixel) => pixel.luma <= coreCutoff);
     const colorPixels = corePixels.length >= 3 ? corePixels : inkPixels;
-    const fill = rgbToCss({
+    const fillRgb = {
       r: medianChannel(colorPixels, 'r'),
       g: medianChannel(colorPixels, 'g'),
       b: medianChannel(colorPixels, 'b'),
-    });
+    };
+    const fill = rgbToCss(fillRgb);
 
     const inkArea = Math.max(1, inkWidth * inkHeight);
     const strokeDensity = inkPixels.length / inkArea;
@@ -223,13 +247,149 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
     const heightBasedSize = inkHeight / 0.72;
     const fontSize = Math.max(8, Math.min(widthBasedSize, heightBasedSize));
 
-    return { fontFamily, fontWeight, fill, fontSize };
+    return { fontFamily, fontWeight, fill, fillRgb, fillLuma: luminance(fillRgb), measured: true, fontSize };
   } catch (err) {
     return {
       ...DEFAULT_TEXT_STYLE,
+      fillRgb: { r: 0, g: 0, b: 0 },
+      fillLuma: 0,
+      measured: false,
       fontSize: calculateFontSize(width, height, originalText),
     };
   }
+}
+
+/**
+ * Shrinks a clearing rectangle so it never paints over the table's printed
+ * rule lines. OCR word boxes frequently touch or swallow the vertical border
+ * immediately left of a weight value (or the one right of it); repainting
+ * that rectangle with background color erased the line. A rule line is
+ * detected by a continuous dark run much longer than any glyph stroke in the
+ * box (>1.2x the box's own size, checked over an extended scan window).
+ * Only rules sitting within a small guard zone of the box edge are treated
+ * as borders - anything deeper inside the box is a glyph and stays cleared.
+ *
+ * @param {Uint8Array} gray single-channel pixel data of the whole image
+ * @param {{width:number,height:number}} grayInfo dimensions of `gray`
+ * @param {{x:number,y:number,right:number,bottom:number}} rect integer clear rect
+ * @param {{r:number,g:number,b:number}} bg sampled local paper color
+ */
+function shrinkClearRectAroundRules(gray, grayInfo, rect, bg) {
+  const imgWidth = grayInfo.width;
+  const imgHeight = grayInfo.height;
+  const width = rect.right - rect.x;
+  const height = rect.bottom - rect.y;
+  if (width <= 2 || height <= 2) return rect;
+
+  const darkLimit = Math.min(150, Math.max(50, Math.round(luminance(bg) * 0.58)));
+
+  // Vertical rules: columns scan over an extended vertical window.
+  const scanTop = Math.max(0, rect.y - height);
+  const scanBottom = Math.min(imgHeight - 1, rect.bottom + height);
+  const minVerticalRun = Math.max(8, Math.round(height * MIN_RULE_RUN_RATIO));
+  const columnMaxRun = (col) => {
+    let best = 0;
+    let run = 0;
+    for (let row = scanTop; row <= scanBottom; row += 1) {
+      if (gray[row * imgWidth + col] < darkLimit) run += 1;
+      else run = 0;
+      if (run > best) best = run;
+    }
+    return best;
+  };
+
+  let x0 = rect.x;
+  let x1 = rect.right;
+  const leftProbeEnd = Math.min(rect.right - 1, rect.x + BORDER_GUARD_PX);
+  for (let col = Math.max(0, rect.x - BORDER_OUTSIDE_PX); col <= leftProbeEnd; col += 1) {
+    if (columnMaxRun(col) >= minVerticalRun) x0 = Math.max(x0, col + 1);
+  }
+  const rightProbeStart = Math.max(x0, rect.right - BORDER_GUARD_PX);
+  for (let col = rightProbeStart; col <= Math.min(imgWidth - 1, rect.right + BORDER_OUTSIDE_PX); col += 1) {
+    if (columnMaxRun(col) >= minVerticalRun) x1 = Math.min(x1, col);
+  }
+
+  // Horizontal rules: rows scan over an extended horizontal window.
+  const currentWidth = x1 - x0;
+  if (currentWidth <= 2) return { x: x0, y: rect.y, right: x1, bottom: rect.bottom };
+  const scanLeft = Math.max(0, x0 - currentWidth);
+  const scanRight = Math.min(imgWidth - 1, x1 + currentWidth);
+  const minHorizontalRun = Math.max(8, Math.round(currentWidth * MIN_RULE_RUN_RATIO));
+  const rowMaxRun = (row) => {
+    let best = 0;
+    let run = 0;
+    for (let col = scanLeft; col <= scanRight; col += 1) {
+      if (gray[row * imgWidth + col] < darkLimit) run += 1;
+      else run = 0;
+      if (run > best) best = run;
+    }
+    return best;
+  };
+
+  let y0 = rect.y;
+  let y1 = rect.bottom;
+  const topProbeEnd = Math.min(rect.bottom - 1, rect.y + BORDER_GUARD_PX);
+  for (let row = Math.max(0, rect.y - BORDER_OUTSIDE_PX); row <= topProbeEnd; row += 1) {
+    if (rowMaxRun(row) >= minHorizontalRun) y0 = Math.max(y0, row + 1);
+  }
+  const bottomProbeStart = Math.max(y0, rect.bottom - BORDER_GUARD_PX);
+  for (let row = bottomProbeStart; row <= Math.min(imgHeight - 1, rect.bottom + BORDER_OUTSIDE_PX); row += 1) {
+    if (rowMaxRun(row) >= minHorizontalRun) y1 = Math.min(y1, row);
+  }
+
+  return { x: x0, y: y0, right: x1, bottom: y1 };
+}
+
+/**
+ * Derives a per-image reference style from other numeric words printed on
+ * the same page (e.g. box dimension values, counts, dates). Only words with
+ * a similar glyph height to the value being replaced are considered, so a
+ * giant barcode ID or a tiny footnote cannot skew the reference. The result
+ * is used when a value's own ink measurement failed or disagrees wildly,
+ * and to keep the replacement color as dark as the page's other numbers.
+ */
+async function computePageStyle(image, meta, styleReferences, regionBbox, cache) {
+  const regionHeight = Math.max(1, regionBbox.y1 - regionBbox.y0);
+  const regionWidth = Math.max(1, regionBbox.x1 - regionBbox.x0);
+
+  const ranked = [];
+  for (const ref of styleReferences) {
+    const refWidth = ref.bbox.x1 - ref.bbox.x0;
+    const refHeight = ref.bbox.y1 - ref.bbox.y0;
+    if (refWidth < 3 || refHeight < 3) continue;
+    if (refWidth > regionWidth * 8) continue;
+    const ratio = refHeight / regionHeight;
+    if (ratio < PAGE_STYLE_HEIGHT_RATIO_MIN || ratio > PAGE_STYLE_HEIGHT_RATIO_MAX) continue;
+    ranked.push({ ref, rank: Math.abs(ratio - 1) });
+  }
+  ranked.sort((a, b) => a.rank - b.rank);
+  const selected = ranked.slice(0, MAX_PAGE_STYLE_REFERENCES);
+
+  const sizes = [];
+  const fillRgbs = [];
+  for (const { ref } of selected) {
+    let style = cache.get(ref);
+    if (style === undefined) {
+      // eslint-disable-next-line no-await-in-loop
+      style = await sampleTextStyle(image, meta, ref.bbox, ref.text);
+      cache.set(ref, style);
+    }
+    if (!style.measured) continue;
+    sizes.push(style.fontSize);
+    fillRgbs.push(style.fillRgb);
+  }
+  if (!sizes.length) return null;
+
+  const fillRgb = {
+    r: medianChannel(fillRgbs, 'r'),
+    g: medianChannel(fillRgbs, 'g'),
+    b: medianChannel(fillRgbs, 'b'),
+  };
+  return {
+    fontSize: percentile(sizes, 0.5),
+    fillRgb,
+    fillLuma: luminance(fillRgb),
+  };
 }
 
 /**
@@ -251,13 +411,34 @@ function calculateFontSize(width, height, replacementText) {
  *
  * @param {string|Buffer} filePath source image path or normalized image buffer
  * @param {Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, clearBbox?:{x0:number,y0:number,x1:number,y1:number}, replacementText:string}>} replacements
+ * @param {{styleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>}} [options]
+ *        styleReferences are other numeric words on the same page used for
+ *        per-image typography (size + ink color), e.g. box dimension values.
  */
-async function replaceWeightRegions(filePath, replacements) {
+async function replaceWeightRegions(filePath, replacements, options = {}) {
+  const { styleReferences = [] } = options;
   const image = sharp(filePath);
   const meta = await image.metadata();
 
   const rects = [];
   const texts = [];
+
+  // Single-channel copy for table-rule detection; decoded at most once and
+  // only when there is actually something to clear.
+  let grayCache = null;
+  const grayPixels = async () => {
+    if (!grayCache) {
+      const { data, info } = await image
+        .clone()
+        .removeAlpha()
+        .greyscale()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      grayCache = { data, info };
+    }
+    return grayCache;
+  };
+  const pageStyleCache = new Map();
 
   for (const {
     bbox,
@@ -276,12 +457,10 @@ async function replaceWeightRegions(filePath, replacements) {
     // table borders, especially the vertical line immediately left of a
     // weight value. Integer edges plus crispEdges prevent SVG antialiasing
     // from leaking the background fill into neighbouring pixels.
-    const rectX = Math.max(0, Math.floor(clearBbox.x0));
-    const rectY = Math.max(0, Math.floor(clearBbox.y0));
-    const rectRight = Math.min(meta.width, Math.ceil(clearBbox.x1));
-    const rectBottom = Math.min(meta.height, Math.ceil(clearBbox.y1));
-    const rectW = rectRight - rectX;
-    const rectH = rectBottom - rectY;
+    let rectX = Math.max(0, Math.floor(clearBbox.x0));
+    let rectY = Math.max(0, Math.floor(clearBbox.y0));
+    let rectRight = Math.min(meta.width, Math.ceil(clearBbox.x1));
+    let rectBottom = Math.min(meta.height, Math.ceil(clearBbox.y1));
 
     // eslint-disable-next-line no-await-in-loop
     const usesExpandedClearing = clearBbox !== bbox;
@@ -290,15 +469,59 @@ async function replaceWeightRegions(filePath, replacements) {
       : await sampleBackgroundColor(image, meta, bbox);
     const fill = rgbToCss(bg);
 
-    rects.push(
-      `<rect x="${rectX}" y="${rectY}" width="${rectW}" height="${rectH}" ` +
-        `fill="${fill}" shape-rendering="crispEdges" />`
+    // Shrink the clear rect around any printed table rule it touches, so the
+    // vertical line left of the value (and any other border) survives intact.
+    // eslint-disable-next-line no-await-in-loop
+    const { data: gray, info: grayInfo } = await grayPixels();
+    const shrunk = shrinkClearRectAroundRules(
+      gray,
+      grayInfo,
+      { x: rectX, y: rectY, right: rectRight, bottom: rectBottom },
+      bg
     );
+    rectX = shrunk.x;
+    rectY = shrunk.y;
+    rectRight = shrunk.right;
+    rectBottom = shrunk.bottom;
+    const rectW = rectRight - rectX;
+    const rectH = rectBottom - rectY;
+
+    if (rectW > 0 && rectH > 0) {
+      rects.push(
+        `<rect x="${rectX}" y="${rectY}" width="${rectW}" height="${rectH}" ` +
+          `fill="${fill}" shape-rendering="crispEdges" />`
+      );
+    }
 
     // Sample before adding the clearing rectangle so the original glyphs are
     // still available for per-image style matching.
     // eslint-disable-next-line no-await-in-loop
-    const textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
+    let textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
+
+    // Align the replacement with the page's other numbers (size + ink color)
+    // when the value's own ink measurement is missing, wildly off, or lighter.
+    if (styleReferences.length) {
+      // eslint-disable-next-line no-await-in-loop
+      const pageStyle = await computePageStyle(image, meta, styleReferences, bbox, pageStyleCache);
+      if (pageStyle) {
+        if (!textStyle.measured || textStyle.fillLuma > pageStyle.fillLuma) {
+          textStyle = {
+            ...textStyle,
+            fill: rgbToCss(pageStyle.fillRgb),
+            fillRgb: pageStyle.fillRgb,
+            fillLuma: pageStyle.fillLuma,
+          };
+        }
+        const sizeDeviation = Math.abs(textStyle.fontSize - pageStyle.fontSize) / pageStyle.fontSize;
+        if (!textStyle.measured || sizeDeviation > PAGE_STYLE_SIZE_DEVIATION) {
+          textStyle = {
+            ...textStyle,
+            fontSize: Math.max(8, Math.min(pageStyle.fontSize, height / 0.6)),
+          };
+        }
+      }
+    }
+
     const baselineY = bbox.y1 - height * 0.16;
     const textX = bbox.x0 + width * textLeftPaddingRatio;
     const renderedFontSize = textStyle.fontSize * fontScale;
@@ -334,4 +557,6 @@ module.exports = {
   sampleLocalPaperColor,
   sampleTextStyle,
   calculateFontSize,
+  shrinkClearRectAroundRules,
+  computePageStyle,
 };

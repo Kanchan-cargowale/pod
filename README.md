@@ -29,9 +29,15 @@ real files, not mocks.
      coordinates for one template.
 4. **Edit** — `src/services/imageEditor.service.js` uses Sharp to:
    - Sample the real local background color around each matched value box
-     (not just assume white).
-   - Paint over just that region and re-render the new weight as text at
-     matching size/position, leaving every other pixel byte-identical.
+     (not just assume white), ignoring any table rule crossing the sample.
+   - Shrink the clearing rectangle around detected table rules so printed
+     border lines (e.g. the vertical line left of a value) are never erased.
+   - Paint over just that region and re-render the new weight as text,
+     sampling the value's own pixels for size/ink and cross-checking them
+     against other numeric words on the same page (box dimensions, counts)
+     so the replacement matches the image's typography even when the
+     original value is faint or blurred, leaving every other pixel
+     byte-identical.
 5. **Scale** — each image is OCR'd + edited inside a dedicated
    `worker_threads` worker (`src/workers/imageProcessor.worker.js`), pooled
    by `src/services/workerPool.service.js`, so hundreds of labels are
@@ -139,12 +145,16 @@ Response `202`:
   "processedFiles": 47,
   "matchedFiles": 45,
   "unmatchedFiles": 2,
+  "startedAt": "2026-08-04T10:15:30.000Z", // when OCR/editing began
+  "completedAt": null,                    // set on completion/failure
+  "durationMs": null,                     // total processing time once done
   "results": [
     {
       "filename": "LM_POD_....jpeg",
       "status": "ok",
       "shipmentId": "307775718",
       "newWeight": 900,
+      "processingMs": 4123,               // per-image OCR + edit time
       "replacedRegions": [
         { "originalText": "802.91", "newText": "900.00", "bbox": { "...": "..." } }
       ]
@@ -152,6 +162,10 @@ Response `202`:
   ]
 }
 ```
+
+The web UI surfaces the same timing: a live "Time" stat in the results
+header (ticks while processing, freezes at the total once done) and a
+per-file "Time" row on each result card.
 
 `status` per file: `ok`, `unmatched` (no ID from the mapping found on the
 page), `id_matched_no_weight_region` (ID found, but no weight column could

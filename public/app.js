@@ -20,6 +20,7 @@
   const statProcessed = document.getElementById('stat-processed');
   const statMatched = document.getElementById('stat-matched');
   const statUnmatched = document.getElementById('stat-unmatched');
+  const statTime = document.getElementById('stat-time');
   const activityIndicator = document.getElementById('activity-indicator');
   const activityText = document.getElementById('activity-text');
   const resultCount = document.getElementById('result-count');
@@ -287,6 +288,7 @@
     statProcessed.textContent = processed;
     statMatched.textContent = job.matchedFiles || 0;
     statUnmatched.textContent = job.unmatchedFiles || 0;
+    statTime.textContent = elapsedTimeText(job);
     progressPercent.textContent = `${percent}%`;
     progressFill.style.width = `${percent}%`;
     jobIdLabel.textContent = `${processed} of ${total} files`;
@@ -326,6 +328,8 @@
     const weightRow = node.querySelector('.weight-row');
     const weightValues = node.querySelector('.weight-values');
     const reason = node.querySelector('.card-reason');
+    const timeRow = node.querySelector('.time-row');
+    const timeValue = node.querySelector('.card-time-value');
 
     const status = result.status || 'unknown';
     const previewUrl = `/api/jobs/${jobId}/preview/${encodeURIComponent(result.filename)}`;
@@ -355,6 +359,12 @@
       if (!result.shipmentId) shipmentRow.remove();
       weightRow.remove();
       reason.textContent = buildReasonText(result);
+    }
+
+    if (Number.isFinite(result.processingMs)) {
+      timeValue.textContent = formatDuration(result.processingMs);
+    } else {
+      timeRow.remove();
     }
 
     return node;
@@ -430,6 +440,7 @@
     statProcessed.textContent = '0';
     statMatched.textContent = '0';
     statUnmatched.textContent = '0';
+    statTime.textContent = '-';
     setActivityState('queued');
     progressPercent.textContent = '0%';
     progressFill.style.width = '0%';
@@ -491,6 +502,28 @@
 
   function formatStatus(status) {
     return String(status || 'unknown').replaceAll('_', ' ');
+  }
+
+  function formatDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return '-';
+    if (ms < 1000) return `${Math.round(ms)} ms`;
+    const totalSeconds = ms / 1000;
+    if (totalSeconds < 60) return `${totalSeconds.toFixed(1)} s`;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.round(totalSeconds % 60);
+    return `${minutes}m ${seconds}s`;
+  }
+
+  // Live batch clock: ticks up from startedAt while the job runs, then
+  // freezes at the server's measured durationMs once it completes.
+  function elapsedTimeText(job) {
+    const startedAt = job.startedAt || job.createdAt;
+    if (!startedAt) return '-';
+    if (Number.isFinite(job.durationMs)) {
+      return formatDuration(job.durationMs);
+    }
+    if (job.status === 'queued') return '-';
+    return formatDuration(Date.now() - new Date(startedAt).getTime());
   }
 
   function formatBytes(bytes) {

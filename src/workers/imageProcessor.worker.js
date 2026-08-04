@@ -10,7 +10,6 @@ const { shouldTryQuarterTurns } = require('../services/imageOrientation.service'
 const { inferActualSiblingRegion } = require('../services/weightRegionFallback.service');
 const {
   findShipmentId,
-  findShipmentIdInFilename,
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
@@ -68,6 +67,8 @@ function extractCandidateIds(words, minConfidence) {
  *      preserving everything else, and write the result to disk.
  */
 async function processImage({ filePath, outputPath, idWeightMap }) {
+  const startedAtMs = Date.now();
+  const elapsedMs = () => Date.now() - startedAtMs;
   const idSet = new Set(idWeightMap.keys());
   const originalMeta = await sharp(filePath).metadata();
   const needsAutoOrientation = Boolean(originalMeta.orientation && originalMeta.orientation !== 1);
@@ -77,14 +78,12 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     ? await sharp(filePath).rotate().toBuffer()
     : filePath;
   const initialMeta = needsAutoOrientation ? await sharp(initialInput).metadata() : originalMeta;
-  const filenameMatch = findShipmentIdInFilename(path.basename(filePath), idSet);
 
   function buildAnalysis(input, meta, rotation, words) {
-    const ocrMatch = findShipmentId(words, idSet, {
+    const match = findShipmentId(words, idSet, {
       minConfidence: config.ocrMinConfidence,
       fuzzyMaxDistance: config.matching.idFuzzyMaxDistance,
     });
-    const match = ocrMatch?.distance === 0 ? ocrMatch : filenameMatch || ocrMatch;
     const anchors = findWeightAnchors(words);
     const regions = findWeightValueRegions(words, anchors, {
       imageHeight: meta.height,
@@ -116,9 +115,87 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     }));
   }
 
+  async function readShipmentIdZones(input, meta) {
+    const zones = [
+      { left: 0, top: 0, width: 1, height: 0.22, scale: 3 },
+      { left: 0.42, top: 0, width: 0.58, height: 0.22, scale: 4 },
+      { left: 0.32, top: 0, width: 0.38, height: 0.18, scale: 4 },
+    ];
+    const words = [];
+
+    for (const zone of zones) {
+      const crop = {
+        left: Math.max(0, Math.floor(meta.width * zone.left)),
+        top: Math.max(0, Math.floor(meta.height * zone.top)),
+        width: Math.max(1, Math.round(meta.width * zone.width)),
+        height: Math.max(1, Math.round(meta.height * zone.height)),
+      };
+      crop.width = Math.min(crop.width, meta.width - crop.left);
+      crop.height = Math.min(crop.height, meta.height - crop.top);
+      if (crop.width <= 0 || crop.height <= 0) continue;
+
+      // eslint-disable-next-line no-await-in-loop
+      const zoneInput = await sharp(input)
+        .extract(crop)
+        .resize({
+          width: Math.round(crop.width * zone.scale),
+          height: Math.round(crop.height * zone.scale),
+        })
+        .greyscale()
+        .normalize()
+        .sharpen()
+        .png()
+        .toBuffer();
+      // eslint-disable-next-line no-await-in-loop
+      const zoneOcr = await ocrService.recognize(zoneInput);
+      words.push(...mapOcrWords(zoneOcr.words, zone.scale, crop.left, crop.top));
+    }
+
+    return words;
+  }
+
+  function mergeWords(primaryWords, extraWords) {
+    const seen = new Set();
+    const merged = [];
+    for (const word of [...primaryWords, ...extraWords]) {
+      const key = [
+        word.text,
+        Math.round(word.bbox.x0),
+        Math.round(word.bbox.y0),
+        Math.round(word.bbox.x1),
+        Math.round(word.bbox.y1),
+      ].join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(word);
+    }
+    return merged;
+  }
+
   async function inspectOrientation(input, meta, rotation) {
     const { words } = await ocrService.recognize(input);
     let result = buildAnalysis(input, meta, rotation, words);
+    let shipmentIdZoneWords = null;
+
+    async function getShipmentIdZoneWords() {
+      if (!shipmentIdZoneWords) {
+        shipmentIdZoneWords = await readShipmentIdZones(input, meta);
+      }
+      return shipmentIdZoneWords;
+    }
+
+    if (!result.match) {
+      const idZoneWords = await getShipmentIdZoneWords();
+      if (idZoneWords.length) {
+        const idZoneResult = buildAnalysis(
+          input,
+          meta,
+          rotation,
+          mergeWords(result.words, idZoneWords)
+        );
+        if (isBetterAnalysis(idZoneResult, result)) result = idZoneResult;
+      }
+    }
 
     if (result.regions.length < 2) {
       // Faint scans can preserve readable values while Tesseract drops the
@@ -139,7 +216,13 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
         .toBuffer();
       const enhanced = await ocrService.recognize(enhancedInput);
       const enhancedWords = mapOcrWords(enhanced.words, enhancedScale);
-      const enhancedResult = buildAnalysis(input, meta, rotation, enhancedWords);
+      const enhancedIdWords = result.match ? [] : await getShipmentIdZoneWords();
+      const enhancedResult = buildAnalysis(
+        input,
+        meta,
+        rotation,
+        mergeWords(enhancedWords, enhancedIdWords)
+      );
       if (isBetterAnalysis(enhancedResult, result)) result = enhancedResult;
     }
 
@@ -208,8 +291,9 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
   if (!match) {
     return {
       status: 'unmatched',
-      reason: 'No shipment ID from the mapping sheet was found in the label text or filename',
+      reason: 'No shipment ID from the mapping sheet was found in the scanned label text',
       detectedNumbers: extractCandidateIds(words, config.ocrMinConfidence),
+      processingMs: elapsedMs(),
     };
   }
 
@@ -222,6 +306,7 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       newWeight,
       reason: 'Shipment ID matched but no "WEIGHT" column value could be located',
       detectedWeightAnchors: anchors.map((a) => a.words.map((w) => w.text).join(' ')),
+      processingMs: elapsedMs(),
     };
   }
 
@@ -258,7 +343,33 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     };
   });
 
-  const editedBuffer = await imageEditor.replaceWeightRegions(processingInput, replacements);
+  // Sibling numeric words on the same page (box dimensions, counts, dates,
+  // etc.) act as per-image typography references so the replacement text
+  // matches the size and ink color of the surrounding print, even when the
+  // weight value's own pixels are too faint/blurry to measure reliably.
+  const replacementBoxes = replacements.map((r) => r.bbox);
+  const styleReferences = [];
+  for (const word of words) {
+    const digits = word.text.replace(NON_DIGIT, '');
+    if (digits.length < 2 || word.text.length > 12) continue;
+    if ((word.text.match(/[a-z]/gi) || []).length > 2) continue;
+    const wordHeight = word.bbox.y1 - word.bbox.y0;
+    if (wordHeight < 3 || wordHeight > analysis.meta.height * 0.2) continue;
+    const overlapsReplacement = replacementBoxes.some(
+      (region) =>
+        word.bbox.x0 - 2 < region.x1 &&
+        word.bbox.x1 + 2 > region.x0 &&
+        word.bbox.y0 - 2 < region.y1 &&
+        word.bbox.y1 + 2 > region.y0
+    );
+    if (overlapsReplacement) continue;
+    styleReferences.push({ bbox: word.bbox, text: word.text });
+    if (styleReferences.length >= 60) break;
+  }
+
+  const editedBuffer = await imageEditor.replaceWeightRegions(processingInput, replacements, {
+    styleReferences,
+  });
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, editedBuffer);
 
@@ -268,6 +379,7 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     shipmentIdSource: match.source || 'ocr',
     appliedRotation: analysis.rotation,
     newWeight,
+    processingMs: elapsedMs(),
     replacedRegions: replacements.map((r) => ({
       originalText: r.originalText,
       newText: r.replacementText,

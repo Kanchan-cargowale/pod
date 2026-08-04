@@ -171,49 +171,6 @@ function findShipmentId(words, idSet, opts = {}) {
 }
 
 /**
- * Finds an exact mapping-sheet ID embedded as a distinct token in the image
- * filename. Courier exports commonly name files like lm-pod-307869128-....jpg;
- * this is a reliable fallback when OCR cannot read the printed barcode ID.
- *
- * @param {string} filename
- * @param {Set<string>} idSet
- */
-function findShipmentIdInFilename(filename, idSet) {
-  const name = String(filename || '');
-  const idsByLength = [...idSet].map(String).sort((a, b) => b.length - a.length);
-
-  for (const id of idsByLength) {
-    if (!id) continue;
-    let fromIndex = 0;
-
-    while (fromIndex <= name.length - id.length) {
-      const index = name.indexOf(id, fromIndex);
-      if (index === -1) break;
-
-      const before = index > 0 ? name[index - 1] : '';
-      const afterIndex = index + id.length;
-      const after = afterIndex < name.length ? name[afterIndex] : '';
-      const hasTokenBoundaries = !/[a-z0-9]/i.test(before) && !/[a-z0-9]/i.test(after);
-
-      if (hasTokenBoundaries) {
-        return {
-          id,
-          word: null,
-          words: [],
-          distance: 0,
-          confidence: 100,
-          source: 'filename',
-        };
-      }
-
-      fromIndex = index + 1;
-    }
-  }
-
-  return null;
-}
-
-/**
  * Groups adjacent OCR word tokens that together form a "WEIGHT" style
  * header (e.g. the words "CHARGED" and "WEIGHT" printed side by side)
  * into a single anchor bounding box per column.
@@ -414,7 +371,6 @@ function formatReplacementWeight(newWeight, originalText) {
 
 module.exports = {
   findShipmentId,
-  findShipmentIdInFilename,
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,

@@ -2,7 +2,6 @@
 
 const {
   findShipmentId,
-  findShipmentIdInFilename,
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
@@ -62,28 +61,6 @@ describe('labelMatcher.service', () => {
       ];
       const match = findShipmentId(lowConfWords, idSet, { minConfidence: 40, fuzzyMaxDistance: 0 });
       expect(match).toBeNull();
-    });
-  });
-
-  describe('findShipmentIdInFilename', () => {
-    it('matches an exact spreadsheet LR embedded in a courier filename', () => {
-      const match = findShipmentIdInFilename(
-        'lm-pod-307869128-1785403938665.jpg',
-        new Set(['287969023', '307869128'])
-      );
-
-      expect(match).toMatchObject({
-        id: '307869128',
-        distance: 0,
-        confidence: 100,
-        source: 'filename',
-      });
-    });
-
-    it('does not match an ID that is only part of a longer filename number', () => {
-      expect(
-        findShipmentIdInFilename('lm-pod-13078691289.jpg', new Set(['307869128']))
-      ).toBeNull();
     });
   });
 
