@@ -517,12 +517,10 @@
   // Live batch clock: ticks up from startedAt while the job runs, then
   // freezes at the server's measured durationMs once it completes.
   function elapsedTimeText(job) {
+    if (Number.isFinite(job.durationMs)) return formatDuration(job.durationMs);
+    if (job.status !== 'processing') return '-';
     const startedAt = job.startedAt || job.createdAt;
     if (!startedAt) return '-';
-    if (Number.isFinite(job.durationMs)) {
-      return formatDuration(job.durationMs);
-    }
-    if (job.status === 'queued') return '-';
     return formatDuration(Date.now() - new Date(startedAt).getTime());
   }
 

@@ -308,8 +308,10 @@ describe('imageEditor.service', () => {
     }
   });
 
-  it('matches the ink of sibling numbers when the value itself is faded', async () => {
-    // Faded gray weight value, but the box-dimension figure below is solid black.
+  it('keeps the original weight ink tone even when sibling numbers are darker', async () => {
+    // Faded gray weight value, with a darker box-dimension figure below. The
+    // replacement should match the original weight tone, not the darker page
+    // number, otherwise the edit is obvious on scanned labels.
     const input = await sharp(
       Buffer.from(
         '<svg width="220" height="140" xmlns="http://www.w3.org/2000/svg">' +
@@ -342,14 +344,63 @@ describe('imageEditor.service', () => {
       return darkest;
     };
 
-    const withoutRefs = await replaceWeightRegions(input, [replacement]);
     const withRefs = await replaceWeightRegions(input, [replacement], {
       styleReferences: [{ bbox: { x0: 20, y0: 98, x1: 95, y1: 118 }, text: '304515' }],
     });
 
-    const fadedDarkest = await darkestPixel(withoutRefs);
+    const originalToneDarkest = await darkestPixel(input);
     const matchedDarkest = await darkestPixel(withRefs);
-    expect(matchedDarkest).toBeLessThan(fadedDarkest - 60);
-    expect(matchedDarkest).toBeLessThan(80);
+    expect(Math.abs(matchedDarkest - originalToneDarkest)).toBeLessThanOrEqual(18);
+    expect(matchedDarkest).toBeGreaterThan(120);
+  });
+
+  it('renders sibling weight replacements with one shared typography style', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="260" height="80" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="260" height="80" fill="white" />' +
+          '<text x="20" y="46" font-family="Arial" font-size="16" fill="black">40.00</text>' +
+          '<text x="150" y="50" font-family="Arial" font-size="28" fill="black">40</text>' +
+          '</svg>'
+      )
+    )
+      .png()
+      .toBuffer();
+
+    const edited = await replaceWeightRegions(input, [
+      {
+        bbox: { x0: 20, y0: 28, x1: 70, y1: 49 },
+        clearBbox: { x0: 18, y0: 25, x1: 78, y1: 54 },
+        originalText: '40.00',
+        replacementText: '40.00',
+      },
+      {
+        bbox: { x0: 150, y0: 24, x1: 184, y1: 54 },
+        clearBbox: { x0: 148, y0: 22, x1: 218, y1: 58 },
+        originalText: '40',
+        replacementText: '40.00',
+      },
+    ]);
+
+    const { data, info } = await sharp(edited)
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const inkHeight = (x0, x1) => {
+      let top = Infinity;
+      let bottom = -Infinity;
+      for (let y = 0; y < info.height; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const offset = (y * info.width + x) * info.channels;
+          if (data[offset] < 120 && data[offset + 1] < 120 && data[offset + 2] < 120) {
+            top = Math.min(top, y);
+            bottom = Math.max(bottom, y);
+          }
+        }
+      }
+      return bottom - top + 1;
+    };
+
+    expect(Math.abs(inkHeight(18, 95) - inkHeight(148, 235))).toBeLessThanOrEqual(2);
   });
 });

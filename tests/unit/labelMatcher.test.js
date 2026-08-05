@@ -5,7 +5,9 @@ const {
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
+  formatSharedReplacementWeight,
   isWeightAnchorText,
+  isWeightQualifierText,
 } = require('../../src/services/labelMatcher.service');
 
 // This word list is a trimmed, real subset of what Tesseract.js actually
@@ -92,6 +94,19 @@ describe('labelMatcher.service', () => {
       expect(isWeightAnchorText('Freight')).toBe(false);
       expect(isWeightAnchorText('Frelght')).toBe(false);
     });
+
+    it('accepts damaged ACTUAL text but rejects product Charger text', () => {
+      expect(isWeightQualifierText('CTUAL')).toBe(true);
+      expect(isWeightQualifierText('Charger')).toBe(false);
+
+      const anchors = findWeightAnchors([
+        { text: 'CTUAL', confidence: 38, bbox: { x0: 285, y0: 354, x1: 320, y1: 363 } },
+        { text: 'Charger', confidence: 45, bbox: { x0: 423, y0: 406, x1: 470, y1: 415 } },
+      ]);
+
+      expect(anchors).toHaveLength(1);
+      expect(anchors[0].words.map((word) => word.text)).toEqual(['CTUAL']);
+    });
   });
 
   describe('findWeightValueRegions', () => {
@@ -175,6 +190,23 @@ describe('labelMatcher.service', () => {
       expect(regions).toHaveLength(1);
       expect(regions[0].originalText).toBe('»N.n');
     });
+    it('finds a value below a damaged ACTUAL header while ignoring Charger product text', () => {
+      const words = [
+        { text: 'CTUAL', confidence: 38, bbox: { x0: 285, y0: 354, x1: 320, y1: 363 } },
+        { text: 'SHT(kg)', confidence: 28, bbox: { x0: 356, y0: 361, x1: 398, y1: 371 } },
+        { text: '150.8', confidence: 70, bbox: { x0: 278, y0: 367, x1: 312, y1: 401 } },
+        { text: 'Charger', confidence: 45, bbox: { x0: 423, y0: 406, x1: 470, y1: 415 } },
+      ];
+      const anchors = findWeightAnchors(words);
+      const regions = findWeightValueRegions(words, anchors, {
+        imageHeight: 768,
+        verticalWindowRatio: 0.18,
+        horizontalTolerancePx: 120,
+      });
+
+      expect(regions).toHaveLength(1);
+      expect(regions[0].originalText).toBe('150.8');
+    });
   });
 
   describe('formatReplacementWeight', () => {
@@ -185,6 +217,21 @@ describe('labelMatcher.service', () => {
 
     it('keeps whole numbers whole when the original had no decimals', () => {
       expect(formatReplacementWeight(900, '803')).toBe('900');
+    });
+
+    it('uses one shared precision for sibling actual and charged weight values', () => {
+      const regions = [
+        { originalText: '40.00' },
+        { originalText: '40' },
+      ];
+
+      expect(formatSharedReplacementWeight(40, regions)).toBe('40.00');
+      expect(formatSharedReplacementWeight(40.5, regions)).toBe('40.50');
+    });
+
+    it('does not round away decimals that came from the mapping sheet', () => {
+      expect(formatSharedReplacementWeight(170.55, [{ originalText: '122.5' }])).toBe('170.55');
+      expect(formatSharedReplacementWeight(368.84, [{ originalText: '159.8' }])).toBe('368.84');
     });
   });
 });

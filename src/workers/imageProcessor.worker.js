@@ -7,12 +7,15 @@ const { parentPort } = require('worker_threads');
 const ocrService = require('../services/ocr.service');
 const imageEditor = require('../services/imageEditor.service');
 const { shouldTryQuarterTurns } = require('../services/imageOrientation.service');
-const { inferActualSiblingRegion } = require('../services/weightRegionFallback.service');
+const {
+  inferActualSiblingRegion,
+  inferWeightRegionsFromTable,
+} = require('../services/weightRegionFallback.service');
 const {
   findShipmentId,
   findWeightAnchors,
   findWeightValueRegions,
-  formatReplacementWeight,
+  formatSharedReplacementWeight,
   buildMergedNumericCandidates,
 } = require('../services/labelMatcher.service');
 const config = require('../config');
@@ -56,6 +59,45 @@ function extractCandidateIds(words, minConfidence) {
     .filter((t) => !seen.has(t));
 
   return [...candidates, ...merged];
+}
+
+function buildWeightClearBbox(region, meta) {
+  const width = region.bbox.x1 - region.bbox.x0;
+  const height = region.bbox.y1 - region.bbox.y0;
+  const originalLength = Math.max(1, String(region.originalText || '').length);
+  const horizontalPad = Math.max(5, height * 0.45, width / originalLength);
+  const verticalPad = Math.max(2, height * 0.22);
+
+  return {
+    // Keep left expansion deliberately tiny. The image editor will still
+    // protect table rules, but most Delhivery weight values begin just inside
+    // a vertical border, so right/bottom expansion is where old decimal ghosts
+    // usually need cleanup.
+    x0: Math.max(0, region.bbox.x0 - Math.min(2, horizontalPad * 0.25)),
+    y0: Math.max(0, region.bbox.y0 - verticalPad),
+    x1: Math.min(meta.width, region.bbox.x1 + horizontalPad * 1.65),
+    y1: Math.min(meta.height, region.bbox.y1 + verticalPad),
+  };
+}
+
+async function writeOutputNamedByShipmentId(outputPath, shipmentId, editedBuffer) {
+  const outputDir = path.dirname(outputPath);
+  const ext = path.extname(outputPath) || '.jpg';
+  const safeShipmentId = String(shipmentId).replace(/[^a-z0-9_-]/gi, '_');
+
+  for (let attempt = 1; attempt <= 999; attempt += 1) {
+    const suffix = attempt === 1 ? '' : `_${attempt}`;
+    const outputFilename = `${safeShipmentId}${suffix}${ext}`;
+    const candidatePath = path.join(outputDir, outputFilename);
+    try {
+      await fs.writeFile(candidatePath, editedBuffer, { flag: 'wx' });
+      return { outputPath: candidatePath, outputFilename };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+  }
+
+  throw new Error(`Could not create a unique output filename for shipment ID ${shipmentId}`);
 }
 
 /**
@@ -300,6 +342,14 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
   const newWeight = idWeightMap.get(match.id);
 
   if (!regions.length) {
+    const inferredTableRegions = await inferWeightRegionsFromTable(
+      processingInput,
+      analysis.meta
+    );
+    if (inferredTableRegions.length) regions = inferredTableRegions;
+  }
+
+  if (!regions.length) {
     return {
       status: 'id_matched_no_weight_region',
       shipmentId: match.id,
@@ -310,33 +360,30 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     };
   }
 
+  const sharedReplacementText = formatSharedReplacementWeight(newWeight, regions);
+
   const replacements = regions.map((region) => {
     const regionWidth = region.bbox.x1 - region.bbox.x0;
     const regionHeight = region.bbox.y1 - region.bbox.y0;
-    const replacementText = formatReplacementWeight(newWeight, region.originalText);
     const originalTextIsReliable = /^\d{1,6}(?:\.\d{1,3})?$/.test(region.originalText);
     const usesTinyScanFallback = regionHeight <= 12 && !originalTextIsReliable;
-    const clearBbox =
-      usesTinyScanFallback
-        ? {
-            // Never expand left: these low-resolution OCR boxes begin only
-            // one pixel inside the table's vertical border.
-            x0: region.bbox.x0,
-            y0: Math.max(0, region.bbox.y0 - 1),
-            x1: Math.min(
-              analysis.meta.width,
-              region.bbox.x1 + Math.max(4, regionWidth * 0.4)
-            ),
-            y1: Math.min(analysis.meta.height, region.bbox.y1 + 2),
-          }
-        : undefined;
+    const clearBbox = buildWeightClearBbox(region, analysis.meta);
+    if (usesTinyScanFallback) {
+      // Never expand left for low-resolution fallback boxes; they often begin
+      // one pixel inside the table's vertical border.
+      clearBbox.x0 = region.bbox.x0;
+      clearBbox.x1 = Math.max(
+        clearBbox.x1,
+        Math.min(analysis.meta.width, region.bbox.x1 + Math.max(4, regionWidth * 0.4))
+      );
+    }
     return {
       bbox: region.bbox,
       clearBbox,
-      replacementText,
+      replacementText: sharedReplacementText,
       originalText: region.originalText,
       styleReferenceText: usesTinyScanFallback
-        ? replacementText.replace(/\d/g, '0')
+        ? sharedReplacementText.replace(/\d/g, '0')
         : region.originalText,
       fontScale: usesTinyScanFallback ? 0.82 : 1,
       textLeftPaddingRatio: usesTinyScanFallback ? 0.03 : undefined,
@@ -371,7 +418,7 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     styleReferences,
   });
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, editedBuffer);
+  const writtenOutput = await writeOutputNamedByShipmentId(outputPath, match.id, editedBuffer);
 
   return {
     status: 'ok',
@@ -385,6 +432,7 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       newText: r.replacementText,
       bbox: r.bbox,
     })),
+    outputFilename: writtenOutput.outputFilename,
   };
 }
 

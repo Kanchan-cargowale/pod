@@ -15,6 +15,12 @@ function normalizeHeaderText(text) {
     .replace(/[^a-z]/g, '');
 }
 
+function normalizeQualifierText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '');
+}
+
 function containsFuzzyWord(text, target, maxDistance = 1) {
   const normalized = normalizeHeaderText(text);
   if (!normalized) return false;
@@ -42,12 +48,24 @@ function isWeightAnchorText(text) {
 
 function isWeightQualifierText(text) {
   if (WEIGHT_COLUMN_QUALIFIER.test(String(text || '').trim())) return true;
-  const normalized = normalizeHeaderText(text);
-  return ['actual', 'charged', 'chargeable'].some(
-    (target) =>
+  const normalized = normalizeQualifierText(text);
+  if (!normalized) return false;
+
+  // Product descriptions often contain "Charger"; it is one character away
+  // from "charged", but it is not a weight column header.
+  if (/^chargers?$/.test(normalized)) return false;
+
+  // Tesseract frequently drops the leading A on ACTUAL in skewed/scanned
+  // labels ("CTUAL"). Accept that specific damage pattern.
+  if (normalized === 'ctual') return true;
+
+  return ['actual', 'charged', 'chargeable'].some((target) => {
+    if (target === 'charged' && /^charger/.test(normalized)) return false;
+    return (
       Math.abs(normalized.length - target.length) <= 1 &&
       levenshtein(normalized, target) <= 1
-  );
+    );
+  });
 }
 
 /**
@@ -318,7 +336,11 @@ function findWeightValueRegions(words, anchors, ctx) {
       if (centerX < minX || centerX > maxX) continue;
 
       const gap = word.bbox.y0 - anchor.bbox.y1;
-      if (gap < 0 || gap > maxVerticalGap) continue;
+      const anchorCenterY = (anchor.bbox.y0 + anchor.bbox.y1) / 2;
+      const wordCenterY = (word.bbox.y0 + word.bbox.y1) / 2;
+      const maxOverlap = Math.max(3, anchor.bbox.height * 0.45);
+      if (gap < -maxOverlap || gap > maxVerticalGap) continue;
+      if (gap < 0 && wordCenterY <= anchorCenterY) continue;
 
       if (gap < bestGap || (gap === bestGap && candidate.strict && !bestCandidate?.strict)) {
         bestGap = gap;
@@ -369,11 +391,31 @@ function formatReplacementWeight(newWeight, originalText) {
   return String(Math.round(Number(newWeight) * 100) / 100);
 }
 
+/**
+ * Formats one shared replacement value for all detected weight columns on a
+ * label. ACTUAL and CHARGED/CHARGEABLE are sibling fields; rendering one as
+ * "40.00" and the other as "40" makes the edit visibly inconsistent. Use the
+ * highest decimal precision already printed in any sibling weight value, then
+ * apply it to every replacement on that page.
+ */
+function formatSharedReplacementWeight(newWeight, regions) {
+  const newWeightDecimalMatch = String(newWeight).match(/\.(\d+)/);
+  const newWeightDecimals = newWeightDecimalMatch ? newWeightDecimalMatch[1].length : 0;
+  const maxDecimals = regions.reduce((max, region) => {
+    const decimalMatch = String(region.originalText || '').match(/\.(\d+)/);
+    return Math.max(max, decimalMatch ? decimalMatch[1].length : 0);
+  }, newWeightDecimals);
+
+  if (maxDecimals > 0) return Number(newWeight).toFixed(maxDecimals);
+  return String(Math.round(Number(newWeight) * 100) / 100);
+}
+
 module.exports = {
   findShipmentId,
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
+  formatSharedReplacementWeight,
   buildMergedNumericCandidates,
   isWeightAnchorText,
   isWeightQualifierText,

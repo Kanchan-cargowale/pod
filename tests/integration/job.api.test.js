@@ -60,6 +60,8 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     const [result] = job.results;
     expect(result.status).toBe('ok');
     expect(result.shipmentId).toBe('307775718');
+    expect(result.filename).toBe('307775718.jpeg');
+    expect(result.outputFilename).toBe('307775718.jpeg');
     expect(result.newWeight).toBe(900);
     expect(result.replacedRegions).toHaveLength(2);
     for (const region of result.replacedRegions) {
@@ -73,6 +75,7 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     const fs = require('fs');
     const zipPath = jobService.getZipPath(jobId);
     expect(fs.existsSync(zipPath)).toBe(true);
+    expect(fs.existsSync(path.join(jobService.getOutputsDir(jobId), '307775718.jpeg'))).toBe(true);
     const stat = fs.statSync(zipPath);
     expect(stat.size).toBeGreaterThan(1000);
 
@@ -138,6 +141,8 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     expect(job.results[0]).toMatchObject({
       status: 'ok',
       shipmentId: '298806377',
+      filename: '298806377.jpeg',
+      outputFilename: '298806377.jpeg',
       newWeight: 152,
     });
     expect(job.results[0].replacedRegions.length).toBeGreaterThan(0);

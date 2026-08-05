@@ -130,6 +130,143 @@ function medianChannel(pixels, channel) {
   return Math.round(percentile(pixels.map((pixel) => pixel[channel]), 0.5));
 }
 
+function medianNumber(values) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function mostCommon(values, fallback) {
+  const counts = new Map();
+  for (const value of values.filter(Boolean)) {
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  let best = fallback;
+  let bestCount = 0;
+  for (const [value, count] of counts.entries()) {
+    if (count > bestCount) {
+      best = value;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+function mergeUniformTextStyle(styles) {
+  const usable = styles.filter(Boolean);
+  if (usable.length <= 1) return null;
+
+  const fillRgbs = usable.map((style) => style.fillRgb).filter(Boolean);
+  const fillRgb = fillRgbs.length
+    ? {
+        r: medianChannel(fillRgbs, 'r'),
+        g: medianChannel(fillRgbs, 'g'),
+        b: medianChannel(fillRgbs, 'b'),
+      }
+    : { r: 0, g: 0, b: 0 };
+
+  return {
+    fontFamily: mostCommon(
+      usable.map((style) => style.fontFamily),
+      DEFAULT_TEXT_STYLE.fontFamily
+    ),
+    fontWeight: mostCommon(
+      usable.map((style) => style.fontWeight || 400),
+      400
+    ),
+    fontSize: Math.max(8, medianNumber(usable.map((style) => style.fontSize).filter(Boolean))),
+    fillRgb,
+    fillLuma: luminance(fillRgb),
+    fill: rgbToCss(fillRgb),
+  };
+}
+
+async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg) {
+  const width = rect.right - rect.x;
+  const height = rect.bottom - rect.y;
+  if (width <= 0 || height <= 0) return null;
+
+  const bgLuma = luminance(bg);
+  const darkLimit = Math.min(235, Math.max(35, bgLuma - Math.max(10, bgLuma * 0.08)));
+  const ruleDarkLimit = Math.min(150, Math.max(50, Math.round(bgLuma * 0.58)));
+
+  const scanTop = Math.max(0, rect.y - height);
+  const scanBottom = Math.min(grayInfo.height - 1, rect.bottom + height);
+  const minVerticalRun = Math.max(8, Math.round(height * MIN_RULE_RUN_RATIO));
+  const verticalRuleCols = new Set();
+  for (let col = rect.x; col < rect.right; col += 1) {
+    let best = 0;
+    let run = 0;
+    for (let row = scanTop; row <= scanBottom; row += 1) {
+      if (gray[row * grayInfo.width + col] < ruleDarkLimit) run += 1;
+      else run = 0;
+      if (run > best) best = run;
+    }
+    if (best >= minVerticalRun) verticalRuleCols.add(col);
+  }
+
+  const scanLeft = Math.max(0, rect.x - width);
+  const scanRight = Math.min(grayInfo.width - 1, rect.right + width);
+  const minHorizontalRun = Math.max(8, Math.round(width * MIN_RULE_RUN_RATIO));
+  const horizontalRuleRows = new Set();
+  for (let row = rect.y; row < rect.bottom; row += 1) {
+    let best = 0;
+    let run = 0;
+    for (let col = scanLeft; col <= scanRight; col += 1) {
+      if (gray[row * grayInfo.width + col] < ruleDarkLimit) run += 1;
+      else run = 0;
+      if (run > best) best = run;
+    }
+    if (best >= minHorizontalRun) horizontalRuleRows.add(row);
+  }
+
+  const { data, info } = await image
+    .clone()
+    .extract({ left: rect.x, top: rect.y, width, height })
+    .removeAlpha()
+    .toColourspace('srgb')
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const overlay = Buffer.alloc(width * height * 4, 0);
+  let erasedPixels = 0;
+  for (let y = 0; y < height; y += 1) {
+    const imageY = rect.y + y;
+    for (let x = 0; x < width; x += 1) {
+      const imageX = rect.x + x;
+      if (verticalRuleCols.has(imageX) || horizontalRuleRows.has(imageY)) continue;
+
+      const sourceOffset = (y * info.width + x) * info.channels;
+      const pixel = {
+        r: data[sourceOffset],
+        g: data[sourceOffset + 1],
+        b: data[sourceOffset + 2],
+      };
+      const pixelLuma = luminance(pixel);
+      const darkness = bgLuma - pixelLuma;
+      const isOldInk = pixelLuma < darkLimit || darkness >= 9;
+      if (!isOldInk) continue;
+
+      const overlayOffset = (y * width + x) * 4;
+      overlay[overlayOffset] = bg.r;
+      overlay[overlayOffset + 1] = bg.g;
+      overlay[overlayOffset + 2] = bg.b;
+      overlay[overlayOffset + 3] = darkness > 35 ? 245 : 190;
+      erasedPixels += 1;
+    }
+  }
+
+  if (!erasedPixels) return null;
+
+  return {
+    input: await sharp(overlay, { raw: { width, height, channels: 4 } }).png().toBuffer(),
+    left: rect.x,
+    top: rect.y,
+  };
+}
+
 function estimateFontFamily(inkWidth, inkHeight, originalText) {
   const characterCount = Math.max(1, String(originalText || '').length);
   const characterAspect = inkWidth / Math.max(1, inkHeight * characterCount);
@@ -416,12 +553,12 @@ function calculateFontSize(width, height, replacementText) {
  *        per-image typography (size + ink color), e.g. box dimension values.
  */
 async function replaceWeightRegions(filePath, replacements, options = {}) {
-  const { styleReferences = [] } = options;
+  const { styleReferences = [], uniformTextStyle = true } = options;
   const image = sharp(filePath);
   const meta = await image.metadata();
 
-  const rects = [];
-  const texts = [];
+  const eraseOverlays = [];
+  const textOps = [];
 
   // Single-channel copy for table-rule detection; decoded at most once and
   // only when there is actually something to clear.
@@ -467,7 +604,6 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     const bg = usesExpandedClearing
       ? await sampleLocalPaperColor(image, meta, clearBbox)
       : await sampleBackgroundColor(image, meta, bbox);
-    const fill = rgbToCss(bg);
 
     // Shrink the clear rect around any printed table rule it touches, so the
     // vertical line left of the value (and any other border) survives intact.
@@ -487,10 +623,16 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     const rectH = rectBottom - rectY;
 
     if (rectW > 0 && rectH > 0) {
-      rects.push(
-        `<rect x="${rectX}" y="${rectY}" width="${rectW}" height="${rectH}" ` +
-          `fill="${fill}" shape-rendering="crispEdges" />`
+      // eslint-disable-next-line no-await-in-loop
+      const eraseOverlay = await createSelectiveEraseOverlay(
+        image,
+        meta,
+        gray,
+        grayInfo,
+        { x: rectX, y: rectY, right: rectRight, bottom: rectBottom },
+        bg
       );
+      if (eraseOverlay) eraseOverlays.push(eraseOverlay);
     }
 
     // Sample before adding the clearing rectangle so the original glyphs are
@@ -504,7 +646,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       // eslint-disable-next-line no-await-in-loop
       const pageStyle = await computePageStyle(image, meta, styleReferences, bbox, pageStyleCache);
       if (pageStyle) {
-        if (!textStyle.measured || textStyle.fillLuma > pageStyle.fillLuma) {
+        if (!textStyle.measured) {
           textStyle = {
             ...textStyle,
             fill: rgbToCss(pageStyle.fillRgb),
@@ -513,7 +655,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
           };
         }
         const sizeDeviation = Math.abs(textStyle.fontSize - pageStyle.fontSize) / pageStyle.fontSize;
-        if (!textStyle.measured || sizeDeviation > PAGE_STYLE_SIZE_DEVIATION) {
+        if (!textStyle.measured && sizeDeviation > PAGE_STYLE_SIZE_DEVIATION) {
           textStyle = {
             ...textStyle,
             fontSize: Math.max(8, Math.min(pageStyle.fontSize, height / 0.6)),
@@ -522,32 +664,61 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       }
     }
 
-    const baselineY = bbox.y1 - height * 0.16;
-    const textX = bbox.x0 + width * textLeftPaddingRatio;
-    const renderedFontSize = textStyle.fontSize * fontScale;
-
-    texts.push(
-      `<text x="${textX}" y="${baselineY}" font-family="${textStyle.fontFamily}" ` +
-        `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
-        `fill="${textStyle.fill}">` +
-        `${escapeXml(replacementText)}</text>`
-    );
+    textOps.push({
+      bbox,
+      width,
+      height,
+      rectX,
+      rectW,
+      replacementText,
+      textStyle,
+      fontScale,
+      textLeftPaddingRatio,
+    });
   }
 
-  if (!rects.length) {
+  if (!textOps.length) {
     // Nothing matched on this label - return the original bytes untouched.
     return image.toBuffer();
   }
 
+  const sharedTextStyle = uniformTextStyle
+    ? mergeUniformTextStyle(textOps.map((op) => op.textStyle))
+    : null;
+  const texts = textOps.map((op) => {
+    const textStyle = sharedTextStyle || op.textStyle;
+    const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
+    const guardedTextX = op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio);
+    const textX = Math.max(naturalTextX, guardedTextX);
+    const maxFontSizeForHeight = Math.max(6, op.height / 0.82);
+    const maxTextWidth = Math.max(4, op.rectX + op.rectW - textX - 1);
+    const maxFontSizeForWidth =
+      maxTextWidth / numericAdvanceUnits(op.replacementText, textStyle.fontFamily);
+    const renderedFontSize = Math.max(
+      6,
+      Math.min(textStyle.fontSize * op.fontScale, maxFontSizeForHeight, maxFontSizeForWidth)
+    );
+    const baselineY = Math.min(
+      op.bbox.y1 - 1,
+      Math.max(op.bbox.y0 + renderedFontSize * 0.72, op.bbox.y0 + op.height / 2 + renderedFontSize * 0.28)
+    );
+
+    return (
+      `<text x="${textX}" y="${baselineY}" font-family="${textStyle.fontFamily}" ` +
+      `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
+      `fill="${textStyle.fill}">` +
+      `${escapeXml(op.replacementText)}</text>`
+    );
+  });
+
   const overlaySvg = Buffer.from(
     `<svg width="${meta.width}" height="${meta.height}" xmlns="http://www.w3.org/2000/svg">` +
-      rects.join('') +
       texts.join('') +
       `</svg>`
   );
 
   return image
-    .composite([{ input: overlaySvg, top: 0, left: 0 }])
+    .composite([...eraseOverlays, { input: overlaySvg, top: 0, left: 0 }])
     .toBuffer();
 }
 

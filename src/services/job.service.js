@@ -86,7 +86,11 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
 
     return pool
       .run({ filePath, outputPath, idWeightMap })
-      .then((result) => ({ filename, ...result }))
+      .then((result) => ({
+        originalFilename: filename,
+        filename: result.outputFilename || filename,
+        ...result,
+      }))
       .catch((err) => ({ filename, status: 'error', reason: err.message }))
       .then(async (result) => {
         state.processedFiles += 1;
