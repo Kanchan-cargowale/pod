@@ -203,10 +203,14 @@ function findWeightAnchors(words) {
   // Tesseract can split a damaged header into tokens such as "WEI" + "GHT".
   // Rejoin only close, same-line neighbours so unrelated page words cannot
   // accidentally become a weight header.
-  for (let i = 0; i < words.length; i += 1) {
-    for (let j = i + 1; j < words.length; j += 1) {
-      const first = words[i];
-      const second = words[j];
+  const splitCandidates = words.filter((word) => {
+    const normalized = normalizeHeaderText(word.text);
+    return normalized.length >= 1 && normalized.length <= 7;
+  });
+  for (let i = 0; i < splitCandidates.length; i += 1) {
+    for (let j = i + 1; j < splitCandidates.length; j += 1) {
+      const first = splitCandidates[i];
+      const second = splitCandidates[j];
       const firstHeight = first.bbox.y1 - first.bbox.y0;
       const secondHeight = second.bbox.y1 - second.bbox.y0;
       const maxHeight = Math.max(firstHeight, secondHeight);

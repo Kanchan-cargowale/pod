@@ -130,6 +130,56 @@ function medianChannel(pixels, channel) {
   return Math.round(percentile(pixels.map((pixel) => pixel[channel]), 0.5));
 }
 
+async function samplePaperInsideBbox(image, meta, bbox) {
+  const left = Math.max(0, Math.floor(bbox.x0));
+  const top = Math.max(0, Math.floor(bbox.y0));
+  const width = Math.min(meta.width - left, Math.max(1, Math.ceil(bbox.x1) - left));
+  const height = Math.min(meta.height - top, Math.max(1, Math.ceil(bbox.y1) - top));
+  if (width <= 0 || height <= 0) return sampleLocalPaperColor(image, meta, bbox);
+
+  try {
+    const { data, info } = await image
+      .clone()
+      .extract({ left, top, width, height })
+      .removeAlpha()
+      .toColourspace('srgb')
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const pixels = [];
+    for (let i = 0; i < data.length; i += info.channels) {
+      const pixel = { r: data[i], g: data[i + 1], b: data[i + 2] };
+      pixel.luma = luminance(pixel);
+      pixels.push(pixel);
+    }
+    // Even a tight numeric word box is mostly paper between/inside glyphs.
+    // Its lightest 35% is the best possible match for the exact local scan
+    // tint and avoids a rectangular warm/cool patch on blue or gray paper.
+    const lumas = pixels.map((pixel) => pixel.luma);
+    const lowerPaper = percentile(lumas, 0.35);
+    const upperPaper = percentile(lumas, 0.8);
+    // Use the middle paper cluster, not the brightest tail. Selecting only
+    // bright pixels biased blue/gray photos several levels toward white and
+    // made the restored word box visible even when its texture was correct.
+    const paperPixels = pixels.filter(
+      (pixel) => pixel.luma >= lowerPaper && pixel.luma <= upperPaper
+    );
+    const insidePaper = {
+      r: medianChannel(paperPixels, 'r'),
+      g: medianChannel(paperPixels, 'g'),
+      b: medianChannel(paperPixels, 'b'),
+    };
+    const surroundingPaper = await sampleLocalPaperColor(image, meta, bbox);
+    // Truncated OCR can occasionally describe only a solid glyph stroke, so
+    // there is no paper inside the box. Detect that case instead of sampling
+    // the black stroke as the background color.
+    return luminance(insidePaper) < luminance(surroundingPaper) - 14
+      ? surroundingPaper
+      : insidePaper;
+  } catch (err) {
+    return sampleLocalPaperColor(image, meta, bbox);
+  }
+}
+
 function medianNumber(values) {
   if (!values.length) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -189,7 +239,9 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
   if (width <= 0 || height <= 0) return null;
 
   const bgLuma = luminance(bg);
-  const darkLimit = Math.min(235, Math.max(35, bgLuma - Math.max(10, bgLuma * 0.08)));
+  // Low-quality blue/gray scans often have only 6-10 luma points between the
+  // old printed value and paper. The former 8% threshold left those pixels
+  // behind as a visible stale value underneath the replacement.
   const ruleDarkLimit = Math.min(150, Math.max(50, Math.round(bgLuma * 0.58)));
 
   const scanTop = Math.max(0, rect.y - height);
@@ -199,12 +251,17 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
   for (let col = rect.x; col < rect.right; col += 1) {
     let best = 0;
     let run = 0;
+    let darkCount = 0;
     for (let row = scanTop; row <= scanBottom; row += 1) {
-      if (gray[row * grayInfo.width + col] < ruleDarkLimit) run += 1;
+      if (gray[row * grayInfo.width + col] < ruleDarkLimit) {
+        run += 1;
+        darkCount += 1;
+      }
       else run = 0;
       if (run > best) best = run;
     }
-    if (best >= minVerticalRun) verticalRuleCols.add(col);
+    const scanLength = scanBottom - scanTop + 1;
+    if (best >= minVerticalRun || darkCount >= scanLength * 0.45) verticalRuleCols.add(col);
   }
 
   const scanLeft = Math.max(0, rect.x - width);
@@ -214,12 +271,17 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
   for (let row = rect.y; row < rect.bottom; row += 1) {
     let best = 0;
     let run = 0;
+    let darkCount = 0;
     for (let col = scanLeft; col <= scanRight; col += 1) {
-      if (gray[row * grayInfo.width + col] < ruleDarkLimit) run += 1;
+      if (gray[row * grayInfo.width + col] < ruleDarkLimit) {
+        run += 1;
+        darkCount += 1;
+      }
       else run = 0;
       if (run > best) best = run;
     }
-    if (best >= minHorizontalRun) horizontalRuleRows.add(row);
+    const scanLength = scanRight - scanLeft + 1;
+    if (best >= minHorizontalRun || darkCount >= scanLength * 0.65) horizontalRuleRows.add(row);
   }
 
   const { data, info } = await image
@@ -230,7 +292,76 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
     .raw()
     .toBuffer({ resolveWithObject: true });
 
+  // Copy real paper texture from the blank part of the same weight cell. A
+  // flat RGB fill is visible as a white/gray strip on photographed paper even
+  // when its average color is close. The area directly below a weight value is
+  // blank on these POD templates and shares the same lighting gradient/noise.
+  let textureData = null;
+  let textureInfo = null;
+  const belowTop = rect.bottom + Math.max(2, Math.round(height * 0.55));
+  const aboveTop = rect.y - height - Math.max(2, Math.round(height * 0.35));
+  const textureTop = belowTop + height <= meta.height
+    ? belowTop
+    : Math.max(0, aboveTop);
+  if (textureTop + height <= meta.height) {
+    try {
+      const texture = await image
+        .clone()
+        .extract({ left: rect.x, top: textureTop, width, height })
+        .removeAlpha()
+        .toColourspace('srgb')
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      textureData = texture.data;
+      textureInfo = texture.info;
+    } catch (err) {
+      textureData = null;
+    }
+  }
+
   const overlay = Buffer.alloc(width * height * 4, 0);
+  const readSourcePixel = (x, y) => {
+    const offset = (y * info.width + x) * info.channels;
+    return { r: data[offset], g: data[offset + 1], b: data[offset + 2] };
+  };
+  // Estimate paper independently on every row. A photographed blue sheet can
+  // change brightness by 10+ levels across one OCR box; comparing the whole
+  // box with one global colour mistakes that natural shadow for printed ink.
+  const rowPaperLumas = Array.from({ length: height }, (_, y) => {
+    const lumas = [];
+    for (let x = 0; x < width; x += 1) lumas.push(luminance(readSourcePixel(x, y)));
+    return percentile(lumas, 0.72);
+  });
+  const sameRowPaper = (x, y) => {
+    let left = null;
+    let right = null;
+    const rowPaperLuma = rowPaperLumas[y];
+    // A solid/merged OCR glyph can occupy almost the entire row. In that case
+    // the row percentile is ink, not paper; let the vertical texture fallback
+    // handle it instead of treating black pixels as a valid replacement.
+    if (rowPaperLuma < bgLuma - Math.max(12, bgLuma * 0.08)) return null;
+    const cleanLimit = rowPaperLuma - Math.max(3, rowPaperLuma * 0.022);
+    for (let distance = 1; distance < width; distance += 1) {
+      if (!left && x - distance >= 0) {
+        const candidate = readSourcePixel(x - distance, y);
+        if (luminance(candidate) >= cleanLimit) left = { pixel: candidate, distance };
+      }
+      if (!right && x + distance < width) {
+        const candidate = readSourcePixel(x + distance, y);
+        if (luminance(candidate) >= cleanLimit) right = { pixel: candidate, distance };
+      }
+      if (left && right) break;
+    }
+    if (left && right) {
+      const total = left.distance + right.distance;
+      return {
+        r: Math.round((left.pixel.r * right.distance + right.pixel.r * left.distance) / total),
+        g: Math.round((left.pixel.g * right.distance + right.pixel.g * left.distance) / total),
+        b: Math.round((left.pixel.b * right.distance + right.pixel.b * left.distance) / total),
+      };
+    }
+    return left?.pixel || right?.pixel || null;
+  };
   let erasedPixels = 0;
   for (let y = 0; y < height; y += 1) {
     const imageY = rect.y + y;
@@ -245,15 +376,32 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
         b: data[sourceOffset + 2],
       };
       const pixelLuma = luminance(pixel);
-      const darkness = bgLuma - pixelLuma;
-      const isOldInk = pixelLuma < darkLimit || darkness >= 9;
+      // Interpolate paper from this exact image row first. This follows camera
+      // shadows and blue/gray lighting without producing a rectangular band.
+      // A nearby vertical texture patch remains the fallback for a fully inked
+      // row where no clean paper pixel exists on either side of the glyph.
+      let replacement = sameRowPaper(x, y) || bg;
+      if (replacement === bg && textureData && textureInfo) {
+        const textureOffset = (y * textureInfo.width + x) * textureInfo.channels;
+        const candidate = {
+          r: textureData[textureOffset],
+          g: textureData[textureOffset + 1],
+          b: textureData[textureOffset + 2],
+        };
+        // Do not copy an unrelated dust speck or rule into the erased glyph.
+        if (luminance(candidate) >= bgLuma - 22) replacement = candidate;
+      }
+      const localPaperLuma = luminance(replacement);
+      const darkness = localPaperLuma - pixelLuma;
+      const localInkThreshold = Math.max(5, localPaperLuma * 0.035);
+      const isOldInk = darkness >= localInkThreshold;
       if (!isOldInk) continue;
 
       const overlayOffset = (y * width + x) * 4;
-      overlay[overlayOffset] = bg.r;
-      overlay[overlayOffset + 1] = bg.g;
-      overlay[overlayOffset + 2] = bg.b;
-      overlay[overlayOffset + 3] = darkness > 35 ? 245 : 190;
+      overlay[overlayOffset] = replacement.r;
+      overlay[overlayOffset + 1] = replacement.g;
+      overlay[overlayOffset + 2] = replacement.b;
+      overlay[overlayOffset + 3] = darkness > 25 ? 255 : 205;
       erasedPixels += 1;
     }
   }
@@ -553,7 +701,11 @@ function calculateFontSize(width, height, replacementText) {
  *        per-image typography (size + ink color), e.g. box dimension values.
  */
 async function replaceWeightRegions(filePath, replacements, options = {}) {
-  const { styleReferences = [], uniformTextStyle = true } = options;
+  const {
+    styleReferences = [],
+    preferredStyleReferences = [],
+    uniformTextStyle = true,
+  } = options;
   const image = sharp(filePath);
   const meta = await image.metadata();
 
@@ -576,6 +728,22 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     return grayCache;
   };
   const pageStyleCache = new Map();
+  let preferredTextStyle = null;
+  if (preferredStyleReferences.length) {
+    const preferredStyles = [];
+    for (const ref of preferredStyleReferences.slice(0, 6)) {
+      // eslint-disable-next-line no-await-in-loop
+      const style = await sampleTextStyle(image, meta, ref.bbox, ref.text);
+      if (style.measured) preferredStyles.push(style);
+    }
+    preferredTextStyle = mergeUniformTextStyle(preferredStyles);
+    if (preferredTextStyle) {
+      // Delhivery's dimension/value figures are proportional sans-serif.
+      // OCR word boxes often include large side gaps and falsely classify
+      // them as monospace; that was the clearest remaining visual mismatch.
+      preferredTextStyle.fontFamily = DEFAULT_TEXT_STYLE.fontFamily;
+    }
+  }
 
   for (const {
     bbox,
@@ -600,10 +768,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     let rectBottom = Math.min(meta.height, Math.ceil(clearBbox.y1));
 
     // eslint-disable-next-line no-await-in-loop
-    const usesExpandedClearing = clearBbox !== bbox;
-    const bg = usesExpandedClearing
-      ? await sampleLocalPaperColor(image, meta, clearBbox)
-      : await sampleBackgroundColor(image, meta, bbox);
+    const bg = await samplePaperInsideBbox(image, meta, bbox);
 
     // Shrink the clear rect around any printed table rule it touches, so the
     // vertical line left of the value (and any other border) survives intact.
@@ -639,6 +804,22 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // still available for per-image style matching.
     // eslint-disable-next-line no-await-in-loop
     let textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
+
+    // The box-dimension figures are printed by the same label template and
+    // are a much cleaner type specimen than a faint/damaged weight value.
+    // Apply that local specimen to both weight columns as one exact style.
+    if (preferredTextStyle) {
+      textStyle = {
+        ...textStyle,
+        fontFamily: preferredTextStyle.fontFamily,
+        fontWeight: preferredTextStyle.fontWeight,
+        fontSize: preferredTextStyle.fontSize,
+        fill: preferredTextStyle.fill,
+        fillRgb: preferredTextStyle.fillRgb,
+        fillLuma: preferredTextStyle.fillLuma,
+        measured: true,
+      };
+    }
 
     // Align the replacement with the page's other numbers (size + ink color)
     // when the value's own ink measurement is missing, wildly off, or lighter.
@@ -685,6 +866,48 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   const sharedTextStyle = uniformTextStyle
     ? mergeUniformTextStyle(textOps.map((op) => op.textStyle))
     : null;
+  // ACTUAL and CHARGED are one visual row. Calculate their final type size
+  // once, against every cell's available width/height, instead of allowing a
+  // slightly different OCR box to produce visibly different typography.
+  let sharedRenderedFontSize = null;
+  let sharedBaselineY = null;
+  if (sharedTextStyle && textOps.length > 1) {
+    const limits = textOps.map((op) => {
+      const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
+      const guardedTextX = op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio);
+      const textX = Math.max(naturalTextX, guardedTextX);
+      const heightLimit = Math.max(6, op.height / 0.82);
+      const widthLimit = Math.max(4, op.rectX + op.rectW - textX - 1) /
+        numericAdvanceUnits(op.replacementText, sharedTextStyle.fontFamily);
+      return Math.min(heightLimit, widthLimit);
+    });
+    sharedRenderedFontSize = Math.max(
+      6,
+      Math.min(
+        sharedTextStyle.fontSize * Math.min(...textOps.map((op) => op.fontScale)),
+        ...limits
+      )
+    );
+
+    const candidateBaselines = textOps.map((op) =>
+      Math.min(
+        op.bbox.y1 - 1,
+        Math.max(
+          op.bbox.y0 + sharedRenderedFontSize * 0.72,
+          op.bbox.y0 + op.height / 2 + sharedRenderedFontSize * 0.28
+        )
+      )
+    );
+    const commonMin = Math.max(
+      ...textOps.map((op) => op.bbox.y0 + sharedRenderedFontSize * 0.72)
+    );
+    const commonMax = Math.min(...textOps.map((op) => op.bbox.y1 - 1));
+    const medianBaseline = medianNumber(candidateBaselines);
+    sharedBaselineY = commonMin <= commonMax
+      ? Math.max(commonMin, Math.min(commonMax, medianBaseline))
+      : medianBaseline;
+  }
+
   const texts = textOps.map((op) => {
     const textStyle = sharedTextStyle || op.textStyle;
     const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
@@ -694,11 +917,11 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     const maxTextWidth = Math.max(4, op.rectX + op.rectW - textX - 1);
     const maxFontSizeForWidth =
       maxTextWidth / numericAdvanceUnits(op.replacementText, textStyle.fontFamily);
-    const renderedFontSize = Math.max(
+    const renderedFontSize = sharedRenderedFontSize ?? Math.max(
       6,
       Math.min(textStyle.fontSize * op.fontScale, maxFontSizeForHeight, maxFontSizeForWidth)
     );
-    const baselineY = Math.min(
+    const baselineY = sharedBaselineY ?? Math.min(
       op.bbox.y1 - 1,
       Math.max(op.bbox.y0 + renderedFontSize * 0.72, op.bbox.y0 + op.height / 2 + renderedFontSize * 0.28)
     );
@@ -717,8 +940,17 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       `</svg>`
   );
 
+  let renderedTextOverlay = overlaySvg;
+  if (preferredTextStyle && Math.max(meta.width, meta.height) <= 2400) {
+    // Native label text in low-resolution scans has a small optical/scan blur;
+    // raw SVG edges look conspicuously digital beside it. Apply only a subtle
+    // resolution-aware blur and keep high-resolution source text untouched.
+    const sigma = Math.min(0.55, Math.max(0.3, 700 / Math.max(meta.width, meta.height)));
+    renderedTextOverlay = await sharp(overlaySvg).png().blur(sigma).toBuffer();
+  }
+
   return image
-    .composite([...eraseOverlays, { input: overlaySvg, top: 0, left: 0 }])
+    .composite([...eraseOverlays, { input: renderedTextOverlay, top: 0, left: 0 }])
     .toBuffer();
 }
 
@@ -726,6 +958,7 @@ module.exports = {
   replaceWeightRegions,
   sampleBackgroundColor,
   sampleLocalPaperColor,
+  samplePaperInsideBbox,
   sampleTextStyle,
   calculateFontSize,
   shrinkClearRectAroundRules,

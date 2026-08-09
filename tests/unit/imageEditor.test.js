@@ -11,9 +11,80 @@ const {
   sampleTextStyle,
   shrinkClearRectAroundRules,
   computePageStyle,
+  samplePaperInsideBbox,
 } = require('../../src/services/imageEditor.service');
 
 describe('imageEditor.service', () => {
+  describe('samplePaperInsideBbox', () => {
+    it('matches blue-gray paper instead of selecting bright scan outliers', async () => {
+      const width = 80;
+      const height = 40;
+      const channels = 3;
+      const pixels = Buffer.alloc(width * height * channels);
+
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const offset = (y * width + x) * channels;
+          const isBrightOutlier = x >= 62;
+          const isInk = x >= 12 && x <= 20 && y >= 12 && y <= 27;
+          const color = isInk
+            ? [55, 65, 78]
+            : isBrightOutlier
+              ? [245, 248, 252]
+              : [170 + (x % 4), 198 + (y % 3), 226 + (x % 3)];
+          pixels[offset] = color[0];
+          pixels[offset + 1] = color[1];
+          pixels[offset + 2] = color[2];
+        }
+      }
+
+      const image = sharp(pixels, { raw: { width, height, channels } });
+      const meta = await image.metadata();
+      const paper = await samplePaperInsideBbox(image, meta, {
+        x0: 0,
+        y0: 0,
+        x1: width,
+        y1: height,
+      });
+
+      expect(paper.r).toBeGreaterThanOrEqual(165);
+      expect(paper.r).toBeLessThan(190);
+      expect(paper.b).toBeGreaterThan(215);
+      expect(paper.b).toBeLessThan(240);
+    });
+  });
+
+  it('does not repaint naturally shadowed blue paper around the old glyphs', async () => {
+    const width = 180;
+    const height = 80;
+    const baseSvg = Buffer.from(
+      `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">` +
+        '<defs><linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">' +
+        '<stop offset="0" stop-color="rgb(92,163,194)" />' +
+        '<stop offset="1" stop-color="rgb(65,133,168)" />' +
+        '</linearGradient></defs>' +
+        '<rect width="180" height="80" fill="url(#paper)" />' +
+        '<text x="45" y="48" font-family="Arial" font-size="22" fill="rgb(28,69,88)">49.9</text>' +
+        '</svg>'
+    );
+    const original = await sharp(baseSvg).png().toBuffer();
+    const edited = await replaceWeightRegions(original, [{
+      bbox: { x0: 43, y0: 28, x1: 92, y1: 53 },
+      clearBbox: { x0: 40, y0: 25, x1: 98, y1: 56 },
+      originalText: '49.9',
+      replacementText: '56.0',
+    }], { uniformTextStyle: false });
+
+    const originalRaw = await sharp(original).removeAlpha().raw().toBuffer();
+    const editedRaw = await sharp(edited).removeAlpha().raw().toBuffer();
+    // This point lies inside the clear rectangle but outside both old and new
+    // glyphs. It must remain untouched instead of becoming part of a strip.
+    const sampleOffset = (30 * width + 95) * 3;
+    expect(editedRaw[sampleOffset]).toBe(originalRaw[sampleOffset]);
+    expect(editedRaw[sampleOffset + 1]).toBe(originalRaw[sampleOffset + 1]);
+    expect(editedRaw[sampleOffset + 2]).toBe(originalRaw[sampleOffset + 2]);
+  });
+
   describe('calculateFontSize', () => {
     it('caps an abnormally tall, narrow OCR box using its text width', () => {
       expect(calculateFontSize(55, 32, '152.00')).toBeCloseTo(18.33, 1);
@@ -262,6 +333,49 @@ describe('imageEditor.service', () => {
     expect(data[offset + 2]).toBeGreaterThan(230);
   });
 
+  it('inpaints erased ink with local paper texture instead of a flat light strip', async () => {
+    const width = 100;
+    const height = 70;
+    const pixels = Buffer.alloc(width * height * 3);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 3;
+        const tone = 205 + Math.round(x * 0.18) + ((x + y) % 3);
+        pixels[offset] = tone - 8;
+        pixels[offset + 1] = tone;
+        pixels[offset + 2] = Math.min(255, tone + 12);
+      }
+    }
+    const input = await sharp(pixels, { raw: { width, height, channels: 3 } })
+      .composite([{ input: Buffer.from(
+        '<svg width="100" height="70" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect x="20" y="20" width="34" height="9" fill="rgb(35,35,35)" />' +
+          '</svg>'
+      ) }])
+      .png()
+      .toBuffer();
+
+    const edited = await replaceWeightRegions(input, [{
+      bbox: { x0: 20, y0: 20, x1: 40, y1: 29 },
+      clearBbox: { x0: 18, y0: 18, x1: 56, y1: 31 },
+      originalText: '80',
+      replacementText: '',
+    }]);
+    const { data, info } = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const colorAt = (x, y) => {
+      const offset = (y * info.width + x) * info.channels;
+      return [data[offset], data[offset + 1], data[offset + 2]];
+    };
+    const filledA = colorAt(25, 24);
+    const filledB = colorAt(48, 24);
+    const nearbyA = colorAt(25, 45);
+    const nearbyB = colorAt(48, 45);
+
+    expect(Math.abs(filledA[0] - nearbyA[0])).toBeLessThan(10);
+    expect(Math.abs(filledB[0] - nearbyB[0])).toBeLessThan(10);
+    expect(filledB[0] - filledA[0]).toBeGreaterThan(2);
+  });
+
   it('keeps the table border when the OCR box itself swallows the line', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'label-editor-'));
     const inputPath = path.join(tempDir, 'border-swallowed.png');
@@ -352,6 +466,36 @@ describe('imageEditor.service', () => {
     const matchedDarkest = await darkestPixel(withRefs);
     expect(Math.abs(matchedDarkest - originalToneDarkest)).toBeLessThanOrEqual(18);
     expect(matchedDarkest).toBeGreaterThan(120);
+  });
+
+  it('never erases a heading separator crossed by an expanded value box', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="140" height="70" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="140" height="70" fill="white" />' +
+          '<line x1="0" y1="25" x2="140" y2="25" stroke="black" stroke-width="2" />' +
+          '<text x="20" y="45" font-family="Arial" font-size="16">80.00</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+
+    const before = await sharp(input).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const edited = await replaceWeightRegions(input, [{
+      bbox: { x0: 20, y0: 31, x1: 65, y1: 48 },
+      clearBbox: { x0: 17, y0: 23, x1: 78, y1: 51 },
+      originalText: '80.00',
+      replacementText: '95.00',
+    }]);
+    const after = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+
+    for (let x = 0; x < 140; x += 1) {
+      for (const y of [24, 25]) {
+        const offset = (y * before.info.width + x) * before.info.channels;
+        expect(after.data.subarray(offset, offset + 3)).toEqual(
+          before.data.subarray(offset, offset + 3)
+        );
+      }
+    }
   });
 
   it('renders sibling weight replacements with one shared typography style', async () => {

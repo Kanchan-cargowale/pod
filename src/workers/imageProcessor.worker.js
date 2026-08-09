@@ -9,7 +9,7 @@ const imageEditor = require('../services/imageEditor.service');
 const { shouldTryQuarterTurns } = require('../services/imageOrientation.service');
 const {
   inferActualSiblingRegion,
-  inferWeightRegionsFromTable,
+  inferWeightRegionsFromAnchors,
 } = require('../services/weightRegionFallback.service');
 const {
   findShipmentId,
@@ -64,7 +64,12 @@ function extractCandidateIds(words, minConfidence) {
 function buildWeightClearBbox(region, meta) {
   const width = region.bbox.x1 - region.bbox.x0;
   const height = region.bbox.y1 - region.bbox.y0;
-  const originalLength = Math.max(1, String(region.originalText || '').length);
+  // Inferred regions deliberately have no OCR text. Treating that as a
+  // one-character value made width/originalLength equal the entire cell and
+  // expanded the erase box far into the next column/header. A typical weight
+  // has at least four glyphs; the conservative estimate keeps all clearing in
+  // the value's local ink band.
+  const originalLength = Math.max(4, String(region.originalText || '').length);
   const horizontalPad = Math.max(5, height * 0.45, width / originalLength);
   const verticalPad = Math.max(2, height * 0.22);
 
@@ -75,7 +80,7 @@ function buildWeightClearBbox(region, meta) {
     // usually need cleanup.
     x0: Math.max(0, region.bbox.x0 - Math.min(2, horizontalPad * 0.25)),
     y0: Math.max(0, region.bbox.y0 - verticalPad),
-    x1: Math.min(meta.width, region.bbox.x1 + horizontalPad * 1.65),
+    x1: Math.min(meta.width, region.bbox.x1 + Math.min(horizontalPad * 1.65, width * 0.45)),
     y1: Math.min(meta.height, region.bbox.y1 + verticalPad),
   };
 }
@@ -196,10 +201,10 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     return words;
   }
 
-  function mergeWords(primaryWords, extraWords) {
+  function mergeWords(...wordGroups) {
     const seen = new Set();
     const merged = [];
-    for (const word of [...primaryWords, ...extraWords]) {
+    for (const word of wordGroups.flat()) {
       const key = [
         word.text,
         Math.round(word.bbox.x0),
@@ -263,7 +268,10 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
         input,
         meta,
         rotation,
-        mergeWords(enhancedWords, enhancedIdWords)
+        // Keep the base OCR headers when enhanced OCR is needed for a faint
+        // value. Replacing the word set entirely made one of the two column
+        // headers disappear on scans such as 287980980.
+        mergeWords(result.words, enhancedWords, enhancedIdWords)
       );
       if (isBetterAnalysis(enhancedResult, result)) result = enhancedResult;
     }
@@ -320,12 +328,91 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
   const { input: processingInput, words, match, anchors } = analysis;
   let { regions } = analysis;
 
+  // Base and enhanced OCR may return the same physical value as two distinct
+  // word objects. Without spatial de-duplication each copy can be assigned to
+  // a different header, falsely producing two replacements in the ACTUAL
+  // cell while leaving CHARGED untouched.
+  regions = [...regions]
+    .sort((a, b) => a.bbox.x0 - b.bbox.x0)
+    .filter((region, index, all) => {
+      const width = Math.max(1, region.bbox.x1 - region.bbox.x0);
+      const centerX = (region.bbox.x0 + region.bbox.x1) / 2;
+      return !all.slice(0, index).some((previous) => {
+        const previousWidth = Math.max(1, previous.bbox.x1 - previous.bbox.x0);
+        const previousCenterX = (previous.bbox.x0 + previous.bbox.x1) / 2;
+        const overlap = Math.max(
+          0,
+          Math.min(region.bbox.x1, previous.bbox.x1) - Math.max(region.bbox.x0, previous.bbox.x0)
+        );
+        return overlap >= Math.min(width, previousWidth) * 0.55 ||
+          Math.abs(centerX - previousCenterX) < Math.min(width, previousWidth) * 0.6;
+      });
+    });
+
+  if (regions.length > 1) {
+    const minColumnSeparation = analysis.meta.width * 0.045;
+    const maxRowDrift = Math.max(7, analysis.meta.height * 0.018);
+    let bestPair = null;
+    for (let i = 0; i < regions.length; i += 1) {
+      for (let j = i + 1; j < regions.length; j += 1) {
+        const firstCenterX = (regions[i].bbox.x0 + regions[i].bbox.x1) / 2;
+        const secondCenterX = (regions[j].bbox.x0 + regions[j].bbox.x1) / 2;
+        const firstCenterY = (regions[i].bbox.y0 + regions[i].bbox.y1) / 2;
+        const secondCenterY = (regions[j].bbox.y0 + regions[j].bbox.y1) / 2;
+        const separation = Math.abs(firstCenterX - secondCenterX);
+        const rowDrift = Math.abs(firstCenterY - secondCenterY);
+        if (separation < minColumnSeparation || rowDrift > maxRowDrift) continue;
+        if (!bestPair || separation > bestPair.separation) {
+          bestPair = { regions: [regions[i], regions[j]], separation };
+        }
+      }
+    }
+    if (bestPair) {
+      regions = bestPair.regions;
+    } else {
+      // Keep the most substantial value token; tiny nearby punctuation/digits
+      // are not a second column and will be replaced by sibling inference.
+      regions = [[...regions].sort((a, b) => {
+        const areaA = (a.bbox.x1 - a.bbox.x0) * (a.bbox.y1 - a.bbox.y0);
+        const areaB = (b.bbox.x1 - b.bbox.x0) * (b.bbox.y1 - b.bbox.y0);
+        return areaB - areaA;
+      })[0]];
+    }
+  }
+
+  const maxSafeValueHeight = Math.max(16, analysis.meta.height * 0.03);
+  const hasUnsafeMergedRegion = regions.some(
+    (region) => region.bbox.y1 - region.bbox.y0 > maxSafeValueHeight
+  );
+
+  // Never edit directly from a tall/merged OCR token when the printed table
+  // can prove both cells and the value row. This is the primary path for
+  // two-column PODs; OCR text remains useful for precision/style only.
+  const structuralRegions = await inferWeightRegionsFromAnchors(
+    processingInput,
+    anchors,
+    words,
+    analysis.meta
+  );
+  if (structuralRegions.length === 2 && (regions.length < 2 || hasUnsafeMergedRegion)) {
+    regions = structuralRegions;
+  }
+
+  // A normal printed value is a short, single text line. Enlarged OCR can
+  // occasionally return a 30-40px box containing the two-line header plus the
+  // value (observed as "1160"/"11168"). Such a box is never safe to erase.
+  regions = regions.filter((region) => {
+    const height = region.bbox.y1 - region.bbox.y0;
+    return height <= maxSafeValueHeight;
+  });
+
   if (regions.length === 1) {
     const inferredRegions = await inferActualSiblingRegion(
       processingInput,
       anchors,
       regions,
-      analysis.meta
+      analysis.meta,
+      words
     );
     regions = [...inferredRegions, ...regions];
   }
@@ -340,14 +427,6 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
   }
 
   const newWeight = idWeightMap.get(match.id);
-
-  if (!regions.length) {
-    const inferredTableRegions = await inferWeightRegionsFromTable(
-      processingInput,
-      analysis.meta
-    );
-    if (inferredTableRegions.length) regions = inferredTableRegions;
-  }
 
   if (!regions.length) {
     return {
@@ -390,6 +469,46 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     };
   });
 
+  // Use the nearest box/dimension line as the per-image typography specimen.
+  // It is generated by the same printer/template as the weight values but is
+  // usually much clearer than the faint value OCR boxes themselves.
+  const replacementCenterY = replacements.reduce(
+    (sum, replacement) => sum + (replacement.bbox.y0 + replacement.bbox.y1) / 2,
+    0
+  ) / replacements.length;
+  const firstWeightX = Math.min(...replacements.map((replacement) => replacement.bbox.x0));
+  const maxReferenceYDistance = Math.max(14, analysis.meta.height * 0.04);
+  const localReferenceCandidates = words
+    .filter((word) => {
+      const width = word.bbox.x1 - word.bbox.x0;
+      const height = word.bbox.y1 - word.bbox.y0;
+      const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
+      const compact = String(word.text || '').replace(/\s/g, '');
+      return word.bbox.x1 < firstWeightX - 2 &&
+        word.bbox.x0 > analysis.meta.width * 0.02 &&
+        Math.abs(centerY - replacementCenterY) <= maxReferenceYDistance &&
+        width >= 4 && height >= 4 && height <= Math.max(24, analysis.meta.height * 0.045) &&
+        compact.length >= 2 && compact.length <= 18;
+    })
+    .map((word) => ({
+      bbox: word.bbox,
+      text: word.text,
+      centerY: (word.bbox.y0 + word.bbox.y1) / 2,
+      priority: /box|\d|[x×]/i.test(word.text) ? 0 : 1,
+    }))
+    .sort((a, b) =>
+      a.priority - b.priority ||
+      Math.abs(a.centerY - replacementCenterY) - Math.abs(b.centerY - replacementCenterY) ||
+      b.bbox.x1 - a.bbox.x1
+    );
+  const bestReferenceY = localReferenceCandidates[0]?.centerY;
+  const preferredStyleReferences = bestReferenceY === undefined
+    ? []
+    : localReferenceCandidates
+      .filter((candidate) => Math.abs(candidate.centerY - bestReferenceY) <= Math.max(4, analysis.meta.height * 0.008))
+      .slice(0, 6)
+      .map(({ bbox, text }) => ({ bbox, text }));
+
   // Sibling numeric words on the same page (box dimensions, counts, dates,
   // etc.) act as per-image typography references so the replacement text
   // matches the size and ink color of the surrounding print, even when the
@@ -416,6 +535,7 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
 
   const editedBuffer = await imageEditor.replaceWeightRegions(processingInput, replacements, {
     styleReferences,
+    preferredStyleReferences,
   });
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   const writtenOutput = await writeOutputNamedByShipmentId(outputPath, match.id, editedBuffer);
