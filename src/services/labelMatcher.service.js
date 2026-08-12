@@ -114,9 +114,9 @@ function buildMergedNumericCandidates(words) {
 
       // Allow generous tolerance: skewed/rotated phone photos can drift
       // vertically as they move horizontally across a line of text.
-      if (gapX > avgHeight * 4 || gapX < -avgHeight) continue;
-      if (verticalDrift > avgHeight * 1.6) continue;
-      if (text.length >= 18) break;
+      if (gapX > avgHeight * 5 || gapX < -avgHeight * 0.8) continue;
+      if (verticalDrift > avgHeight * 2.0) continue;
+      if (text.length >= 20) break;
 
       text += next.digits;
       minConfidence = Math.min(minConfidence, next.word.confidence);
@@ -148,7 +148,7 @@ function buildMergedNumericCandidates(words) {
  */
 function findShipmentId(words, idSet, opts = {}) {
   const minConfidence = opts.minConfidence ?? 40;
-  const fuzzyMaxDistance = opts.fuzzyMaxDistance ?? 1;
+  const fuzzyMaxDistance = opts.fuzzyMaxDistance ?? 2;
 
   const singleWordCandidates = words
     .filter((w) => w.confidence >= minConfidence)
@@ -175,11 +175,12 @@ function findShipmentId(words, idSet, opts = {}) {
   if (best) return best;
 
   // Fuzzy fallback: only runs if no exact match was found anywhere on the page.
+  // Allow up to 2 character differences for heavily degraded scans.
   for (const candidate of allCandidates) {
     for (const id of idSet) {
       if (Math.abs(id.length - candidate.text.length) > fuzzyMaxDistance) continue;
       const distance = levenshtein(id, candidate.text);
-      if (distance <= fuzzyMaxDistance && (!best || distance < best.distance)) {
+      if (distance <= fuzzyMaxDistance && (!best || distance < best.distance || candidate.confidence > best.confidence)) {
         best = { id, word: candidate.words[0], words: candidate.words, distance, confidence: candidate.confidence };
       }
     }
@@ -321,7 +322,8 @@ function findWeightValueRegions(words, anchors, ctx) {
   const regions = [];
   const claimed = new Set();
 
-  for (const anchor of anchors) {
+  for (let anchorIndex = 0; anchorIndex < anchors.length; anchorIndex += 1) {
+    const anchor = anchors[anchorIndex];
     const anchorWidth = anchor.bbox.x1 - anchor.bbox.x0;
     const effectiveTolerance = Math.min(
       horizontalTolerancePx,
@@ -359,6 +361,7 @@ function findWeightValueRegions(words, anchors, ctx) {
         bbox: { ...word.bbox },
         originalText: word.text.trim(),
         anchorText: anchor.words.map((w) => w.text).join(' '),
+        kind: classifyWeightRegion({ anchorText: anchor.words.map((w) => w.text).join(' ') }, anchorIndex, anchors),
       });
     }
   }
@@ -379,6 +382,27 @@ function findWeightValueRegions(words, anchors, ctx) {
   }
   rowGroups.sort((a, b) => b.length - a.length || a[0].bbox.y0 - b[0].bbox.y0);
   return rowGroups[0];
+}
+
+function weightColumnKind(text) {
+  const normalized = String(text || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (/actual|ctual/.test(normalized)) return 'actual';
+  if (/charged|chargeable|chargd/.test(normalized)) return 'charged';
+  return null;
+}
+
+function classifyWeightRegion(region, anchorIndex, anchors) {
+  const anchorText = region.anchorText || '';
+  const kind = weightColumnKind(anchorText);
+  if (kind) return kind;
+
+  if (anchors.length >= 2 && anchorIndex < anchors.length) {
+    const anchor = anchors[anchorIndex];
+    const anchorWords = anchor.words.map((w) => w.text).join(' ');
+    return weightColumnKind(anchorWords) || (anchorIndex === 0 ? 'actual' : 'charged');
+  }
+
+  return 'actual';
 }
 
 /**
@@ -423,4 +447,6 @@ module.exports = {
   buildMergedNumericCandidates,
   isWeightAnchorText,
   isWeightQualifierText,
+  weightColumnKind,
+  classifyWeightRegion,
 };

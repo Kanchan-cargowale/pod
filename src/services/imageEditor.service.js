@@ -2,11 +2,11 @@
 
 const sharp = require('sharp');
 
-const FONT_SIZE_RATIO = 0.86; // font-size relative to bbox height
+const FONT_SIZE_RATIO = 0.7; // font-size relative to bbox height
 const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advance
 const TEXT_LEFT_PADDING_RATIO = 0.08; // inset replacement text inside the cleared value area
-const BORDER_GUARD_PX = 8; // how far inside the clear box a table rule may sit
-const BORDER_OUTSIDE_PX = 4; // how far outside the clear box we look for rules
+const BORDER_GUARD_PX = 12; // how far inside the clear box a table rule may sit
+const BORDER_OUTSIDE_PX = 6; // how far outside the clear box we look for rules
 const MIN_RULE_RUN_RATIO = 1.2; // rule lines run much longer than glyph strokes
 const MAX_PAGE_STYLE_REFERENCES = 40; // sibling numbers sampled per value
 const PAGE_STYLE_HEIGHT_RATIO_MIN = 0.45; // ignore much smaller page text
@@ -393,7 +393,7 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
       }
       const localPaperLuma = luminance(replacement);
       const darkness = localPaperLuma - pixelLuma;
-      const localInkThreshold = Math.max(5, localPaperLuma * 0.035);
+      const localInkThreshold = Math.max(2, localPaperLuma * 0.02);
       const isOldInk = darkness >= localInkThreshold;
       if (!isOldInk) continue;
 
@@ -406,6 +406,77 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
     }
   }
 
+  // Secondary residual sweep: faint fragments of the old weight value can
+  // survive the primary pass on degraded scans. After the main erase, scan
+  // the clear rectangle once more with a lower luma threshold and remove any
+  // remaining dark pixels that are not table rules.
+  if (erasedPixels > 0) {
+    const residualLimit = Math.max(1, bgLuma * 0.01);
+    for (let y = 0; y < height; y += 1) {
+      const imageY = rect.y + y;
+      for (let x = 0; x < width; x += 1) {
+        const imageX = rect.x + x;
+        if (verticalRuleCols.has(imageX) || horizontalRuleRows.has(imageY)) continue;
+
+        const sourceOffset = (y * info.width + x) * info.channels;
+        const pixelLuma = luminance({
+          r: data[sourceOffset],
+          g: data[sourceOffset + 1],
+          b: data[sourceOffset + 2],
+        });
+        if (bgLuma - pixelLuma < residualLimit) continue;
+
+        const overlayOffset = (y * width + x) * 4;
+        if (overlay[overlayOffset + 3] === 0) {
+          let replacement = sameRowPaper(x, y) || bg;
+          if (replacement === bg && textureData && textureInfo) {
+            const textureOffset = (y * textureInfo.width + x) * textureInfo.channels;
+            const candidate = {
+              r: textureData[textureOffset],
+              g: textureData[textureOffset + 1],
+              b: textureData[textureOffset + 2],
+            };
+            if (luminance(candidate) >= bgLuma - 22) replacement = candidate;
+          }
+          overlay[overlayOffset] = replacement.r;
+          overlay[overlayOffset + 1] = replacement.g;
+          overlay[overlayOffset + 2] = replacement.b;
+          overlay[overlayOffset + 3] = 255;
+        }
+      }
+    }
+  }
+
+  // Tertiary global sweep: catch any remaining dark fragments that were
+  // missed by both the primary and residual passes. This uses a very low
+  // threshold and only operates on pixels that are still un-erased.
+  if (erasedPixels > 0) {
+    const globalLimit = Math.max(1, bgLuma * 0.008);
+    for (let y = 0; y < height; y += 1) {
+      const imageY = rect.y + y;
+      for (let x = 0; x < width; x += 1) {
+        const imageX = rect.x + x;
+        if (verticalRuleCols.has(imageX) || horizontalRuleRows.has(imageY)) continue;
+
+        const sourceOffset = (y * info.width + x) * info.channels;
+        const pixelLuma = luminance({
+          r: data[sourceOffset],
+          g: data[sourceOffset + 1],
+          b: data[sourceOffset + 2],
+        });
+        if (bgLuma - pixelLuma < globalLimit) continue;
+
+        const overlayOffset = (y * width + x) * 4;
+        if (overlay[overlayOffset + 3] === 0) {
+          overlay[overlayOffset] = bg.r;
+          overlay[overlayOffset + 1] = bg.g;
+          overlay[overlayOffset + 2] = bg.b;
+          overlay[overlayOffset + 3] = 255;
+        }
+      }
+    }
+  }
+
   if (!erasedPixels) return null;
 
   return {
@@ -415,13 +486,40 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
   };
 }
 
-function estimateFontFamily(inkWidth, inkHeight, originalText) {
+function estimateFontFamily(inkWidth, inkHeight, strokeThickness, originalText) {
   const characterCount = Math.max(1, String(originalText || '').length);
   const characterAspect = inkWidth / Math.max(1, inkHeight * characterCount);
+  const strokeRatio = strokeThickness / Math.max(1, inkHeight);
 
+  if (strokeRatio > 0.16 && characterAspect > 0.5) return 'Arial Black, Arial, sans-serif';
   if (characterAspect < 0.42) return 'Arial Narrow, Arial, sans-serif';
   if (characterAspect > 0.82) return 'Courier New, monospace';
   return DEFAULT_TEXT_STYLE.fontFamily;
+}
+
+function estimateStrokeThickness(inkPixels, pixelWidth, pixelHeight) {
+  if (inkPixels.length < 4) return 1;
+
+  const inkSet = new Set(inkPixels.map((p) => `${p.x},${p.y}`));
+  const runs = [];
+
+  for (const pixel of inkPixels) {
+    let hRun = 1;
+    for (let dx = 1; pixel.x + dx < pixelWidth; dx += 1) {
+      if (inkSet.has(`${pixel.x + dx},${pixel.y}`)) hRun += 1;
+      else break;
+    }
+    let vRun = 1;
+    for (let dy = 1; pixel.y + dy < pixelHeight; dy += 1) {
+      if (inkSet.has(`${pixel.x},${pixel.y + dy}`)) vRun += 1;
+      else break;
+    }
+    if (hRun >= 2 || vRun >= 2) runs.push(Math.min(hRun, vRun));
+  }
+
+  if (!runs.length) return 1;
+  const sorted = runs.sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length * 0.35)] || 1;
 }
 
 function numericAdvanceUnits(text, fontFamily) {
@@ -504,7 +602,6 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
     const ys = inkPixels.map((pixel) => pixel.y);
     const inkWidth = Math.max(...xs) - Math.min(...xs) + 1;
     const inkHeight = Math.max(...ys) - Math.min(...ys) + 1;
-    const fontFamily = estimateFontFamily(inkWidth, inkHeight, originalText);
 
     // Use the darkest quarter of the ink for the fill color. A plain median
     // of the "core" pixels lands on gray anti-aliased edge pixels for blurred
@@ -524,12 +621,11 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
 
     const inkArea = Math.max(1, inkWidth * inkHeight);
     const strokeDensity = inkPixels.length / inkArea;
-    // Camera blur spreads bold strokes over a larger area but lowers their
-    // darkest-pixel density, so scanned bold text needs a lower cutoff than
-    // clean screen-rendered text.
-    const fontWeight = strokeDensity >= 0.25 ? 700 : 400;
+    const strokeThickness = estimateStrokeThickness(inkPixels, info.width, info.height);
+    const fontWeight = strokeDensity >= 0.22 || strokeThickness >= 2.2 ? 700 : 400;
+    const fontFamily = estimateFontFamily(inkWidth, inkHeight, strokeThickness, originalText);
     const widthBasedSize = inkWidth / numericAdvanceUnits(originalText, fontFamily);
-    const heightBasedSize = inkHeight / 0.72;
+    const heightBasedSize = inkHeight / 0.85;
     const fontSize = Math.max(8, Math.min(widthBasedSize, heightBasedSize));
 
     return { fontFamily, fontWeight, fill, fillRgb, fillLuma: luminance(fillRgb), measured: true, fontSize };
@@ -876,7 +972,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
       const guardedTextX = op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio);
       const textX = Math.max(naturalTextX, guardedTextX);
-      const heightLimit = Math.max(6, op.height / 0.82);
+      const heightLimit = Math.max(6, op.height / 0.9);
       const widthLimit = Math.max(4, op.rectX + op.rectW - textX - 1) /
         numericAdvanceUnits(op.replacementText, sharedTextStyle.fontFamily);
       return Math.min(heightLimit, widthLimit);
@@ -913,7 +1009,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
     const guardedTextX = op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio);
     const textX = Math.max(naturalTextX, guardedTextX);
-    const maxFontSizeForHeight = Math.max(6, op.height / 0.82);
+    const maxFontSizeForHeight = Math.max(6, op.height / 0.9);
     const maxTextWidth = Math.max(4, op.rectX + op.rectW - textX - 1);
     const maxFontSizeForWidth =
       maxTextWidth / numericAdvanceUnits(op.replacementText, textStyle.fontFamily);

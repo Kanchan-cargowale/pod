@@ -349,6 +349,56 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       });
     });
 
+  function countWeightColumns(anchors) {
+    const weightAnchors = anchors.filter((anchor) =>
+      anchor.words.some((word) => /weight|weigh|actual|ctual|charg|chargeable/i.test(word.text))
+    );
+    return Math.max(1, Math.min(2, weightAnchors.length));
+  }
+
+  function isWeightRegion(region) {
+    const text = (region.anchorText || '').toLowerCase();
+    return /weight|weigh|actual|ctual|charg|chargeable|structural|inferred/.test(text);
+  }
+
+  function regionOverlapsAnchor(region, anchors) {
+    const rx0 = region.bbox.x0;
+    const rx1 = region.bbox.x1;
+    const ry0 = region.bbox.y0;
+    const ry1 = region.bbox.y1;
+    return anchors.some((anchor) => {
+      const ax0 = anchor.bbox.x0;
+      const ax1 = anchor.bbox.x1;
+      const ay0 = anchor.bbox.y0;
+      const ay1 = anchor.bbox.y1;
+      const overlapX = Math.max(0, Math.min(rx1, ax1) - Math.max(rx0, ax0));
+      const overlapY = Math.max(0, Math.min(ry1, ay1) - Math.max(ry0, ay0));
+      return overlapX > 0 && overlapY > 0;
+    });
+  }
+
+  function sanitizeRegionBbox(region, anchors, meta) {
+    const sanitized = { ...region, bbox: { ...region.bbox } };
+    if (regionOverlapsAnchor(sanitized, anchors)) {
+      const anchorBelow = anchors.filter((a) => a.bbox.y0 >= sanitized.bbox.y1);
+      const closestBelow = anchorBelow.sort((a, b) => a.bbox.y0 - b.bbox.y0)[0];
+      if (closestBelow) {
+        sanitized.bbox.y1 = Math.min(sanitized.bbox.y1, closestBelow.bbox.y0 - 2);
+      }
+      const anchorAbove = anchors.filter((a) => a.bbox.y1 <= sanitized.bbox.y0);
+      const closestAbove = anchorAbove.sort((a, b) => b.bbox.y1 - a.bbox.y1)[0];
+      if (closestAbove) {
+        sanitized.bbox.y0 = Math.max(sanitized.bbox.y0, closestAbove.bbox.y1 + 2);
+      }
+      if (sanitized.bbox.y1 <= sanitized.bbox.y0) {
+        sanitized.bbox.y1 = sanitized.bbox.y0 + 10;
+      }
+    }
+    return sanitized;
+  }
+
+  const expectedRegionCount = countWeightColumns(anchors);
+
   if (regions.length > 1) {
     const minColumnSeparation = analysis.meta.width * 0.045;
     const maxRowDrift = Math.max(7, analysis.meta.height * 0.018);
@@ -370,8 +420,6 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     if (bestPair) {
       regions = bestPair.regions;
     } else {
-      // Keep the most substantial value token; tiny nearby punctuation/digits
-      // are not a second column and will be replaced by sibling inference.
       regions = [[...regions].sort((a, b) => {
         const areaA = (a.bbox.x1 - a.bbox.x0) * (a.bbox.y1 - a.bbox.y0);
         const areaB = (b.bbox.x1 - b.bbox.x0) * (b.bbox.y1 - b.bbox.y0);
@@ -380,7 +428,14 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     }
   }
 
-  const maxSafeValueHeight = Math.max(16, analysis.meta.height * 0.03);
+  regions = regions.filter((region) => !regionOverlapsAnchor(region, anchors));
+  regions = regions.map((region) => sanitizeRegionBbox(region, anchors, analysis.meta));
+
+  // Remove any regions that are not actually weight fields (e.g. container
+  // description numbers that were picked up by OCR near a weight column).
+  regions = regions.filter(isWeightRegion);
+
+  const maxSafeValueHeight = Math.max(14, analysis.meta.height * 0.025);
   const hasUnsafeMergedRegion = regions.some(
     (region) => region.bbox.y1 - region.bbox.y0 > maxSafeValueHeight
   );
@@ -406,7 +461,7 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
     return height <= maxSafeValueHeight;
   });
 
-  if (regions.length === 1) {
+  if (regions.length < expectedRegionCount) {
     const inferredRegions = await inferActualSiblingRegion(
       processingInput,
       anchors,
@@ -415,6 +470,13 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       words
     );
     regions = [...inferredRegions, ...regions];
+    regions = regions.filter((region) => !regionOverlapsAnchor(region, anchors));
+    regions = regions.map((region) => sanitizeRegionBbox(region, anchors, analysis.meta));
+    regions = regions.filter(isWeightRegion);
+    regions = regions.filter((region) => {
+      const height = region.bbox.y1 - region.bbox.y0;
+      return height <= maxSafeValueHeight;
+    });
   }
 
   if (!match) {
@@ -422,6 +484,17 @@ async function processImage({ filePath, outputPath, idWeightMap }) {
       status: 'unmatched',
       reason: 'No shipment ID from the mapping sheet was found in the scanned label text',
       detectedNumbers: extractCandidateIds(words, config.ocrMinConfidence),
+      processingMs: elapsedMs(),
+    };
+  }
+
+  if (expectedRegionCount === 2 && regions.length < 2) {
+    return {
+      status: 'partial_weight_detection',
+      shipmentId: match.id,
+      newWeight: idWeightMap.get(match.id),
+      reason: `Label requires 2 weight fields but only ${regions.length} could be located`,
+      detectedWeightAnchors: anchors.map((a) => a.words.map((w) => w.text).join(' ')),
       processingMs: elapsedMs(),
     };
   }

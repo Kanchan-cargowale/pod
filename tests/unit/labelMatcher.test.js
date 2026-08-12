@@ -8,6 +8,8 @@ const {
   formatSharedReplacementWeight,
   isWeightAnchorText,
   isWeightQualifierText,
+  weightColumnKind,
+  classifyWeightRegion,
 } = require('../../src/services/labelMatcher.service');
 
 // This word list is a trimmed, real subset of what Tesseract.js actually
@@ -232,6 +234,77 @@ describe('labelMatcher.service', () => {
     it('does not round away decimals that came from the mapping sheet', () => {
       expect(formatSharedReplacementWeight(170.55, [{ originalText: '122.5' }])).toBe('170.55');
       expect(formatSharedReplacementWeight(368.84, [{ originalText: '159.8' }])).toBe('368.84');
+    });
+  });
+
+  describe('weightColumnKind', () => {
+    it('classifies actual weight headers', () => {
+      expect(weightColumnKind('ACTUAL WEIGHT')).toBe('actual');
+      expect(weightColumnKind('CTUAL')).toBe('actual');
+      expect(weightColumnKind('actual')).toBe('actual');
+    });
+
+    it('classifies charged weight headers', () => {
+      expect(weightColumnKind('CHARGED WEIGHT')).toBe('charged');
+      expect(weightColumnKind('CHARGEABLE')).toBe('charged');
+      expect(weightColumnKind('chargd')).toBe('charged');
+    });
+
+    it('returns null for non-weight text', () => {
+      expect(weightColumnKind('SAID TO CONTAIN')).toBeNull();
+      expect(weightColumnKind('Box Dimensions')).toBeNull();
+    });
+  });
+
+  describe('classifyWeightRegion', () => {
+    it('tags regions from ACTUAL anchors as actual', () => {
+      const region = { anchorText: 'ACTUAL WEIGHT' };
+      expect(classifyWeightRegion(region, 0, [])).toBe('actual');
+    });
+
+    it('tags regions from CHARGED anchors as charged', () => {
+      const region = { anchorText: 'CHARGED WEIGHT' };
+      expect(classifyWeightRegion(region, 1, [])).toBe('charged');
+    });
+
+    it('falls back to anchor index when anchor text is ambiguous', () => {
+      const region = { anchorText: 'WEIGHT' };
+      const anchors = [
+        { words: [{ text: 'WEIGHT' }] },
+        { words: [{ text: 'WEIGHT' }] },
+      ];
+      expect(classifyWeightRegion(region, 0, anchors)).toBe('actual');
+      expect(classifyWeightRegion(region, 1, anchors)).toBe('charged');
+    });
+  });
+
+  describe('findWeightValueRegions kind tagging', () => {
+    it('tags located values with their column kind', () => {
+      const anchors = [
+        {
+          bbox: { x0: 300, y0: 258, x1: 360, y1: 280, height: 22 },
+          words: [{ text: 'ACTUAL', bbox: { x0: 300, y0: 258, x1: 360, y1: 280 } }],
+        },
+        {
+          bbox: { x0: 404, y0: 249, x1: 462, y1: 272, height: 23 },
+          words: [{ text: 'CHARGED', bbox: { x0: 404, y0: 249, x1: 462, y1: 272 } }],
+        },
+      ];
+      const words = [
+        { text: '117.5', confidence: 94, bbox: { x0: 300, y0: 292, x1: 328, y1: 309 } },
+        { text: '152.0', confidence: 96, bbox: { x0: 404, y0: 286, x1: 430, y1: 304 } },
+      ];
+      const regions = findWeightValueRegions(words, anchors, {
+        imageHeight: 860,
+        verticalWindowRatio: 0.18,
+        horizontalTolerancePx: 120,
+      });
+
+      expect(regions).toHaveLength(2);
+      const actualRegion = regions.find((r) => r.originalText === '117.5');
+      const chargedRegion = regions.find((r) => r.originalText === '152.0');
+      expect(actualRegion.kind).toBe('actual');
+      expect(chargedRegion.kind).toBe('charged');
     });
   });
 });

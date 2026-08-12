@@ -207,10 +207,12 @@ async function inferWeightRegionsFromAnchors(imageInput, anchors, words, meta) {
         wordHeight <= maxWordHeight &&
         /^\d{1,6}(?:[.,]\d{1,3})?$/.test(word.text.trim());
     });
+    const kind = index === 0 ? 'actual' : 'charged';
     return {
       bbox,
       originalText: matchingWord ? matchingWord.text.trim().replace(',', '.') : '',
       anchorText: index === 0 ? 'structural ACTUAL WEIGHT' : 'structural CHARGED WEIGHT',
+      kind,
     };
   });
 }
@@ -464,10 +466,12 @@ async function inferWeightRegionsFromTable(imageInput, meta, anchors = []) {
     const width = column.right - column.left;
     const x0 = Math.max(0, Math.round(column.left + width * 0.06));
     const x1 = Math.min(info.width, Math.round(column.right - Math.max(2, width * 0.08)));
+    const kind = index === 0 ? 'actual' : 'charged';
     return {
       bbox: { x0, y0, x1, y1 },
       originalText: '',
       anchorText: index === 0 ? 'inferred ACTUAL WEIGHT table cell' : 'inferred CHARGED WEIGHT table cell',
+      kind,
     };
   });
 }
@@ -603,7 +607,7 @@ async function inferSiblingFromTableRules(imageInput, anchors, regions, meta) {
   };
   if (bbox.x0 < 0 || bbox.x1 > meta.width) return [];
   const targetKind = direction > 0 ? 'charged' : 'actual';
-  return [{ bbox, originalText: '', anchorText: `inferred ${targetKind.toUpperCase()} WEIGHT from table rules` }];
+  return [{ bbox, originalText: '', anchorText: `inferred ${targetKind.toUpperCase()} WEIGHT from table rules`, kind: targetKind }];
 }
 
 /**
@@ -682,6 +686,7 @@ function inferSiblingFromAnchors(anchors, regions, meta) {
     bbox: inferredBbox,
     originalText: '',
     anchorText: `inferred ${targetKind.toUpperCase()} WEIGHT`,
+    kind: targetKind,
   }];
 }
 
@@ -762,6 +767,7 @@ async function inferActualSiblingRegion(imageInput, anchors, regions, meta, word
       bbox: inferredBbox,
       originalText: '',
       anchorText: 'inferred ACTUAL WEIGHT',
+      kind: 'actual',
     },
   ];
 }

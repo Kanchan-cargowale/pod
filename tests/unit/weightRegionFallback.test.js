@@ -239,4 +239,36 @@ describe('weightRegionFallback.service', () => {
     expect(regions[0].anchorText).toMatch(/ACTUAL/);
     expect(regions[1].anchorText).toMatch(/CHARGED/);
   });
+
+  it('tags inferred regions with explicit kind fields', async () => {
+    const image = Buffer.from(
+      '<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect width="400" height="300" fill="white" />' +
+        '<path d="M100 60V220 M160 60V220 M220 60V220" stroke="black" stroke-width="2" />' +
+        '</svg>'
+    );
+    const anchors = [
+      {
+        bbox: { x0: 168, y0: 100, x1: 205, y1: 115, height: 15 },
+        words: [{ text: 'CHARGED', bbox: { x0: 168, y0: 100, x1: 205, y1: 115 } }],
+      },
+    ];
+    const regions = [
+      {
+        bbox: { x0: 168, y0: 140, x1: 195, y1: 152 },
+        originalText: 'N.n',
+        anchorText: 'CHARGED',
+      },
+    ];
+
+    const inferred = await inferActualSiblingRegion(
+      image,
+      anchors,
+      regions,
+      { width: 400, height: 300 }
+    );
+
+    expect(inferred).toHaveLength(1);
+    expect(inferred[0].kind).toBe('actual');
+  });
 });

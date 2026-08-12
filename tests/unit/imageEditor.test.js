@@ -12,6 +12,7 @@ const {
   shrinkClearRectAroundRules,
   computePageStyle,
   samplePaperInsideBbox,
+  estimateStrokeThickness,
 } = require('../../src/services/imageEditor.service');
 
 describe('imageEditor.service', () => {
@@ -91,7 +92,7 @@ describe('imageEditor.service', () => {
     });
 
     it('keeps height-based sizing for a normal proportional OCR box', () => {
-      expect(calculateFontSize(144, 34, '900.00')).toBeCloseTo(29.24, 1);
+      expect(calculateFontSize(144, 34, '900.00')).toBeCloseTo(23.8, 1);
     });
   });
 
@@ -546,5 +547,69 @@ describe('imageEditor.service', () => {
     };
 
     expect(Math.abs(inkHeight(18, 95) - inkHeight(148, 235))).toBeLessThanOrEqual(2);
+  });
+
+  it('removes faint residual ink fragments after the primary erase pass', async () => {
+    const input = await sharp({
+      create: {
+        width: 80,
+        height: 45,
+        channels: 3,
+        background: { r: 245, g: 245, b: 245 },
+      },
+    })
+      .composite([
+        {
+          input: Buffer.from(
+            '<svg width="80" height="45" xmlns="http://www.w3.org/2000/svg">' +
+              '<rect x="18" y="18" width="34" height="9" fill="rgb(200,200,200)" />' +
+              '<rect x="48" y="20" width="3" height="5" fill="rgb(200,200,200)" />' +
+              '</svg>'
+          ),
+        },
+      ])
+      .png()
+      .toBuffer();
+
+    const edited = await replaceWeightRegions(input, [
+      {
+        bbox: { x0: 18, y0: 18, x1: 52, y1: 27 },
+        clearBbox: { x0: 17, y0: 17, x1: 54, y1: 28 },
+        originalText: '80.0',
+        replacementText: '90.0',
+      },
+    ]);
+    const { data, info } = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+
+    for (let y = 18; y <= 27; y += 1) {
+      for (let x = 48; x <= 51; x += 1) {
+        const offset = (y * info.width + x) * info.channels;
+        expect(data[offset]).toBeGreaterThan(230);
+        expect(data[offset + 1]).toBeGreaterThan(230);
+        expect(data[offset + 2]).toBeGreaterThan(230);
+      }
+    }
+  });
+
+  it('samples stroke thickness and classifies bold vs regular text', async () => {
+    const svg = Buffer.from(
+      '<svg width="60" height="30" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect width="60" height="30" fill="white" />' +
+        '<text x="5" y="22" font-family="Arial" font-size="20" font-weight="700" fill="black">900</text>' +
+        '</svg>'
+    );
+    const image = sharp(svg);
+    const meta = await image.metadata();
+
+    const style = await sampleTextStyle(
+      image,
+      meta,
+      { x0: 5, y0: 5, x1: 50, y1: 25 },
+      '900'
+    );
+
+    expect(style.fontWeight).toBe(700);
+    expect(style.fontSize).toBeGreaterThan(10);
+    expect(style.measured).toBe(true);
   });
 });
