@@ -423,6 +423,45 @@ describe('imageEditor.service', () => {
     }
   });
 
+  it('keeps a perspective-slanted table border through the erased value row', async () => {
+    const width = 130;
+    const height = 90;
+    const linePath = Array.from({ length: height }, (_, y) => {
+      const x = 9 + Math.floor(y / 9);
+      return `<rect x="${x}" y="${y}" width="2" height="1" fill="rgb(35,35,35)" />`;
+    }).join('');
+    const input = await sharp(
+      Buffer.from(
+        `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">` +
+          '<rect width="130" height="90" fill="white" />' +
+          linePath +
+          '<text x="18" y="49" font-family="Arial" font-size="17">268.78</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+
+    const before = await sharp(input).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const edited = await replaceWeightRegions(input, [{
+      // Deliberately swallow the slanted border. Its x coordinate changes by
+      // several pixels over the scan window, so fixed-column detection fails.
+      bbox: { x0: 10, y0: 33, x1: 76, y1: 52 },
+      clearBbox: { x0: 10, y0: 31, x1: 80, y1: 54 },
+      replacementText: '300.00',
+      originalText: '268.78',
+    }]);
+    const after = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+
+    for (let y = 31; y < 54; y += 1) {
+      const lineX = 9 + Math.floor(y / 9);
+      for (const x of [lineX, lineX + 1]) {
+        const offset = (y * width + x) * before.info.channels;
+        expect(after.data.subarray(offset, offset + 3)).toEqual(
+          before.data.subarray(offset, offset + 3)
+        );
+      }
+    }
+  });
+
   it('keeps the original weight ink tone even when sibling numbers are darker', async () => {
     // Faded gray weight value, with a darker box-dimension figure below. The
     // replacement should match the original weight tone, not the darker page

@@ -176,6 +176,48 @@ describe('weightRegionFallback.service', () => {
     expect(inferred).toEqual([]);
   });
 
+  it('does not infer a sibling from table rules when SAID TO CONTAIN is the adjacent header', async () => {
+    const image = Buffer.from(
+      '<svg width="1024" height="700" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect width="1024" height="700" fill="white" />' +
+        '<path d="M210 300V560 M365 300V560 M520 300V560" stroke="black" stroke-width="2" />' +
+        '</svg>'
+    );
+    const anchors = [{
+      bbox: { x0: 225, y0: 315, x1: 345, y1: 348 },
+      words: [{ text: 'ACTUAL WEIGHT', bbox: { x0: 225, y0: 315, x1: 345, y1: 348 } }],
+    }];
+    const words = [
+      ...anchors[0].words,
+      { text: 'SAID', bbox: { x0: 382, y0: 315, x1: 420, y1: 330 } },
+      { text: 'TO', bbox: { x0: 425, y0: 315, x1: 445, y1: 330 } },
+      { text: 'CONTAIN', bbox: { x0: 380, y0: 332, x1: 465, y1: 348 } },
+    ];
+    const regions = [{
+      bbox: { x0: 230, y0: 370, x1: 266, y1: 381 },
+      originalText: '64.6',
+      anchorText: 'ACTUAL WEIGHT',
+      kind: 'actual',
+    }];
+
+    const tableInferred = await inferSiblingFromTableRules(
+      image,
+      anchors,
+      regions,
+      { width: 1024, height: 700 }
+    );
+    const inferred = await inferActualSiblingRegion(
+      image,
+      anchors,
+      regions,
+      { width: 1024, height: 700 },
+      words
+    );
+
+    expect(tableInferred).toHaveLength(1);
+    expect(inferred).toEqual([]);
+  });
+
   it('finds proportionally sized weight columns on a high-resolution page', async () => {
     const image = Buffer.from(
       '<svg width="1600" height="600" xmlns="http://www.w3.org/2000/svg">' +

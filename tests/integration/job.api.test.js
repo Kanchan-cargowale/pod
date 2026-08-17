@@ -65,7 +65,9 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     expect(result.newWeight).toBe(900);
     expect(result.replacedRegions).toHaveLength(2);
     for (const region of result.replacedRegions) {
-      expect(region.originalText).toBe('802.91');
+      // A confirmed sibling cell can be inferred from table/header geometry
+      // even when OCR reads only one of the two identical printed values.
+      expect(['802.91', '']).toContain(region.originalText);
       expect(region.newText).toBe('900.00');
     }
 
@@ -92,6 +94,91 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
       .post('/api/jobs')
       .attach('mapping', MAPPING_FIXTURE)
       .expect(400);
+  });
+
+  it('preserves an unmatched review image and renames it from the scanned header ID', async () => {
+    const ExcelJS = require('exceljs');
+    const fs = require('fs');
+    const os = require('os');
+    const reviewMapping = path.join(os.tmpdir(), `pod-review-${Date.now()}.xlsx`);
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Weights');
+    sheet.addRow(['ID', 'Weight']);
+    sheet.addRow(['999999999', 15]);
+    await workbook.xlsx.writeFile(reviewMapping);
+
+    try {
+      const createRes = await request(app)
+        .post('/api/jobs')
+        .attach('images', IMAGE_FIXTURE)
+        .attach('mapping', reviewMapping)
+        .expect(202);
+      let job;
+      for (let i = 0; i < 120; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        job = (await request(app).get(`/api/jobs/${createRes.body.jobId}`).expect(200)).body;
+        if (job.status === 'completed' || job.status === 'failed') break;
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(1000);
+      }
+      expect(job.status).toBe('completed');
+      expect(job.results[0].status).toBe('unmatched');
+      expect(job.results[0].downloadable).toBe(true);
+      expect(job.results[0].outputFilename).toBe('307775718.jpeg');
+      expect(fs.existsSync(path.join(jobService.getOutputsDir(job.jobId), '307775718.jpeg'))).toBe(true);
+
+      await request(app)
+        .post(`/api/jobs/${job.jobId}/download-selected`)
+        .send({ filenames: ['307775718.jpeg'] })
+        .expect(200);
+    } finally {
+      fs.rmSync(reviewMapping, { force: true });
+    }
+  });
+
+  it('downloads selected images that are ready while the job is still processing', async () => {
+    const fs = require('fs');
+    const jobId = `processing-selected-${Date.now()}`;
+    const outputFilename = 'ready-label.jpg';
+
+    await storage.ensureJobDirs(jobId);
+    fs.copyFileSync(IMAGE_FIXTURE, path.join(jobService.getOutputsDir(jobId), outputFilename));
+    await storage.writeJobMeta(jobId, {
+      jobId,
+      status: 'processing',
+      totalFiles: 2,
+      processedFiles: 1,
+      matchedFiles: 1,
+      unmatchedFiles: 0,
+      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      durationMs: null,
+      updatedAt: new Date().toISOString(),
+      results: [
+        {
+          status: 'ok',
+          filename: outputFilename,
+          outputFilename,
+          downloadable: true,
+        },
+      ],
+      error: null,
+      zipReady: false,
+    });
+
+    try {
+      const downloadRes = await request(app)
+        .post(`/api/jobs/${jobId}/download-selected`)
+        .send({ filenames: [outputFilename, 'not-ready-yet.jpg'] })
+        .expect(200);
+
+      expect(downloadRes.headers['content-type']).toMatch(/zip/);
+      expect(downloadRes.headers['x-selected-ready-count']).toBe('1');
+      expect(downloadRes.headers['x-selected-requested-count']).toBe('2');
+    } finally {
+      await storage.removeJob(jobId);
+    }
   });
 
   it('auto-orients an EXIF-rotated label instead of falsely reporting a rotation error', async () => {
@@ -125,7 +212,7 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
 
     const { jobId } = createRes.body;
     let job;
-    for (let i = 0; i < 60; i += 1) {
+    for (let i = 0; i < 120; i += 1) {
       // eslint-disable-next-line no-await-in-loop
       const statusRes = await request(app).get(`/api/jobs/${jobId}`).expect(200);
       job = statusRes.body;

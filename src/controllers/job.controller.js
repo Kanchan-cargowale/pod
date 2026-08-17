@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const excelParser = require('../services/excelParser.service');
 const jobService = require('../services/job.service');
 
@@ -64,6 +65,54 @@ async function downloadJobZip(req, res) {
   return res.download(zipPath, `${path.basename(zipPath)}`);
 }
 
+async function downloadSelectedZip(req, res, next) {
+  const job = await jobService.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (!['processing', 'completed', 'failed'].includes(job.status)) {
+    return res.status(409).json({
+      error: `No processed images are ready to download yet (status: ${job.status})`,
+    });
+  }
+
+  let filenames = [];
+  try {
+    filenames = req.body.filenames || [];
+    if (!Array.isArray(filenames) || !filenames.length) {
+      return res.status(400).json({ error: 'A non-empty filenames array is required' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Invalid request body' });
+  }
+
+  const safeFilenames = filenames.map((name) => path.basename(name));
+  const selectedPaths = [];
+  const outputsDir = jobService.getOutputsDir(req.params.id);
+  for (const name of safeFilenames) {
+    const candidate = path.join(outputsDir, name);
+    if (fs.existsSync(candidate)) selectedPaths.push(candidate);
+  }
+
+  if (!selectedPaths.length) {
+    return res.status(404).json({
+      error: 'None of the selected images are ready yet. Try again after a few more files process.',
+    });
+  }
+
+  const zipPath = jobService.getSelectedZipPath(req.params.id, randomUUID());
+  const { zipDirectory } = require('../services/zip.service');
+  const { ensureJobDirs } = require('../services/storage.service');
+
+  await ensureJobDirs(req.params.id);
+  await zipDirectory(outputsDir, zipPath, selectedPaths);
+
+  res.setHeader('X-Selected-Ready-Count', String(selectedPaths.length));
+  res.setHeader('X-Selected-Requested-Count', String(safeFilenames.length));
+  return res.download(zipPath, `selected-labels-${req.params.id}.zip`, (err) => {
+    fs.rm(zipPath, { force: true }, () => {});
+    if (err) next(err);
+  });
+}
+
 const MIME_BY_EXT = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
@@ -87,4 +136,4 @@ async function previewImage(req, res) {
   return fs.createReadStream(filePath).pipe(res);
 }
 
-module.exports = { createJob, getJobStatus, downloadJobZip, previewImage };
+module.exports = { createJob, getJobStatus, downloadJobZip, downloadSelectedZip, previewImage };

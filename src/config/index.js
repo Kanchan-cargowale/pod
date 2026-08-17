@@ -19,7 +19,12 @@ module.exports = {
   ocrMinConfidence: Number(process.env.OCR_MIN_CONFIDENCE || 40),
 
   // Concurrency
-  workerPoolSize: Number(process.env.WORKER_POOL_SIZE || Math.max(1, os.cpus().length - 1)),
+  // Tesseract.js workers are CPU- and memory-heavy WASM instances. Running
+  // one per logical CPU causes severe contention on image batches and makes
+  // otherwise fast labels hit the per-image timeout. Two workers provide
+  // stable throughput while leaving capacity for Sharp and the HTTP process.
+  workerPoolSize: Number(process.env.WORKER_POOL_SIZE || Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)))),
+  imageProcessingTimeoutMs: Number(process.env.IMAGE_PROCESSING_TIMEOUT_MS || 180000),
   maxConcurrentUploads: Number(process.env.MAX_FILES_PER_JOB || 1000),
   maxUploadFileSizeMb: Number(process.env.MAX_UPLOAD_FILE_SIZE_MB || 25),
 

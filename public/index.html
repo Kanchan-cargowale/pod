@@ -77,10 +77,18 @@
           <p class="eyebrow">Batch results</p>
           <h2 id="workspace-title">Ready when you are</h2>
         </div>
-        <a id="download-link" class="btn btn-secondary" hidden download>
-          <span class="btn-icon" aria-hidden="true">ZIP</span>
-          <span>Download ZIP</span>
-        </a>
+        <div class="header-actions">
+          <button type="button" id="reset-btn" class="btn btn-ghost" hidden>
+            <span class="btn-icon" aria-hidden="true">&#8635;</span>
+            <span>Reset</span>
+          </button>
+          <button type="button" id="download-selected-btn" class="btn btn-secondary" hidden>
+            <span class="btn-icon" aria-hidden="true">ZIP</span>
+            <span>Download Selected</span>
+          </button>
+          <button type="button" id="select-all-btn" class="btn btn-ghost" hidden>Select all</button>
+          <button type="button" id="unselect-all-btn" class="btn btn-ghost" hidden>Unselect all</button>
+        </div>
       </div>
 
       <div class="progress-panel" id="progress-panel">
@@ -147,6 +155,10 @@
 
   <template id="result-card-template">
     <article class="result-card">
+      <label class="card-select">
+        <input type="checkbox" class="card-select-input" />
+        <span class="card-select-visual" aria-hidden="true"></span>
+      </label>
       <button type="button" class="thumb-button" aria-label="Open preview">
         <img class="card-image" loading="lazy" />
         <div class="card-placeholder">

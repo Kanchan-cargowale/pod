@@ -7,11 +7,15 @@ const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advan
 const TEXT_LEFT_PADDING_RATIO = 0.08; // inset replacement text inside the cleared value area
 const BORDER_GUARD_PX = 12; // how far inside the clear box a table rule may sit
 const BORDER_OUTSIDE_PX = 6; // how far outside the clear box we look for rules
-const MIN_RULE_RUN_RATIO = 1.2; // rule lines run much longer than glyph strokes
+const MIN_RULE_RUN_RATIO = 1.8; // rule lines run much longer than glyph strokes
 const MAX_PAGE_STYLE_REFERENCES = 40; // sibling numbers sampled per value
 const PAGE_STYLE_HEIGHT_RATIO_MIN = 0.45; // ignore much smaller page text
 const PAGE_STYLE_HEIGHT_RATIO_MAX = 2.4; // ignore much larger page text (e.g. barcode IDs)
 const PAGE_STYLE_SIZE_DEVIATION = 0.45; // trust own ink unless it disagrees wildly
+// 306601375 establishes the desired visual scale: roughly 8-12px on a
+// 1024px-wide label. Scale with source resolution, never with a tall/skewed
+// OCR rectangle alone.
+const MAX_WEIGHT_FONT_WIDTH_RATIO = 0.012;
 const DEFAULT_TEXT_STYLE = {
   fontFamily: 'Arial, Helvetica, sans-serif',
   fontWeight: 400,
@@ -206,7 +210,8 @@ function mostCommon(values, fallback) {
 
 function mergeUniformTextStyle(styles) {
   const usable = styles.filter(Boolean);
-  if (usable.length <= 1) return null;
+  if (!usable.length) return null;
+  if (usable.length === 1) return { ...usable[0] };
 
   const fillRgbs = usable.map((style) => style.fillRgb).filter(Boolean);
   const fillRgb = fillRgbs.length
@@ -233,7 +238,17 @@ function mergeUniformTextStyle(styles) {
   };
 }
 
-async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg) {
+async function createSelectiveEraseOverlay(
+  image,
+  meta,
+  gray,
+  grayInfo,
+  rect,
+  bg,
+  protectOnlyEdgeRules = false,
+  protectRules = true,
+  eraseAllInterior = false
+) {
   const width = rect.right - rect.x;
   const height = rect.bottom - rect.y;
   if (width <= 0 || height <= 0) return null;
@@ -283,6 +298,122 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
     const scanLength = scanRight - scanLeft + 1;
     if (best >= minHorizontalRun || darkCount >= scanLength * 0.65) horizontalRuleRows.add(row);
   }
+
+  // Phone photos turn nominally vertical cell borders into diagonal or bowed
+  // strokes. No single x column then contains a long enough run for the check
+  // above, even though the stroke is plainly one continuous table rule. Trace
+  // connected dark components through the extended value-row window and keep
+  // components spanning many rows. Glyph strokes remain too short to qualify.
+  const slantedVerticalRulePixels = new Set();
+  const componentLeft = Math.max(0, rect.x - BORDER_OUTSIDE_PX);
+  const componentRight = Math.min(grayInfo.width - 1, rect.right + BORDER_OUTSIDE_PX);
+  const componentWidth = componentRight - componentLeft + 1;
+  const componentHeight = scanBottom - scanTop + 1;
+  const componentVisited = new Uint8Array(componentWidth * componentHeight);
+  const traceDarkLimit = Math.min(210, Math.max(ruleDarkLimit, Math.round(bgLuma * 0.82)));
+  const componentIndex = (x, y) => (y - scanTop) * componentWidth + (x - componentLeft);
+
+  for (let startY = scanTop; startY <= scanBottom; startY += 1) {
+    for (let startX = componentLeft; startX <= componentRight; startX += 1) {
+      const startIndex = componentIndex(startX, startY);
+      if (componentVisited[startIndex] || gray[startY * grayInfo.width + startX] >= traceDarkLimit) {
+        continue;
+      }
+
+      const stack = [{ x: startX, y: startY }];
+      const component = [];
+      componentVisited[startIndex] = 1;
+      let minX = startX;
+      let maxX = startX;
+      let minY = startY;
+      let maxY = startY;
+      const occupiedRows = new Set();
+      while (stack.length) {
+        const pixel = stack.pop();
+        component.push(pixel);
+        minX = Math.min(minX, pixel.x);
+        maxX = Math.max(maxX, pixel.x);
+        minY = Math.min(minY, pixel.y);
+        maxY = Math.max(maxY, pixel.y);
+        occupiedRows.add(pixel.y);
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dy === 0) continue;
+            const x = pixel.x + dx;
+            const y = pixel.y + dy;
+            if (x < componentLeft || x > componentRight || y < scanTop || y > scanBottom) continue;
+            const index = componentIndex(x, y);
+            if (componentVisited[index] || gray[y * grayInfo.width + x] >= traceDarkLimit) continue;
+            componentVisited[index] = 1;
+            stack.push({ x, y });
+          }
+        }
+      }
+
+      const verticalSpan = maxY - minY + 1;
+      const horizontalSpan = maxX - minX + 1;
+      const narrowRuleWidth = Math.max(6, verticalSpan * 0.35);
+      if (verticalSpan < minVerticalRun ||
+          occupiedRows.size < verticalSpan * 0.72 ||
+          horizontalSpan > narrowRuleWidth) continue;
+      for (const pixel of component) {
+        slantedVerticalRulePixels.add(pixel.y * grayInfo.width + pixel.x);
+      }
+    }
+  }
+
+  const protectedPixelCache = new Map();
+  const isProtectedRulePixel = (imageX, imageY) => {
+    const key = imageY * grayInfo.width + imageX;
+    if (protectedPixelCache.has(key)) return protectedPixelCache.get(key);
+    if (slantedVerticalRulePixels.has(key)) {
+      protectedPixelCache.set(key, true);
+      return true;
+    }
+    if (gray[key] >= ruleDarkLimit) {
+      protectedPixelCache.set(key, false);
+      return false;
+    }
+    let protectedPixel = false;
+    if (verticalRuleCols.has(imageX)) {
+      let run = 1;
+      for (let y = imageY - 1; y >= scanTop && gray[y * grayInfo.width + imageX] < ruleDarkLimit; y -= 1) run += 1;
+      for (let y = imageY + 1; y <= scanBottom && gray[y * grayInfo.width + imageX] < ruleDarkLimit; y += 1) run += 1;
+      protectedPixel = run >= minVerticalRun;
+    }
+    if (!protectedPixel && horizontalRuleRows.has(imageY)) {
+      let run = 1;
+      for (let x = imageX - 1; x >= scanLeft && gray[imageY * grayInfo.width + x] < ruleDarkLimit; x -= 1) run += 1;
+      for (let x = imageX + 1; x <= scanRight && gray[imageY * grayInfo.width + x] < ruleDarkLimit; x += 1) run += 1;
+      protectedPixel = run >= minHorizontalRun;
+    }
+    protectedPixelCache.set(key, protectedPixel);
+    return protectedPixel;
+  };
+  const edgeRuleGuard = Math.max(3, Math.min(6, Math.round(width * 0.06)));
+  const shouldProtectRulePixel = (imageX, imageY) => {
+    if (!protectRules || !isProtectedRulePixel(imageX, imageY)) return false;
+    const key = imageY * grayInfo.width + imageX;
+    // Narrow connected components spanning the full row window are genuine
+    // perspective/slanted rules. For an exact, cell-confined glyph box,
+    // however, upright digit strokes (especially "4") can satisfy the same
+    // component test. Forced interior cleanup therefore protects these
+    // components only at the clear rectangle's geometric edges; the cell
+    // boundary remains safe while interior old digits are erased.
+    if (slantedVerticalRulePixels.has(key)) {
+      if (eraseAllInterior && protectOnlyEdgeRules) {
+        return imageX <= rect.x + 1 || imageX >= rect.right - 2;
+      }
+      return true;
+    }
+    // Horizontal separators must remain protected across the full clear box.
+    // Vertical/slanted components are protected only at geometric edges when
+    // requested, so an old digit connected to a stamp or noise stroke cannot
+    // masquerade as an interior table rule and survive erasure.
+    if (horizontalRuleRows.has(imageY)) return true;
+    return !protectOnlyEdgeRules ||
+      imageX < rect.x + edgeRuleGuard || imageX >= rect.right - edgeRuleGuard;
+  };
 
   const { data, info } = await image
     .clone()
@@ -336,12 +467,10 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
     let left = null;
     let right = null;
     const rowPaperLuma = rowPaperLumas[y];
-    // A solid/merged OCR glyph can occupy almost the entire row. In that case
-    // the row percentile is ink, not paper; let the vertical texture fallback
-    // handle it instead of treating black pixels as a valid replacement.
-    if (rowPaperLuma < bgLuma - Math.max(12, bgLuma * 0.08)) return null;
-    const cleanLimit = rowPaperLuma - Math.max(3, rowPaperLuma * 0.022);
-    for (let distance = 1; distance < width; distance += 1) {
+    if (rowPaperLuma < bgLuma - Math.max(8, bgLuma * 0.05)) return null;
+    const cleanLimit = rowPaperLuma - Math.max(2, rowPaperLuma * 0.015);
+    const maxSearch = Math.max(width, 160);
+    for (let distance = 1; distance <= maxSearch; distance += 1) {
       if (!left && x - distance >= 0) {
         const candidate = readSourcePixel(x - distance, y);
         if (luminance(candidate) >= cleanLimit) left = { pixel: candidate, distance };
@@ -367,7 +496,7 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
     const imageY = rect.y + y;
     for (let x = 0; x < width; x += 1) {
       const imageX = rect.x + x;
-      if (verticalRuleCols.has(imageX) || horizontalRuleRows.has(imageY)) continue;
+      if (shouldProtectRulePixel(imageX, imageY)) continue;
 
       const sourceOffset = (y * info.width + x) * info.channels;
       const pixel = {
@@ -393,15 +522,17 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
       }
       const localPaperLuma = luminance(replacement);
       const darkness = localPaperLuma - pixelLuma;
-      const localInkThreshold = Math.max(2, localPaperLuma * 0.02);
-      const isOldInk = darkness >= localInkThreshold;
+      const localInkThreshold = Math.max(2, localPaperLuma * 0.018);
+      const isOldInk = eraseAllInterior || darkness >= localInkThreshold;
       if (!isOldInk) continue;
 
       const overlayOffset = (y * width + x) * 4;
       overlay[overlayOffset] = replacement.r;
       overlay[overlayOffset + 1] = replacement.g;
       overlay[overlayOffset + 2] = replacement.b;
-      overlay[overlayOffset + 3] = darkness > 25 ? 255 : 205;
+      // Once a pixel is positively classified as old ink, replace it fully.
+      // Partial alpha left faint duplicate numerals visible on pale scans.
+      overlay[overlayOffset + 3] = 255;
       erasedPixels += 1;
     }
   }
@@ -416,7 +547,7 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
       const imageY = rect.y + y;
       for (let x = 0; x < width; x += 1) {
         const imageX = rect.x + x;
-        if (verticalRuleCols.has(imageX) || horizontalRuleRows.has(imageY)) continue;
+        if (shouldProtectRulePixel(imageX, imageY)) continue;
 
         const sourceOffset = (y * info.width + x) * info.channels;
         const pixelLuma = luminance({
@@ -456,7 +587,7 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
       const imageY = rect.y + y;
       for (let x = 0; x < width; x += 1) {
         const imageX = rect.x + x;
-        if (verticalRuleCols.has(imageX) || horizontalRuleRows.has(imageY)) continue;
+        if (shouldProtectRulePixel(imageX, imageY)) continue;
 
         const sourceOffset = (y * info.width + x) * info.channels;
         const pixelLuma = luminance({
@@ -477,12 +608,185 @@ async function createSelectiveEraseOverlay(image, meta, gray, grayInfo, rect, bg
     }
   }
 
+  // Anti-aliased and motion-blurred glyph edges can be nearly the same luma
+  // as photographed paper, so threshold passes alone may leave a one-pixel
+  // ghost of the old number. Expand the proven ink mask by one pixel and
+  // inpaint that halo with the same row-adaptive paper estimate. The tight
+  // value-row rectangle and explicit rule masks keep this away from borders.
+  if (erasedPixels > 0) {
+    const seeds = [];
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (overlay[(y * width + x) * 4 + 3] > 0) seeds.push({ x, y });
+      }
+    }
+    for (const seed of seeds) {
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const x = seed.x + dx;
+          const y = seed.y + dy;
+          if (x < 0 || x >= width || y < 0 || y >= height) continue;
+          const imageX = rect.x + x;
+          const imageY = rect.y + y;
+          if (shouldProtectRulePixel(imageX, imageY)) continue;
+          const overlayOffset = (y * width + x) * 4;
+          if (overlay[overlayOffset + 3] > 0) continue;
+          const replacement = sameRowPaper(x, y) || bg;
+          overlay[overlayOffset] = replacement.r;
+          overlay[overlayOffset + 1] = replacement.g;
+          overlay[overlayOffset + 2] = replacement.b;
+          overlay[overlayOffset + 3] = 235;
+        }
+      }
+    }
+  }
+
   if (!erasedPixels) return null;
 
   return {
     input: await sharp(overlay, { raw: { width, height, channels: 4 } }).png().toBuffer(),
     left: rect.x,
     top: rect.y,
+  };
+}
+
+/**
+ * Tracks the original left table rule near a worker-provided cell boundary and
+ * returns a narrow source-pixel overlay. The overlay is composited last, so a
+ * faint, slanted, or partly missed rule cannot be damaged by erase halos or
+ * replacement text. Dynamic programming follows the darkest continuous path;
+ * short digit strokes cannot satisfy the required row support.
+ */
+async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, request) {
+  const hintX = Number(request?.x);
+  const valueTop = Number(request?.y0);
+  const valueBottom = Number(request?.y1);
+  if (![hintX, valueTop, valueBottom].every(Number.isFinite) || valueBottom <= valueTop) {
+    return null;
+  }
+
+  const valueHeight = Math.max(4, valueBottom - valueTop);
+  const verticalMargin = Math.max(12, Math.min(48, Math.round(valueHeight * 2)));
+  const scanTop = Math.max(0, Math.floor(valueTop - verticalMargin));
+  const scanBottom = Math.min(grayInfo.height, Math.ceil(valueBottom + verticalMargin));
+  const searchRadius = Math.max(10, Math.min(28, Math.round(meta.width * 0.018)));
+  const scanLeft = Math.max(0, Math.floor(hintX - searchRadius));
+  const scanRight = Math.min(grayInfo.width - 1, Math.ceil(hintX + searchRadius));
+  const candidateWidth = scanRight - scanLeft + 1;
+  const rowCount = scanBottom - scanTop;
+  if (candidateWidth < 3 || rowCount < 8) return null;
+
+  const rowPapers = new Float64Array(rowCount);
+  const predecessors = Array.from({ length: rowCount }, () => {
+    const row = new Int16Array(candidateWidth);
+    row.fill(-1);
+    return row;
+  });
+  let previous = new Float64Array(candidateWidth);
+  let current = new Float64Array(candidateWidth);
+
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    const imageY = scanTop + rowIndex;
+    const rowLumas = [];
+    for (let x = scanLeft; x <= scanRight; x += 1) {
+      rowLumas.push(gray[imageY * grayInfo.width + x]);
+    }
+    rowPapers[rowIndex] = percentile(rowLumas, 0.75);
+
+    for (let xIndex = 0; xIndex < candidateWidth; xIndex += 1) {
+      const imageX = scanLeft + xIndex;
+      const emission = gray[imageY * grayInfo.width + imageX] +
+        Math.abs(imageX - hintX) * 0.12;
+      if (rowIndex === 0) {
+        current[xIndex] = emission;
+        continue;
+      }
+
+      let bestCost = Infinity;
+      let bestPrevious = -1;
+      const previousStart = Math.max(0, xIndex - 2);
+      const previousEnd = Math.min(candidateWidth - 1, xIndex + 2);
+      for (let previousIndex = previousStart; previousIndex <= previousEnd; previousIndex += 1) {
+        const transition = Math.abs(previousIndex - xIndex) * 8;
+        const cost = previous[previousIndex] + transition;
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestPrevious = previousIndex;
+        }
+      }
+      current[xIndex] = bestCost + emission;
+      predecessors[rowIndex][xIndex] = bestPrevious;
+    }
+
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+
+  let finalIndex = 0;
+  for (let xIndex = 1; xIndex < candidateWidth; xIndex += 1) {
+    if (previous[xIndex] < previous[finalIndex]) finalIndex = xIndex;
+  }
+  const path = new Int32Array(rowCount);
+  let pathIndex = finalIndex;
+  for (let rowIndex = rowCount - 1; rowIndex >= 0; rowIndex -= 1) {
+    path[rowIndex] = scanLeft + pathIndex;
+    if (rowIndex > 0) {
+      const prior = predecessors[rowIndex][pathIndex];
+      pathIndex = prior >= 0 ? prior : pathIndex;
+    }
+  }
+
+  let supportedRows = 0;
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    const imageY = scanTop + rowIndex;
+    const pathLuma = gray[imageY * grayInfo.width + path[rowIndex]];
+    const minimumContrast = Math.max(8, rowPapers[rowIndex] * 0.045);
+    if (rowPapers[rowIndex] - pathLuma >= minimumContrast) supportedRows += 1;
+  }
+  if (supportedRows < Math.max(10, rowCount * 0.35)) return null;
+
+  const bandRadius = Math.max(1, Math.min(2, Math.round(valueHeight * 0.08)));
+  const cropLeft = Math.max(0, Math.min(...path) - bandRadius);
+  const cropRight = Math.min(grayInfo.width - 1, Math.max(...path) + bandRadius);
+  const cropWidth = cropRight - cropLeft + 1;
+  const { data: source, info: sourceInfo } = await image
+    .clone()
+    .extract({ left: cropLeft, top: scanTop, width: cropWidth, height: rowCount })
+    .removeAlpha()
+    .toColourspace('srgb')
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const overlay = Buffer.alloc(cropWidth * rowCount * 4, 0);
+  let ruleXAtValue = hintX;
+
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    const imageY = scanTop + rowIndex;
+    const centerX = path[rowIndex];
+    if (imageY >= valueTop && imageY <= valueBottom) {
+      ruleXAtValue = Math.max(ruleXAtValue, centerX + bandRadius);
+    }
+    for (let imageX = centerX - bandRadius; imageX <= centerX + bandRadius; imageX += 1) {
+      if (imageX < cropLeft || imageX > cropRight) continue;
+      const localX = imageX - cropLeft;
+      const sourceOffset = (rowIndex * sourceInfo.width + localX) * sourceInfo.channels;
+      const overlayOffset = (rowIndex * cropWidth + localX) * 4;
+      overlay[overlayOffset] = source[sourceOffset];
+      overlay[overlayOffset + 1] = source[sourceOffset + 1];
+      overlay[overlayOffset + 2] = source[sourceOffset + 2];
+      overlay[overlayOffset + 3] = 255;
+    }
+  }
+
+  return {
+    overlay: {
+      input: await sharp(overlay, { raw: { width: cropWidth, height: rowCount, channels: 4 } })
+        .png()
+        .toBuffer(),
+      left: cropLeft,
+      top: scanTop,
+    },
+    ruleXAtValue,
   };
 }
 
@@ -806,6 +1110,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   const meta = await image.metadata();
 
   const eraseOverlays = [];
+  const ruleRestoreOverlays = [];
   const textOps = [];
 
   // Single-channel copy for table-rule detection; decoded at most once and
@@ -833,22 +1138,25 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       if (style.measured) preferredStyles.push(style);
     }
     preferredTextStyle = mergeUniformTextStyle(preferredStyles);
-    if (preferredTextStyle) {
-      // Delhivery's dimension/value figures are proportional sans-serif.
-      // OCR word boxes often include large side gaps and falsely classify
-      // them as monospace; that was the clearest remaining visual mismatch.
-      preferredTextStyle.fontFamily = DEFAULT_TEXT_STYLE.fontFamily;
-    }
   }
 
   for (const {
     bbox,
     clearBbox = bbox,
+    textBounds = null,
+    leftRuleHint = null,
+    eraseOnly = false,
     replacementText,
     originalText = replacementText,
     styleReferenceText = originalText,
+    preferSourceStyle = false,
+    preferPageStyle = false,
+    solidErase = false,
+    forceInteriorErase = false,
     fontScale = 1,
     textLeftPaddingRatio = TEXT_LEFT_PADDING_RATIO,
+    preferTextBoundsStart = false,
+    skipRuleShrink = false,
   } of replacements) {
     const width = bbox.x1 - bbox.x0;
     const height = bbox.y1 - bbox.y0;
@@ -870,20 +1178,30 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // vertical line left of the value (and any other border) survives intact.
     // eslint-disable-next-line no-await-in-loop
     const { data: gray, info: grayInfo } = await grayPixels();
-    const shrunk = shrinkClearRectAroundRules(
-      gray,
-      grayInfo,
-      { x: rectX, y: rectY, right: rectRight, bottom: rectBottom },
-      bg
-    );
-    rectX = shrunk.x;
-    rectY = shrunk.y;
-    rectRight = shrunk.right;
-    rectBottom = shrunk.bottom;
+    if (!skipRuleShrink) {
+      const shrunk = shrinkClearRectAroundRules(
+        gray,
+        grayInfo,
+        { x: rectX, y: rectY, right: rectRight, bottom: rectBottom },
+        bg,
+        false
+      );
+      rectX = shrunk.x;
+      rectY = shrunk.y;
+      rectRight = shrunk.right;
+      rectBottom = shrunk.bottom;
+    }
     const rectW = rectRight - rectX;
     const rectH = rectBottom - rectY;
 
-    if (rectW > 0 && rectH > 0) {
+    if (rectW > 0 && rectH > 0 && solidErase) {
+      const solidOverlay = Buffer.from(
+        `<svg width="${rectW}" height="${rectH}" xmlns="http://www.w3.org/2000/svg">` +
+          `<rect x="0" y="0" width="${rectW}" height="${rectH}" fill="${rgbToCss(bg)}" ` +
+          `shape-rendering="crispEdges"/></svg>`
+      );
+      eraseOverlays.push({ input: solidOverlay, left: rectX, top: rectY });
+    } else if (rectW > 0 && rectH > 0) {
       // eslint-disable-next-line no-await-in-loop
       const eraseOverlay = await createSelectiveEraseOverlay(
         image,
@@ -891,28 +1209,47 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         gray,
         grayInfo,
         { x: rectX, y: rectY, right: rectRight, bottom: rectBottom },
-        bg
+        bg,
+        true,
+        true,
+        forceInteriorErase
       );
       if (eraseOverlay) eraseOverlays.push(eraseOverlay);
     }
+
+    if (eraseOnly) continue;
 
     // Sample before adding the clearing rectangle so the original glyphs are
     // still available for per-image style matching.
     // eslint-disable-next-line no-await-in-loop
     let textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
 
-    // The box-dimension figures are printed by the same label template and
-    // are a much cleaner type specimen than a faint/damaged weight value.
-    // Apply that local specimen to both weight columns as one exact style.
-    if (preferredTextStyle) {
+    // Prefer the original weight pixels whenever they are measurable. Nearby
+    // dimensions are only a fallback specimen; overriding a faint but valid
+    // source made replacements too dark/bold on photographed labels.
+    if (preferredTextStyle && (!textStyle.measured || preferPageStyle)) {
+      const sourceWasMeasured = textStyle.measured;
+      const boundedSourceFontSize = sourceWasMeasured && !preferPageStyle
+        ? Math.max(
+            preferredTextStyle.fontSize * 0.9,
+            Math.min(textStyle.fontSize, preferredTextStyle.fontSize * 1.1)
+          )
+        : preferredTextStyle.fontSize;
       textStyle = {
         ...textStyle,
         fontFamily: preferredTextStyle.fontFamily,
-        fontWeight: preferredTextStyle.fontWeight,
-        fontSize: preferredTextStyle.fontSize,
-        fill: preferredTextStyle.fill,
-        fillRgb: preferredTextStyle.fillRgb,
-        fillLuma: preferredTextStyle.fillLuma,
+        // A clean value's own glyph box is the closest possible size/weight
+        // reference. The dimensions specimen is only the fallback for a
+        // missing or damaged value; taking the larger of both made small
+        // labels visibly oversized.
+        // Preserve the measured template specimen's stroke weight. Artificially
+        // forcing inferred values to 600 made faint scans look bolder than the
+        // original and amplified size differences between label variants.
+        fontWeight: preferredTextStyle.fontWeight || 400,
+        fontSize: Math.min(boundedSourceFontSize, Math.max(8, height * 0.92)),
+        fill: sourceWasMeasured && !preferPageStyle ? textStyle.fill : preferredTextStyle.fill,
+        fillRgb: sourceWasMeasured && !preferPageStyle ? textStyle.fillRgb : preferredTextStyle.fillRgb,
+        fillLuma: sourceWasMeasured && !preferPageStyle ? textStyle.fillLuma : preferredTextStyle.fillLuma,
         measured: true,
       };
     }
@@ -941,17 +1278,67 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       }
     }
 
+    // A sampled style must still be visibly darker than the paper under this
+    // exact value. This prevents a blank/shadowed fallback box from producing
+    // pale or white replacement text.
+    const paperLuma = luminance(bg);
+    const maximumInkLuma = Math.max(0, paperLuma - Math.max(24, paperLuma * 0.18));
+    const sampledFill = textStyle.fillRgb || { r: 0, g: 0, b: 0 };
+    const sampledFillLuma = luminance(sampledFill);
+    let visibleFill = sampledFill;
+    if (!Number.isFinite(sampledFillLuma) || sampledFillLuma > maximumInkLuma) {
+      const scale = sampledFillLuma > 0 ? maximumInkLuma / sampledFillLuma : 0;
+      visibleFill = {
+        r: Math.max(0, Math.round(sampledFill.r * scale)),
+        g: Math.max(0, Math.round(sampledFill.g * scale)),
+        b: Math.max(0, Math.round(sampledFill.b * scale)),
+      };
+    }
+    const templateFontCap = Math.max(7, meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO);
+    textStyle = {
+      ...textStyle,
+      fillRgb: visibleFill,
+      fillLuma: luminance(visibleFill),
+      fill: rgbToCss(visibleFill),
+      fontSize: Math.min(textStyle.fontSize || templateFontCap, templateFontCap),
+    };
+
     textOps.push({
       bbox,
       width,
       height,
       rectX,
       rectW,
+      rectH,
+      textBounds,
+      leftRuleHint,
       replacementText,
       textStyle,
       fontScale,
       textLeftPaddingRatio,
+      preferTextBoundsStart,
     });
+  }
+
+  // Reconstruct every proven left rule from the untouched source after the
+  // erase/text layers are prepared. This is an authoritative repair pass,
+  // independent of whether the earlier heuristic mask recognized the rule.
+  if (textOps.some((op) => Number.isFinite(Number(op.leftRuleHint)))) {
+    const { data: gray, info: grayInfo } = await grayPixels();
+    for (const op of textOps) {
+      if (!Number.isFinite(Number(op.leftRuleHint))) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const restoredRule = await createVerticalRuleRestoreOverlay(
+        image,
+        meta,
+        gray,
+        grayInfo,
+        { x: op.leftRuleHint, y0: op.bbox.y0, y1: op.bbox.y1 }
+      );
+      if (!restoredRule) continue;
+      ruleRestoreOverlays.push(restoredRule.overlay);
+      op.detectedLeftRuleX = restoredRule.ruleXAtValue;
+    }
   }
 
   if (!textOps.length) {
@@ -970,10 +1357,23 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   if (sharedTextStyle && textOps.length > 1) {
     const limits = textOps.map((op) => {
       const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
-      const guardedTextX = op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio);
-      const textX = Math.max(naturalTextX, guardedTextX);
-      const heightLimit = Math.max(6, op.height / 0.9);
-      const widthLimit = Math.max(4, op.rectX + op.rectW - textX - 1) /
+      const detectedRuleX = Number.isFinite(op.detectedLeftRuleX)
+        ? op.detectedLeftRuleX
+        : op.rectX;
+      const ruleSafeTextX = Math.max(op.rectX, detectedRuleX) +
+        Math.max(3, Math.min(8, meta.width * 0.004));
+      const guardedTextX = op.textBounds
+        ? Math.max(op.textBounds.x0, ruleSafeTextX)
+        : Math.max(
+            ruleSafeTextX,
+            op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio)
+          );
+      const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
+      const heightLimit = preferredTextStyle
+        ? Math.max(6, op.height * 0.98)
+        : Math.max(6, op.height / 0.9);
+      const textRight = op.textBounds?.x1 ?? (op.rectX + op.rectW);
+      const widthLimit = Math.max(4, textRight - textX - 1) /
         numericAdvanceUnits(op.replacementText, sharedTextStyle.fontFamily);
       return Math.min(heightLimit, widthLimit);
     });
@@ -1007,10 +1407,23 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   const texts = textOps.map((op) => {
     const textStyle = sharedTextStyle || op.textStyle;
     const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
-    const guardedTextX = op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio);
-    const textX = Math.max(naturalTextX, guardedTextX);
-    const maxFontSizeForHeight = Math.max(6, op.height / 0.9);
-    const maxTextWidth = Math.max(4, op.rectX + op.rectW - textX - 1);
+    const detectedRuleX = Number.isFinite(op.detectedLeftRuleX)
+      ? op.detectedLeftRuleX
+      : op.rectX;
+    const ruleSafeTextX = Math.max(op.rectX, detectedRuleX) +
+      Math.max(3, Math.min(8, meta.width * 0.004));
+    const guardedTextX = op.textBounds
+      ? Math.max(op.textBounds.x0, ruleSafeTextX)
+      : Math.max(
+          ruleSafeTextX,
+          op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio)
+        );
+    const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
+    const maxFontSizeForHeight = preferredTextStyle
+      ? Math.max(6, op.height * 0.98)
+      : Math.max(6, op.height / 0.9);
+    const textRight = op.textBounds?.x1 ?? (op.rectX + op.rectW);
+    const maxTextWidth = Math.max(4, textRight - textX - 1);
     const maxFontSizeForWidth =
       maxTextWidth / numericAdvanceUnits(op.replacementText, textStyle.fontFamily);
     const renderedFontSize = sharedRenderedFontSize ?? Math.max(
@@ -1046,7 +1459,13 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   }
 
   return image
-    .composite([...eraseOverlays, { input: renderedTextOverlay, top: 0, left: 0 }])
+    .composite([
+      ...eraseOverlays,
+      { input: renderedTextOverlay, top: 0, left: 0 },
+      // Source rule pixels are authoritative and are restored last so neither
+      // inpainting nor text antialiasing can break or cover the cell border.
+      ...ruleRestoreOverlays,
+    ])
     .toBuffer();
 }
 

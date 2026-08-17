@@ -17,6 +17,13 @@ const pool = new WorkerPool(config.workerPoolSize);
 
 const jobs = new Map(); // jobId -> in-memory job state (mirrors the on-disk JSON)
 
+async function preserveFailedInput(filePath, outputsDir) {
+  const originalFilename = path.basename(filePath);
+  const candidate = path.join(outputsDir, originalFilename);
+  await fs.copyFile(filePath, candidate);
+  return originalFilename;
+}
+
 function newJobState(jobId, totalFiles) {
   return {
     jobId,
@@ -91,7 +98,46 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
         filename: result.outputFilename || filename,
         ...result,
       }))
-      .catch((err) => ({ filename, status: 'error', reason: err.message }))
+      .catch(async (err) => {
+        if (err.code === 'ETASKTIMEOUT') {
+          const outputFilename = await preserveFailedInput(filePath, outputsDir);
+          return {
+            originalFilename: filename,
+            filename: outputFilename,
+            outputFilename,
+            status: 'error',
+            errorCode: 'processing_timeout',
+            reason: `${err.message}; original image preserved so the batch can finish`,
+            processingMs: err.timeoutMs,
+            downloadable: true,
+          };
+        }
+
+        try {
+          const recovered = await pool.run({
+            filePath,
+            outputPath,
+            idWeightMap,
+            preserveOnly: true,
+            preserveReason: err.message,
+          });
+          return {
+            originalFilename: filename,
+            filename: recovered.outputFilename || filename,
+            ...recovered,
+          };
+        } catch (scanErr) {
+          const outputFilename = await preserveFailedInput(filePath, outputsDir);
+          return {
+            originalFilename: filename,
+            filename: outputFilename,
+            outputFilename,
+            status: 'error',
+            reason: `${err.message}; ID recovery failed: ${scanErr.message}`,
+            downloadable: true,
+          };
+        }
+      })
       .then(async (result) => {
         state.processedFiles += 1;
         if (result.status === 'ok') state.matchedFiles += 1;
@@ -131,6 +177,11 @@ function getZipPath(jobId) {
   return storage.jobZipFile(jobId);
 }
 
+function getSelectedZipPath(jobId, suffix = '') {
+  const suffixPart = suffix ? `-${suffix}` : '';
+  return path.join(config.outputsDir, `${jobId}-selected${suffixPart}.zip`);
+}
+
 function getOutputsDir(jobId) {
   return storage.jobOutputsDir(jobId);
 }
@@ -139,4 +190,4 @@ async function shutdown() {
   await pool.shutdown();
 }
 
-module.exports = { createJob, getJob, getZipPath, getOutputsDir, shutdown, _pool: pool };
+module.exports = { createJob, getJob, getZipPath, getSelectedZipPath, getOutputsDir, shutdown, _pool: pool };

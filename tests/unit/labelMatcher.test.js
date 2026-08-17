@@ -66,6 +66,36 @@ describe('labelMatcher.service', () => {
       const match = findShipmentId(lowConfWords, idSet, { minConfidence: 40, fuzzyMaxDistance: 0 });
       expect(match).toBeNull();
     });
+
+    it('repairs common barcode-header OCR glyph confusions', () => {
+      const words = [
+        { text: '3O99526I4', confidence: 82, bbox: { x0: 620, y0: 35, x1: 770, y1: 70 } },
+      ];
+      const match = findShipmentId(words, new Set(['309952614']), {
+        minConfidence: 40,
+        fuzzyMaxDistance: 0,
+        imageWidth: 1000,
+        imageHeight: 700,
+      });
+
+      expect(match.id).toBe('309952614');
+      expect(match.source).toBe('ocr_confusion_repair');
+    });
+
+    it('prefers the large upper header ID when multiple mapped IDs appear', () => {
+      const words = [
+        { text: '287798368', confidence: 78, bbox: { x0: 530, y0: 35, x1: 690, y1: 72 } },
+        { text: '309952614', confidence: 95, bbox: { x0: 120, y0: 430, x1: 220, y1: 446 } },
+      ];
+      const match = findShipmentId(words, new Set(['287798368', '309952614']), {
+        minConfidence: 40,
+        fuzzyMaxDistance: 0,
+        imageWidth: 1000,
+        imageHeight: 700,
+      });
+
+      expect(match.id).toBe('287798368');
+    });
   });
 
   describe('findWeightAnchors', () => {
@@ -108,6 +138,20 @@ describe('labelMatcher.service', () => {
 
       expect(anchors).toHaveLength(1);
       expect(anchors[0].words.map((word) => word.text)).toEqual(['CTUAL']);
+    });
+
+    it('splits duplicate-OCR bridges between ACTUAL and CHARGED columns', () => {
+      const words = [
+        { text: 'ACTUAL', confidence: 80, bbox: { x0: 265, y0: 330, x1: 315, y1: 342 } },
+        { text: 'WEIGHT', confidence: 76, bbox: { x0: 266, y0: 345, x1: 318, y1: 357 } },
+        { text: 'WEIGHT(kg)', confidence: 61, bbox: { x0: 300, y0: 344, x1: 365, y1: 357 } },
+        { text: 'CHARGED', confidence: 79, bbox: { x0: 382, y0: 330, x1: 442, y1: 342 } },
+        { text: 'WEIGHT', confidence: 74, bbox: { x0: 383, y0: 345, x1: 438, y1: 357 } },
+      ];
+
+      const anchors = findWeightAnchors(words);
+      expect(anchors).toHaveLength(2);
+      expect(anchors[0].bbox.x1).toBeLessThan(anchors[1].bbox.x0 + 5);
     });
   });
 

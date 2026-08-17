@@ -25,7 +25,10 @@
   const activityText = document.getElementById('activity-text');
   const resultCount = document.getElementById('result-count');
   const resultsGrid = document.getElementById('results-grid');
-  const downloadLink = document.getElementById('download-link');
+  const downloadSelectedBtn = document.getElementById('download-selected-btn');
+  const selectAllBtn = document.getElementById('select-all-btn');
+  const unselectAllBtn = document.getElementById('unselect-all-btn');
+  const resetBtn = document.getElementById('reset-btn');
   const cardTemplate = document.getElementById('result-card-template');
   const filterTabs = [...document.querySelectorAll('.filter-tab')];
   const previewDialog = document.getElementById('preview-dialog');
@@ -40,6 +43,7 @@
     pollTimer: null,
     lastResults: [],
     isDownloading: false,
+    selectedFilenames: new Set(),
   };
 
   checkHealth();
@@ -47,28 +51,73 @@
   wireDropzone(mappingDrop, mappingInput, updateMappingSelection);
   wireFilters();
   wirePreviewDialog();
+  wireSelectionControls();
 
   form.addEventListener('submit', submitBatch);
-  downloadLink.addEventListener('click', downloadZipAndReset);
+  downloadSelectedBtn.addEventListener('click', downloadSelected);
+  resetBtn.addEventListener('click', resetToEmptyState);
 
-  async function downloadZipAndReset(event) {
+  function wireSelectionControls() {
+    selectAllBtn.addEventListener('click', () => {
+      state.lastResults
+        .filter((result) => result.downloadable !== false && result.outputFilename)
+        .forEach((result) => state.selectedFilenames.add(result.outputFilename));
+      renderResults();
+      updateSelectionCount();
+    });
+
+    unselectAllBtn.addEventListener('click', () => {
+      state.selectedFilenames.clear();
+      renderResults();
+      updateSelectionCount();
+    });
+  }
+
+  function updateSelectionCount() {
+    const count = state.selectedFilenames.size;
+    const total = state.lastResults.length;
+    if (count === 0) {
+      downloadSelectedBtn.disabled = true;
+      downloadSelectedBtn.querySelector('span:last-child').textContent = 'Download Selected';
+    } else if (count === total && total > 0) {
+      downloadSelectedBtn.disabled = false;
+      downloadSelectedBtn.querySelector('span:last-child').textContent = `Download All (${count})`;
+    } else {
+      downloadSelectedBtn.disabled = false;
+      downloadSelectedBtn.querySelector('span:last-child').textContent = `Download Selected (${count})`;
+    }
+  }
+
+  async function downloadSelected(event) {
     event.preventDefault();
-    if (state.isDownloading || !downloadLink.href) return;
+    if (state.isDownloading || !state.currentJobId) return;
+    if (!state.selectedFilenames.size) {
+      showError('Select at least one image to download.');
+      return;
+    }
 
     state.isDownloading = true;
-    downloadLink.setAttribute('aria-disabled', 'true');
+    downloadSelectedBtn.setAttribute('aria-disabled', 'true');
 
     try {
-      const response = await fetch(downloadLink.href, { cache: 'no-store' });
+      const response = await fetch(
+        `/api/jobs/${state.currentJobId}/download-selected`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filenames: [...state.selectedFilenames] }),
+          cache: 'no-store',
+        }
+      );
       if (!response.ok) {
         const body = await parseJsonResponse(response);
-        throw new Error(body.error || 'Could not download the ZIP.');
+        throw new Error(body.error || 'Could to download the selected images.');
       }
 
       const blob = await response.blob();
       const disposition = response.headers.get('content-disposition') || '';
       const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
-      const filename = filenameMatch?.[1] || `courier-labels-${state.currentJobId}.zip`;
+      const filename = filenameMatch?.[1] || `selected-labels-${state.currentJobId}.zip`;
       const objectUrl = URL.createObjectURL(blob);
       const saveLink = document.createElement('a');
       saveLink.href = objectUrl;
@@ -77,13 +126,11 @@
       saveLink.click();
       saveLink.remove();
       setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-
-      resetToEmptyState();
     } catch (error) {
-      showError(error.message || 'Could not download the ZIP.');
+      showError(error.message || 'Could not download the selected images.');
     } finally {
       state.isDownloading = false;
-      downloadLink.removeAttribute('aria-disabled');
+      downloadSelectedBtn.removeAttribute('aria-disabled');
     }
   }
 
@@ -255,8 +302,15 @@
           if (job.status === 'completed') {
             workspaceTitle.textContent = 'Batch complete';
             setActivityState('completed');
-            downloadLink.href = `/api/jobs/${jobId}/download`;
-            downloadLink.hidden = false;
+            downloadSelectedBtn.hidden = false;
+            selectAllBtn.hidden = false;
+            unselectAllBtn.hidden = false;
+            resetBtn.hidden = false;
+            state.selectedFilenames.clear();
+            state.lastResults
+              .filter((result) => result.downloadable !== false && result.outputFilename)
+              .forEach((result) => state.selectedFilenames.add(result.outputFilename));
+            updateSelectionCount();
           } else {
             workspaceTitle.textContent = 'Batch failed';
             setActivityState('failed');
@@ -294,6 +348,13 @@
     jobIdLabel.textContent = `${processed} of ${total} files`;
     setActivityState(job.status || 'processing');
 
+    if (job.status === 'completed') {
+      downloadSelectedBtn.hidden = false;
+      selectAllBtn.hidden = false;
+      unselectAllBtn.hidden = false;
+      resetBtn.hidden = false;
+    }
+
     renderResults();
   }
 
@@ -306,6 +367,15 @@
     filtered.forEach((result) => {
       resultsGrid.append(buildCard(state.currentJobId, result));
     });
+
+    if (state.lastResults.length > 0) {
+      downloadSelectedBtn.hidden = false;
+      selectAllBtn.hidden = false;
+      unselectAllBtn.hidden = false;
+      resetBtn.hidden = false;
+    }
+
+    updateSelectionCount();
   }
 
   function matchesCurrentFilter(result) {
@@ -318,6 +388,7 @@
   function buildCard(jobId, result) {
     const node = cardTemplate.content.cloneNode(true);
     const card = node.querySelector('.result-card');
+    const checkbox = node.querySelector('.card-select-input');
     const thumbButton = node.querySelector('.thumb-button');
     const img = node.querySelector('.card-image');
     const placeholder = node.querySelector('.card-placeholder');
@@ -332,29 +403,43 @@
     const timeValue = node.querySelector('.card-time-value');
 
     const status = result.status || 'unknown';
-    const previewUrl = `/api/jobs/${jobId}/preview/${encodeURIComponent(result.filename)}`;
+    const artifactFilename = result.outputFilename || result.filename;
+    const previewUrl = `/api/jobs/${jobId}/preview/${encodeURIComponent(artifactFilename)}`;
 
     card.dataset.status = status;
-    filename.textContent = result.filename || 'Unknown file';
-    filename.title = result.filename || '';
+    card.dataset.filename = artifactFilename || '';
+    checkbox.disabled = !artifactFilename || result.downloadable === false;
+    checkbox.checked = state.selectedFilenames.has(artifactFilename);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) state.selectedFilenames.add(artifactFilename);
+      else state.selectedFilenames.delete(artifactFilename);
+      updateSelectionCount();
+    });
+    filename.textContent = artifactFilename || result.filename || 'Unknown file';
+    filename.title = artifactFilename || result.filename || '';
     badge.textContent = formatStatus(status);
     badge.classList.add(status);
 
-    if (status === 'ok') {
+    if (artifactFilename) {
       img.src = previewUrl;
-      img.alt = `Edited label preview for ${result.filename}`;
+      img.alt = `${status === 'ok' ? 'Edited' : 'Scanned'} label preview for ${artifactFilename}`;
       placeholder.remove();
-      thumbButton.addEventListener('click', () => openPreview(previewUrl, result.filename));
+      thumbButton.addEventListener('click', () => openPreview(previewUrl, artifactFilename));
+    }
+
+    if (status === 'ok') {
       idValue.textContent = result.shipmentId || '-';
       renderWeightChanges(weightValues, result);
       reason.remove();
     } else {
-      img.remove();
-      placeholder.style.display = 'grid';
-      if (result.errorCode === 'image_rotation') {
-        placeholder.querySelector('.placeholder-text').textContent = 'Fix image rotation';
+      if (!artifactFilename) {
+        img.remove();
+        placeholder.style.display = 'grid';
+        if (result.errorCode === 'image_rotation') {
+          placeholder.querySelector('.placeholder-text').textContent = 'Fix image rotation';
+        }
+        thumbButton.disabled = true;
       }
-      thumbButton.disabled = true;
       idValue.textContent = result.shipmentId || '-';
       if (!result.shipmentId) shipmentRow.remove();
       weightRow.remove();
@@ -432,6 +517,12 @@
   function resetJobView() {
     if (state.pollTimer) clearInterval(state.pollTimer);
 
+    // Do not carry an Errors/Review filter from the previous batch into a new
+    // job; doing so makes valid live previews appear to be missing.
+    state.currentFilter = 'all';
+    filterTabs.forEach((tab) =>
+      tab.classList.toggle('is-active', tab.dataset.filter === 'all')
+    );
     state.currentJobId = null;
     state.lastResults = [];
     workspaceTitle.textContent = 'Preparing batch';
@@ -444,8 +535,11 @@
     setActivityState('queued');
     progressPercent.textContent = '0%';
     progressFill.style.width = '0%';
-    downloadLink.hidden = true;
-    downloadLink.removeAttribute('href');
+    downloadSelectedBtn.hidden = true;
+    downloadSelectedBtn.disabled = true;
+    selectAllBtn.hidden = true;
+    unselectAllBtn.hidden = true;
+    resetBtn.hidden = true;
     renderResults();
   }
 
@@ -461,6 +555,7 @@
     state.currentFilter = 'all';
     filterTabs.forEach((tab) => tab.classList.toggle('is-active', tab.dataset.filter === 'all'));
     setSubmitting(false);
+    state.selectedFilenames.clear();
   }
 
   function setSubmitting(isSubmitting, label = 'Process batch') {
@@ -514,8 +609,6 @@
     return `${minutes}m ${seconds}s`;
   }
 
-  // Live batch clock: ticks up from startedAt while the job runs, then
-  // freezes at the server's measured durationMs once it completes.
   function elapsedTimeText(job) {
     if (Number.isFinite(job.durationMs)) return formatDuration(job.durationMs);
     if (job.status !== 'processing') return '-';

@@ -93,17 +93,39 @@ function findInkClusters(data, info, cell, headerBottom) {
   for (let y = top; y < bottom; y += 1) {
     for (let x = left; x < right; x += 2) samples.push(data[y * info.width + x]);
   }
-  const paper = percentileNumber(samples, 0.82);
-  const darkLimit = Math.min(205, paper - Math.max(10, paper * 0.055));
+  const globalPaper = percentileNumber(samples, 0.82);
+  const globalDarkLimit = Math.min(205, globalPaper - Math.max(8, globalPaper * 0.045));
   const usableWidth = right - left;
   const rows = [];
   for (let y = top; y < bottom; y += 1) {
+    const rowPixels = [];
+    for (let x = left; x < right; x += 1) rowPixels.push(data[y * info.width + x]);
+    // A broad phone shadow changes the absolute luma of the complete row but
+    // leaves printed glyphs darker than that row's paper. Use row-local paper
+    // instead of one threshold for the whole search band.
+    const rowPaper = percentileNumber(rowPixels, 0.8) || globalPaper;
+    const rowDark = percentileNumber(rowPixels, 0.1);
+    const rowContrast = rowPaper - rowDark;
+    const rowDarkLimit = Math.min(
+      215,
+      rowPaper - Math.max(5, rowPaper * 0.032)
+    );
     let dark = 0;
-    for (let x = left; x < right; x += 1) {
-      if (data[y * info.width + x] < darkLimit) dark += 1;
+    for (const pixel of rowPixels) {
+      if (pixel < Math.min(globalDarkLimit + 28, rowDarkLimit)) dark += 1;
     }
+    // Broad shadows/noise can contain many slightly darker pixels but have a
+    // very small within-row contrast range. Printed value strokes retain a
+    // clear dark tail even inside that shadow.
+    const hasGlyphContrast = rowContrast >= Math.max(14, rowPaper * 0.11);
     // A table separator spans most of the cell; it is never value ink.
-    if (dark >= 2 && dark < usableWidth * 0.34) rows.push({ y, score: dark });
+    if (hasGlyphContrast && dark >= 2 && dark < usableWidth * 0.72) {
+      rows.push({
+        y,
+        score: dark + rowContrast,
+        darkLimit: Math.min(globalDarkLimit + 28, rowDarkLimit),
+      });
+    }
   }
 
   const grouped = [];
@@ -121,30 +143,242 @@ function findInkClusters(data, info, cell, headerBottom) {
       height: group[group.length - 1].y - group[0].y + 1,
       left,
       right,
-      darkLimit,
+      darkLimit: percentileNumber(group.map((row) => row.darkLimit), 0.5),
+      darkLimits: new Map(group.map((row) => [row.y, row.darkLimit])),
     }))
     .filter((cluster) =>
       cluster.height >= 3 &&
-      cluster.height <= Math.max(16, info.height * 0.03) &&
+      cluster.height <= Math.max(18, info.height * 0.045) &&
       cluster.score >= 8
     )
     .sort((a, b) => a.top - b.top);
 }
 
 function bboxForInkCluster(data, info, cluster) {
-  const xs = [];
+  const inkByX = new Map();
+  const rowHeight = Math.max(1, cluster.bottom - cluster.top);
+  const contextRadius = Math.max(5, Math.round(rowHeight * 0.8));
+  const localPaperByX = new Map();
+  for (let x = cluster.left; x < cluster.right; x += 1) {
+    const columnSamples = [];
+    const sampleTop = Math.max(0, cluster.top - contextRadius);
+    const sampleBottom = Math.min(info.height, cluster.bottom + contextRadius);
+    for (let y = sampleTop; y < sampleBottom; y += 1) {
+      columnSamples.push(data[y * info.width + x]);
+    }
+    localPaperByX.set(x, percentileNumber(columnSamples, 0.75));
+  }
   for (let y = cluster.top; y < cluster.bottom; y += 1) {
+    const rowDarkLimit = cluster.darkLimits?.get(y) ?? cluster.darkLimit;
     for (let x = cluster.left; x < cluster.right; x += 1) {
-      if (data[y * info.width + x] < cluster.darkLimit) xs.push(x);
+      const localPaper = localPaperByX.get(x) || 255;
+      const localDarkLimit = localPaper - Math.max(5, localPaper * 0.04);
+      if (data[y * info.width + x] < Math.min(rowDarkLimit, localDarkLimit)) {
+        inkByX.set(x, (inkByX.get(x) || 0) + 1);
+      }
     }
   }
-  if (!xs.length) return null;
+  const occupied = [...inkByX.entries()]
+    // A table rule is dark through nearly the complete row; glyph columns
+    // occupy only part of it. Never include such a rule in the value bbox.
+    .filter(([, count]) => count < rowHeight * 0.82)
+    .map(([x]) => x)
+    .sort((a, b) => a - b);
+  if (!occupied.length) return null;
+
+  const groups = [];
+  for (const x of occupied) {
+    const current = groups[groups.length - 1];
+    if (current && x <= current[current.length - 1] + 4) current.push(x);
+    else groups.push([x]);
+  }
+  const componentGroups = groups
+    .map((group) => ({
+      left: group[0],
+      right: group[group.length - 1],
+      ink: group.reduce((sum, x) => sum + (inkByX.get(x) || 0), 0),
+    }))
+    .filter((group) => group.ink >= Math.max(3, rowHeight * 0.12));
+  const candidates = componentGroups
+    .filter((group) => group.right - group.left >= 3 && group.ink >= 6)
+    .sort((a, b) => b.ink - a.ink || a.left - b.left);
+  const valueGroup = candidates[0];
+  if (!valueGroup) return null;
+  // Shadowed/blurred numbers can split into several x-components. Starting
+  // from the strongest component, absorb nearby groups on the same proven
+  // row so the bbox covers every old digit rather than only the final glyph.
+  // Keep narrow components for this expansion: faint single strokes often
+  // fail the primary width threshold even though they are part of the value.
+  const maxGap = Math.max(8, rowHeight * 0.85);
+  const selectedGroups = [valueGroup];
+  let unionLeft = valueGroup.left;
+  let unionRight = valueGroup.right;
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const candidate of componentGroups) {
+      if (selectedGroups.includes(candidate)) continue;
+      const gap = candidate.right < unionLeft
+        ? unionLeft - candidate.right
+        : candidate.left > unionRight
+          ? candidate.left - unionRight
+          : 0;
+      const nextLeft = Math.min(unionLeft, candidate.left);
+      const nextRight = Math.max(unionRight, candidate.right);
+      if (gap <= maxGap && nextRight - nextLeft <= (cluster.right - cluster.left) * 0.78) {
+        selectedGroups.push(candidate);
+        unionLeft = nextLeft;
+        unionRight = nextRight;
+        expanded = true;
+      }
+    }
+  }
   return {
-    x0: Math.max(cluster.left, percentileNumber(xs, 0.03) - 1),
+    x0: Math.max(cluster.left, unionLeft - 2),
     y0: Math.max(0, cluster.top - 1),
-    x1: Math.min(cluster.right, percentileNumber(xs, 0.97) + 2),
+    x1: Math.min(cluster.right, unionRight + 3),
     y1: Math.min(info.height, cluster.bottom + 1),
   };
+}
+
+/**
+ * Re-locate old value ink after the worker has made its final business-schema
+ * decision. The caller supplies only ACTUAL/CHARGED regions with physically
+ * proven cell bounds; this function may refine their pixel boxes but can
+ * never create a field or move one into BOXES/SAID TO CONTAIN.
+ */
+async function localizeWeightInkInCells(imageInput, regions, meta = {}) {
+  if (!Array.isArray(regions) || !regions.length) return regions || [];
+
+  const { data, info } = await sharp(imageInput)
+    .greyscale()
+    .normalize()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  // Perspective-skewed text can span 3-4% of page height even when each
+  // glyph is normally sized. The cell boundary and rule-row rejection remain
+  // the hard safety constraints; do not discard that complete slanted row.
+  const maxSafeHeight = Math.max(18, (meta.height || info.height) * 0.045);
+  const minimumHeaderGap = Math.max(5, info.height * 0.007);
+  const rowTolerance = Math.max(8, info.height * 0.018);
+
+  const searches = regions.map((region) => {
+    if (!region.cellBounds) return { region, candidates: [] };
+    const cell = {
+      left: Math.max(0, region.cellBounds.x0),
+      right: Math.min(info.width, region.cellBounds.x1),
+    };
+    const fallbackHeaderBottom = Math.max(
+      0,
+      region.bbox.y0 - Math.max(8, info.height * 0.035)
+    );
+    const headerBottom = Math.max(
+      0,
+      Math.min(
+        info.height - 1,
+        Number.isFinite(region.headerBottom) ? region.headerBottom : fallbackHeaderBottom
+      )
+    );
+    const candidates = findInkClusters(data, info, cell, headerBottom)
+      .filter((cluster) => cluster.top - headerBottom >= minimumHeaderGap)
+      .map((cluster) => ({ cluster, bbox: bboxForInkCluster(data, info, cluster) }))
+      .filter(({ bbox }) => {
+        if (!bbox) return false;
+        const height = bbox.y1 - bbox.y0;
+        const centerX = (bbox.x0 + bbox.x1) / 2;
+        return height >= 3 && height <= maxSafeHeight &&
+          centerX > cell.left && centerX < cell.right &&
+          bbox.x0 >= cell.left && bbox.x1 <= cell.right;
+      })
+      // The printed value is the first non-rule ink row beneath its own
+      // heading. Score is a tie-breaker only; it must not pull selection down
+      // into footer text when a faint old value exists above it.
+      .sort((a, b) => a.cluster.top - b.cluster.top || b.cluster.score - a.cluster.score)
+      .slice(0, 6);
+    return { region, cell, headerBottom, candidates };
+  });
+
+  const selected = new Array(regions.length).fill(null);
+  if (regions.length === 2 && searches.every((search) => search.candidates.length)) {
+    let bestPair = null;
+    for (const leftCandidate of searches[0].candidates) {
+      for (const rightCandidate of searches[1].candidates) {
+        const leftCenterY = (leftCandidate.bbox.y0 + leftCandidate.bbox.y1) / 2;
+        const rightCenterY = (rightCandidate.bbox.y0 + rightCandidate.bbox.y1) / 2;
+        const drift = Math.abs(leftCenterY - rightCenterY);
+        if (drift > rowTolerance) continue;
+        const firstBandDistance =
+          leftCandidate.cluster.top - searches[0].headerBottom +
+          rightCandidate.cluster.top - searches[1].headerBottom;
+        const score = firstBandDistance + drift * 4;
+        if (!bestPair || score < bestPair.score) {
+          bestPair = { leftCandidate, rightCandidate, score };
+        }
+      }
+    }
+    if (bestPair) {
+      selected[0] = bestPair.leftCandidate;
+      selected[1] = bestPair.rightCandidate;
+    }
+  }
+
+  // A single-field label needs only its first owned ink band. For a proven
+  // two-field schema, one visible sibling can establish the row of a faint or
+  // blank cell, but x remains independently clipped to that target cell.
+  if (regions.length === 1) {
+    selected[0] = searches[0].candidates[0] || null;
+  } else if (regions.length === 2 && !selected[0] && !selected[1]) {
+    const sourceIndex = searches[0].candidates.length ? 0 :
+      searches[1].candidates.length ? 1 : -1;
+    if (sourceIndex >= 0) {
+      selected[sourceIndex] = searches[sourceIndex].candidates[0];
+      const targetIndex = sourceIndex === 0 ? 1 : 0;
+      const sourceBbox = selected[sourceIndex].bbox;
+      const sourceCell = searches[sourceIndex].cell;
+      const targetCell = searches[targetIndex].cell;
+      if (sourceCell && targetCell) {
+        const width = Math.min(
+          sourceBbox.x1 - sourceBbox.x0,
+          Math.max(6, targetCell.right - targetCell.left - 4)
+        );
+        const relativeLeft = Math.max(2, sourceBbox.x0 - sourceCell.left);
+        const x0 = Math.min(
+          targetCell.right - width - 2,
+          targetCell.left + relativeLeft
+        );
+        selected[targetIndex] = {
+          bbox: {
+            x0: Math.max(targetCell.left + 2, x0),
+            y0: sourceBbox.y0,
+            x1: Math.min(targetCell.right - 2, Math.max(targetCell.left + 2, x0) + width),
+            y1: sourceBbox.y1,
+          },
+          inheritedRow: true,
+        };
+      }
+    }
+  }
+
+  return regions.map((region, index) => {
+    const localized = selected[index];
+    if (!localized?.bbox) return region;
+    if (region.ocrInkLocalized) {
+      const existingHeight = region.bbox.y1 - region.bbox.y0;
+      const localizedHeight = localized.bbox.y1 - localized.bbox.y0;
+      const coversOcrRow = localized.bbox.y0 <= region.bbox.y0 + 2 &&
+        localized.bbox.y1 >= region.bbox.y1 - 2;
+      // On a perspective-skewed word, horizontal row scanning can isolate
+      // only the lower strokes. Never replace a complete exact OCR glyph box
+      // with that smaller fragment.
+      if (!coversOcrRow && localizedHeight < existingHeight * 0.85) return region;
+    }
+    return {
+      ...region,
+      bbox: { ...localized.bbox },
+      inkLocalized: !localized.inheritedRow,
+      rowLocalizedFromSibling: Boolean(localized.inheritedRow),
+    };
+  });
 }
 
 /**
@@ -167,7 +401,15 @@ async function inferWeightRegionsFromAnchors(imageInput, anchors, words, meta) {
   // than its sibling. The aligned sibling provides the safe separator.
   const headerBottom = Math.min(pair.left.bbox.y1, pair.right.bbox.y1);
   const { data, info } = await sharp(imageInput).greyscale().raw().toBuffer({ resolveWithObject: true });
-  const clusterSets = cells.map((cell) => findInkClusters(data, info, cell, headerBottom));
+  // The value baseline can begin only 6-10px below the header separator on
+  // downscaled phone images. A 2% page-height minimum skipped that real row
+  // and selected the footer hundreds of pixels below it.
+  const minimumValueGap = Math.max(5, info.height * 0.007);
+  const clusterSets = cells.map((cell) =>
+    findInkClusters(data, info, cell, headerBottom).filter((cluster) =>
+      cluster.top - headerBottom >= minimumValueGap
+    )
+  );
 
   let selected = [clusterSets[0][0] || null, clusterSets[1][0] || null];
   if (selected[0] && selected[1]) {
@@ -210,6 +452,16 @@ async function inferWeightRegionsFromAnchors(imageInput, anchors, words, meta) {
     const kind = index === 0 ? 'actual' : 'charged';
     return {
       bbox,
+      // Header glyphs are inset from their physical cells. Include the normal
+      // left padding so stale leading digits from an earlier bad edit are
+      // also inside the cleanup mask; rule detection still protects borders.
+      cellBounds: {
+        // Physical ruled-cell interiors are the hard edit boundary. Extending
+        // ACTUAL left into BOXES & DIMENSION allowed a same-row dimension or
+        // stale failed edit to be erased and replaced as weight text.
+        x0: Math.max(0, cells[index].left),
+        x1: cells[index].right,
+      },
       originalText: matchingWord ? matchingWord.text.trim().replace(',', '.') : '',
       anchorText: index === 0 ? 'structural ACTUAL WEIGHT' : 'structural CHARGED WEIGHT',
       kind,
@@ -217,14 +469,14 @@ async function inferWeightRegionsFromAnchors(imageInput, anchors, words, meta) {
   });
 }
 
-function findVerticalLineTop(data, info, x, yMin, yMax) {
+function findVerticalLineTop(data, info, x, yMin, yMax, darkLimit = 185) {
   const rows = [];
   for (let y = yMin; y < yMax; y += 1) {
     let dark = false;
     for (let dx = -1; dx <= 1; dx += 1) {
       const px = x + dx;
       if (px < 0 || px >= info.width) continue;
-      if (data[y * info.width + px] < 185) {
+      if (data[y * info.width + px] < darkLimit) {
         dark = true;
         break;
       }
@@ -252,6 +504,7 @@ function findValueTextBand(data, info, columns, searchBand = {}) {
   const minGap = Math.max(14, info.height * 0.025);
   const yMin = Math.max(0, Math.round(searchBand.yMin ?? info.height * 0.34));
   const yMax = Math.min(info.height, Math.round(searchBand.yMax ?? info.height * 0.65));
+  const darkLimit = searchBand.darkLimit ?? 175;
 
   for (const column of columns) {
     const width = column.right - column.left;
@@ -263,7 +516,7 @@ function findValueTextBand(data, info, columns, searchBand = {}) {
     for (let y = yMin; y < yMax; y += 1) {
       let count = 0;
       for (let x = x0; x < x1; x += 1) {
-        if (data[y * info.width + x] < 175) count += 1;
+        if (data[y * info.width + x] < darkLimit) count += 1;
       }
       if (count >= 2) rows.push({ y, score: count });
     }
@@ -305,7 +558,24 @@ function findValueTextBand(data, info, columns, searchBand = {}) {
 function pickWeightColumnBorders(borders, imageWidth) {
   const sortedBorders = [...borders].sort((a, b) => a.x - b.x);
   const xs = sortedBorders.map((border) => border.x);
-  if (xs.length < 4) return [];
+  if (xs.length < 3) return [];
+
+  // Extremely faint single-ACTUAL scans may expose only the three long rules
+  // around ACTUAL and SAID TO CONTAIN; the outer BOXES boundary is at/cropped
+  // by the page edge. In that specific Delhivery geometry, the first interior
+  // cell is ACTUAL and the second is the product cell. Return only ACTUAL.
+  if (xs.length === 3) {
+    const firstWidth = xs[1] - xs[0];
+    const secondWidth = xs[2] - xs[1];
+    const firstXRatio = xs[0] / imageWidth;
+    const plausibleWidth = firstWidth >= imageWidth * 0.055 && firstWidth <= imageWidth * 0.19;
+    const neighbourRatio = secondWidth / Math.max(1, firstWidth);
+    if (firstXRatio >= 0.16 && firstXRatio <= 0.32 && plausibleWidth &&
+        neighbourRatio >= 0.55 && neighbourRatio <= 1.25) {
+      return [{ left: xs[0], right: xs[1] }];
+    }
+    return [];
+  }
 
   // Cell widths scale with the photographed page. Fixed pixel limits worked
   // on ~1100px scans but rejected the same table in 3K/4K phone photos.
@@ -340,12 +610,32 @@ function pickWeightColumnBorders(borders, imageWidth) {
     ];
   }
 
-  // For single ACTUAL WEIGHT templates, suppress weaker internal text strokes
-  // and use the first strong 80-180px cell before the SAID TO CONTAIN column.
   const strongestScore = Math.max(...sortedBorders.map((border) => border.score));
   const strongXs = sortedBorders
     .filter((border) => border.score >= strongestScore * 0.45)
     .map((border) => border.x);
+
+  for (let i = 0; i < strongXs.length - 2; i += 1) {
+    const width = strongXs[i + 1] - strongXs[i];
+    const nextWidth = strongXs[i + 2] - strongXs[i + 1];
+    const beforeWidth = i > 0 ? strongXs[i] - strongXs[i - 1] : 0;
+    const afterWidth = i + 3 < strongXs.length ? strongXs[i + 3] - strongXs[i + 2] : 0;
+    if (
+      width >= minCellWidth && width <= maxCellWidth &&
+      nextWidth >= minCellWidth && nextWidth <= maxCellWidth &&
+      nextWidth / width >= 0.65 && nextWidth / width <= 1.35 &&
+      (beforeWidth >= Math.max(width, nextWidth) * 1.35 ||
+        (afterWidth > 0 && afterWidth <= Math.max(width, nextWidth) * 0.9))
+    ) {
+      return [
+        { left: strongXs[i], right: strongXs[i + 1] },
+        { left: strongXs[i + 1], right: strongXs[i + 2] },
+      ];
+    }
+  }
+
+  // For single ACTUAL WEIGHT templates, suppress weaker internal text strokes
+  // and use the first strong 80-180px cell before the SAID TO CONTAIN column.
   if (strongXs.length >= 3) {
     for (let i = 0; i < strongXs.length - 1; i += 1) {
       const width = strongXs[i + 1] - strongXs[i];
@@ -417,6 +707,15 @@ async function inferWeightRegionsFromTable(imageInput, meta, anchors = []) {
   const bandHeight = Math.max(1, yMax - yMin);
   const xMin = Math.round(info.width * 0.02);
   const xMax = Math.round(info.width * 0.6);
+  const bandSamples = [];
+  for (let y = yMin; y < yMax; y += 3) {
+    for (let x = xMin; x < xMax; x += 3) bandSamples.push(data[y * info.width + x]);
+  }
+  const localPaper = percentileNumber(bandSamples, 0.75) || 255;
+  // Fixed 175/185 thresholds classify blue/gray paper itself as a rule. Use
+  // contrast relative to this label's local paper, capped at the old value
+  // for normal white scans.
+  const tableDarkLimit = Math.min(185, localPaper - Math.max(8, localPaper * 0.05));
 
   const scoredXs = [];
   for (let x = xMin; x < xMax; x += 1) {
@@ -424,7 +723,7 @@ async function inferWeightRegionsFromTable(imageInput, meta, anchors = []) {
     let bestRun = 0;
     let run = 0;
     for (let y = yMin; y < yMax; y += 1) {
-      if (data[y * info.width + x] < 185) {
+      if (data[y * info.width + x] < tableDarkLimit) {
         count += 1;
         run += 1;
       } else {
@@ -434,21 +733,45 @@ async function inferWeightRegionsFromTable(imageInput, meta, anchors = []) {
     }
     if (run > bestRun) bestRun = run;
     const score = Math.max(count, bestRun * 3);
-    if (count >= bandHeight * 0.08 || bestRun >= bandHeight * 0.08) {
+    if (count >= bandHeight * 0.035 || bestRun >= bandHeight * 0.035) {
       scoredXs.push({ x, score, count, bestRun });
     }
   }
 
   const borders = groupAdjacentXs(scoredXs)
-    .filter((border) => border.score >= Math.max(55, bandHeight * 0.18))
+    .filter((border) => border.score >= Math.max(24, bandHeight * 0.08))
     .sort((a, b) => a.x - b.x);
-  const columns = pickWeightColumnBorders(borders, info.width);
+  let columns = pickWeightColumnBorders(borders, info.width);
+  if (!columns.length && !weightAnchors.length) {
+    // On very low-contrast phone photos, text strokes can bridge the grouped
+    // x-candidates and hide otherwise strong vertical rules. Recover only the
+    // known single-ACTUAL geometry: one strong interior rule in the 16-32%
+    // band and one similarly strong rule 5.5-19% of page width to its right.
+    // The bounded right search excludes the farther SAID TO CONTAIN edge.
+    const minimumRuleScore = Math.max(30, bandHeight * 0.4);
+    const leftRule = scoredXs
+      .filter((entry) => entry.x >= info.width * 0.16 && entry.x <= info.width * 0.32)
+      .filter((entry) => entry.score >= minimumRuleScore)
+      .sort((a, b) => b.score - a.score)[0];
+    const rightRule = leftRule ? scoredXs
+      .filter((entry) => entry.x >= leftRule.x + info.width * 0.055)
+      .filter((entry) => entry.x <= leftRule.x + info.width * 0.19)
+      .filter((entry) => entry.score >= minimumRuleScore)
+      .sort((a, b) => b.score - a.score)[0] : null;
+    if (leftRule && rightRule && rightRule.x - leftRule.x >= info.width * 0.055) {
+      columns = [{ left: leftRule.x, right: rightRule.x }];
+    }
+  }
   if (!columns.length) return [];
 
-  const valueTextBand = findValueTextBand(data, info, columns, { yMin, yMax });
+  const valueTextBand = findValueTextBand(data, info, columns, {
+    yMin,
+    yMax,
+    darkLimit: tableDarkLimit,
+  });
   const lineTops = columns
     .flatMap((column) => [column.left, column.right])
-    .map((x) => findVerticalLineTop(data, info, x, yMin, yMax))
+    .map((x) => findVerticalLineTop(data, info, x, yMin, yMax, tableDarkLimit))
     .filter((top) => top !== null);
   let y0;
   let y1;
@@ -467,8 +790,10 @@ async function inferWeightRegionsFromTable(imageInput, meta, anchors = []) {
     const x0 = Math.max(0, Math.round(column.left + width * 0.06));
     const x1 = Math.min(info.width, Math.round(column.right - Math.max(2, width * 0.08)));
     const kind = index === 0 ? 'actual' : 'charged';
+    const cellLeft = Math.max(0, Math.round(column.left));
     return {
       bbox: { x0, y0, x1, y1 },
+      cellBounds: { x0: cellLeft, x1: column.right },
       originalText: '',
       anchorText: index === 0 ? 'inferred ACTUAL WEIGHT table cell' : 'inferred CHARGED WEIGHT table cell',
       kind,
@@ -535,7 +860,15 @@ function hasTargetWeightHeaderEvidence(anchors, words, sourceRegion, candidateRe
   });
   if (targetAnchor) return true;
 
-  return /weight|weigh|charg|actual|ctual/.test(targetText);
+  if (/weight|weigh|charg|actual|ctual/.test(targetText)) return true;
+
+  // Equal-width adjacent table rules are already required by the caller.
+  // A damaged but clearly printed alphabetic header (for example CHARGED
+  // recognized as "Tar") is enough additional evidence, provided it was not
+  // identified above as SAID TO CONTAIN/product text.
+  return targetHeaderWords.some((word) =>
+    String(word.text || '').replace(/[^a-z]/gi, '').length >= 3
+  );
 }
 
 async function inferSiblingFromTableRules(imageInput, anchors, regions, meta) {
@@ -607,7 +940,111 @@ async function inferSiblingFromTableRules(imageInput, anchors, regions, meta) {
   };
   if (bbox.x0 < 0 || bbox.x1 > meta.width) return [];
   const targetKind = direction > 0 ? 'charged' : 'actual';
-  return [{ bbox, originalText: '', anchorText: `inferred ${targetKind.toUpperCase()} WEIGHT from table rules`, kind: targetKind }];
+  const targetLeft = direction > 0 ? currentRight : previousLeft;
+  const targetRight = direction > 0 ? nextRight : currentLeft;
+  return [{
+    bbox,
+    cellBounds: { x0: targetLeft, x1: targetRight },
+    originalText: '',
+    anchorText: `inferred ${targetKind.toUpperCase()} WEIGHT from table rules`,
+    kind: targetKind,
+  }];
+}
+
+async function inferSingleWeightRegionFromAnchor(imageInput, anchors, words, meta) {
+  const candidates = anchors
+    .filter((anchor) => {
+      const centerX = (anchor.bbox.x0 + anchor.bbox.x1) / 2;
+      const centerY = (anchor.bbox.y0 + anchor.bbox.y1) / 2;
+      return centerX < meta.width * 0.62 &&
+        centerY > meta.height * 0.2 && centerY < meta.height * 0.68;
+    })
+    .sort((a, b) => a.bbox.y0 - b.bbox.y0);
+  if (!candidates.length) return [];
+  const anchor = candidates[0];
+  const { data, info } = await sharp(imageInput).greyscale().raw().toBuffer({ resolveWithObject: true });
+  const centerX = (anchor.bbox.x0 + anchor.bbox.x1) / 2;
+  const top = Math.max(0, Math.floor(anchor.bbox.y0 - info.height * 0.025));
+  const bottom = Math.min(info.height, Math.ceil(anchor.bbox.y1 + info.height * 0.22));
+  const searchLeft = Math.max(0, Math.floor(anchor.bbox.x0 - info.width * 0.16));
+  const searchRight = Math.min(info.width - 1, Math.ceil(anchor.bbox.x1 + info.width * 0.16));
+  const bandHeight = Math.max(1, bottom - top);
+  const xs = [];
+  for (let x = searchLeft; x <= searchRight; x += 1) {
+    let longestRun = 0;
+    let run = 0;
+    for (let y = top; y < bottom; y += 1) {
+      if (data[y * info.width + x] < 180) {
+        run += 1;
+        longestRun = Math.max(longestRun, run);
+      } else {
+        run = 0;
+      }
+    }
+    if (longestRun >= bandHeight * 0.42) xs.push({ x, score: longestRun });
+  }
+  const borders = groupAdjacentXs(xs).sort((a, b) => a.x - b.x);
+  let leftBorder = borders.filter((border) => border.x < centerX).at(-1);
+  let rightBorder = borders.find((border) => border.x > centerX);
+  const anchorWidth = anchor.bbox.x1 - anchor.bbox.x0;
+  const boundariesLookInset = leftBorder &&
+    anchor.bbox.x0 - leftBorder.x < anchorWidth * 0.2;
+  if (!leftBorder || !rightBorder || boundariesLookInset) {
+    // Perspective-skewed photos turn vertical rules into diagonals, so no
+    // single x coordinate has a long run. The header text is still inset by a
+    // stable amount; use it as a conservative cell estimate and keep the
+    // existing right inset in findInkClusters away from the product column.
+    leftBorder = { x: Math.max(0, anchor.bbox.x0 - anchorWidth * 0.45) };
+    rightBorder = { x: Math.min(info.width, anchor.bbox.x1) };
+  }
+  let cellWidth = rightBorder.x - leftBorder.x;
+  if (cellWidth < info.width * 0.045 || cellWidth > info.width * 0.24) {
+    leftBorder = { x: Math.max(0, anchor.bbox.x0 - anchorWidth * 0.45) };
+    rightBorder = { x: Math.min(info.width, anchor.bbox.x1) };
+    cellWidth = rightBorder.x - leftBorder.x;
+  }
+  if (cellWidth < info.width * 0.045 || cellWidth > info.width * 0.24) return [];
+
+  const clusters = findInkClusters(
+    data,
+    info,
+    { left: leftBorder.x, right: rightBorder.x },
+    anchor.bbox.y1
+  );
+  const minimumValueGap = Math.max(12, info.height * 0.02);
+  const cluster = clusters.find((candidate) =>
+    candidate.top - anchor.bbox.y1 >= minimumValueGap
+  ) || null;
+  const fallbackBbox = {
+    x0: Math.round(leftBorder.x + cellWidth * 0.045),
+    y0: Math.round(anchor.bbox.y1 + Math.max(8, info.height * 0.014)),
+    x1: Math.round(leftBorder.x + cellWidth * 0.58),
+    y1: Math.round(anchor.bbox.y1 + Math.max(20, info.height * 0.04)),
+  };
+  const bbox = cluster
+    ? (bboxForInkCluster(data, info, cluster) || fallbackBbox)
+    : {
+        // Last-resort row for an extremely faint value beneath a positively
+        // identified single ACTUAL WEIGHT header. These Delhivery templates
+        // use a stable one-line header-to-value gap; the cell bounds prevent
+        // this from drifting into invoice or product fields.
+        ...fallbackBbox,
+      };
+  if (!bbox || bbox.y1 <= bbox.y0) return [];
+  const matchingWord = words.find((word) => {
+    const cx = (word.bbox.x0 + word.bbox.x1) / 2;
+    const cy = (word.bbox.y0 + word.bbox.y1) / 2;
+    return cx > leftBorder.x && cx < rightBorder.x &&
+      cy >= bbox.y0 - 5 && cy <= bbox.y1 + 5 &&
+      /^\d{1,6}(?:[.,]\d{1,3})?$/.test(String(word.text || '').trim());
+  });
+  return [{
+    bbox,
+    cellBounds: { x0: leftBorder.x, x1: rightBorder.x },
+    originalText: matchingWord ? matchingWord.text.trim().replace(',', '.') : '',
+    anchorText: 'structural ACTUAL WEIGHT',
+    kind: 'actual',
+  }];
 }
 
 /**
@@ -777,5 +1214,7 @@ module.exports = {
   inferSiblingFromAnchors,
   inferSiblingFromTableRules,
   inferWeightRegionsFromAnchors,
+  inferSingleWeightRegionFromAnchor,
   inferWeightRegionsFromTable,
+  localizeWeightInkInCells,
 };

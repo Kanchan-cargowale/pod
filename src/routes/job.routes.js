@@ -19,6 +19,10 @@ router.get('/:id', asyncHandler(controller.getJobStatus));
 // GET /api/jobs/:id/download
 router.get('/:id/download', asyncHandler(controller.downloadJobZip));
 
+// POST /api/jobs/:id/download-selected
+// body: { filenames: string[] }
+router.post('/:id/download-selected', asyncHandler(controller.downloadSelectedZip));
+
 // GET /api/jobs/:id/preview/:filename - stream an edited image inline
 router.get('/:id/preview/:filename', asyncHandler(controller.previewImage));
 

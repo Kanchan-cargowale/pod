@@ -42,7 +42,7 @@ function isWeightAnchorText(text) {
   const normalized = normalizeHeaderText(text);
   // "Freight Payment" is common immediately above the real weight table and
   // differs from "weight" by only one leading character.
-  if (normalized.includes('freight')) return false;
+  if (normalized.includes('freight') || containsFuzzyWord(text, 'freight', 1)) return false;
   return WEIGHT_ANCHOR.test(String(text || '')) || containsFuzzyWord(text, 'weight');
 }
 
@@ -132,6 +132,55 @@ function buildMergedNumericCandidates(words) {
   return candidates;
 }
 
+function numericTokenVariants(text) {
+  const raw = String(text || '').trim();
+  const digitsOnly = raw.replace(NON_DIGIT, '');
+  const variants = new Set(digitsOnly ? [digitsOnly] : []);
+  const compact = raw.replace(/[^a-z0-9|]/gi, '');
+  const letters = (compact.match(/[a-z]/gi) || []).length;
+
+  // Barcode-header IDs often contain a small number of OCR glyph confusions.
+  // Restrict repair to long, overwhelmingly numeric tokens so page prose can
+  // never become a fabricated shipment number.
+  if (compact.length >= 7 && letters <= 2) {
+    const corrected = compact
+      .toUpperCase()
+      .replace(/[OQD]/g, '0')
+      .replace(/[IL|]/g, '1')
+      .replace(/Z/g, '2')
+      .replace(/S/g, '5')
+      .replace(/G/g, '6')
+      .replace(/B/g, '8')
+      .replace(/\D/g, '');
+    if (corrected) variants.add(corrected);
+  }
+
+  return [...variants];
+}
+
+function candidatePositionScore(candidate, opts, medianWordHeight) {
+  const imageWidth = Number(opts.imageWidth) || 0;
+  const imageHeight = Number(opts.imageHeight) || 0;
+  const words = candidate.words || [];
+  if (!imageWidth || !imageHeight || !words.length) return 0;
+
+  const x0 = Math.min(...words.map((word) => word.bbox.x0));
+  const x1 = Math.max(...words.map((word) => word.bbox.x1));
+  const y0 = Math.min(...words.map((word) => word.bbox.y0));
+  const y1 = Math.max(...words.map((word) => word.bbox.y1));
+  const centerX = (x0 + x1) / 2;
+  const centerY = (y0 + y1) / 2;
+  const height = y1 - y0;
+  let score = 0;
+
+  // This POD family prints the primary ID in the upper barcode/header band.
+  if (centerY <= imageHeight * 0.22) score += 30;
+  else if (centerY <= imageHeight * 0.34) score += 12;
+  if (centerX >= imageWidth * 0.38) score += 12;
+  if (height >= medianWordHeight * 1.35) score += 8;
+  return score;
+}
+
 /**
  * Finds the shipment ID present on a label out of a known set of IDs
  * (the keys of the uploaded Excel mapping). Matching order:
@@ -150,9 +199,20 @@ function findShipmentId(words, idSet, opts = {}) {
   const minConfidence = opts.minConfidence ?? 40;
   const fuzzyMaxDistance = opts.fuzzyMaxDistance ?? 2;
 
+  const wordHeights = words
+    .map((word) => word.bbox.y1 - word.bbox.y0)
+    .filter((height) => height > 0)
+    .sort((a, b) => a - b);
+  const medianWordHeight = wordHeights[Math.floor(wordHeights.length / 2)] || 1;
+
   const singleWordCandidates = words
     .filter((w) => w.confidence >= minConfidence)
-    .map((w) => ({ text: w.text.replace(NON_DIGIT, ''), confidence: w.confidence, words: [w] }))
+    .flatMap((w) => numericTokenVariants(w.text).map((text) => ({
+      text,
+      confidence: w.confidence,
+      words: [w],
+      source: text === w.text.replace(NON_DIGIT, '') ? 'ocr' : 'ocr_confusion_repair',
+    })))
     .filter((c) => c.text.length >= 4);
 
   const mergedCandidates = buildMergedNumericCandidates(words).filter(
@@ -167,8 +227,17 @@ function findShipmentId(words, idSet, opts = {}) {
   let best = null;
   for (const candidate of allCandidates) {
     if (idSet.has(candidate.text)) {
-      if (!best || candidate.confidence > best.confidence) {
-        best = { id: candidate.text, word: candidate.words[0], words: candidate.words, distance: 0, confidence: candidate.confidence };
+      const score = candidate.confidence + candidatePositionScore(candidate, opts, medianWordHeight);
+      if (!best || score > best.score) {
+        best = {
+          id: candidate.text,
+          word: candidate.words[0],
+          words: candidate.words,
+          distance: 0,
+          confidence: candidate.confidence,
+          score,
+          source: candidate.source || (candidate.words.length > 1 ? 'ocr_fragments' : 'ocr'),
+        };
       }
     }
   }
@@ -180,8 +249,17 @@ function findShipmentId(words, idSet, opts = {}) {
     for (const id of idSet) {
       if (Math.abs(id.length - candidate.text.length) > fuzzyMaxDistance) continue;
       const distance = levenshtein(id, candidate.text);
-      if (distance <= fuzzyMaxDistance && (!best || distance < best.distance || candidate.confidence > best.confidence)) {
-        best = { id, word: candidate.words[0], words: candidate.words, distance, confidence: candidate.confidence };
+      const score = candidate.confidence + candidatePositionScore(candidate, opts, medianWordHeight) - distance * 35;
+      if (distance <= fuzzyMaxDistance && (!best || score > best.score)) {
+        best = {
+          id,
+          word: candidate.words[0],
+          words: candidate.words,
+          distance,
+          confidence: candidate.confidence,
+          score,
+          source: 'ocr_fuzzy',
+        };
       }
     }
   }
@@ -283,7 +361,120 @@ function findWeightAnchors(words) {
     }
   }
 
-  return groups;
+  const makeAnchor = (groupWords) => {
+    const x0 = Math.min(...groupWords.map((word) => word.bbox.x0));
+    const y0 = Math.min(...groupWords.map((word) => word.bbox.y0));
+    const x1 = Math.max(...groupWords.map((word) => word.bbox.x1));
+    const y1 = Math.max(...groupWords.map((word) => word.bbox.y1));
+    const anchor = { bbox: { x0, y0, x1, y1, height: y1 - y0 }, words: groupWords };
+    return narrowCompositeWeightAnchor(anchor);
+  };
+
+  function narrowCompositeWeightAnchor(anchor) {
+    const text = anchor.words.map((word) => String(word.text || '')).join(' ');
+    const normalized = normalizeQualifierText(text);
+    const mentionsWeight = /weight|weigh/.test(normalizeHeaderText(text));
+    const spillsIntoProductColumn = /said|contain/.test(normalized);
+    if (!mentionsWeight || !spillsIntoProductColumn) return anchor;
+
+    const width = anchor.bbox.x1 - anchor.bbox.x0;
+    if (width <= 0) return anchor;
+
+    // Some low-contrast scans are OCR'd as one long token such as
+    // "[ACTUAL WEIGHT(kg)___|SAID". Keep the physical left-side weight
+    // header and discard the neighbouring SAID TO CONTAIN text from the
+    // anchor, otherwise value search moves into the product column.
+    const isActualOnly = /actual|ctual/.test(normalized) && !/charg|chargeable/.test(normalized);
+    if (!isActualOnly) return anchor;
+
+    const narrowedWidth = Math.max(width * 0.32, Math.min(width * 0.52, anchor.bbox.height * 3.4));
+    return {
+      ...anchor,
+      bbox: {
+        ...anchor.bbox,
+        x1: anchor.bbox.x0 + narrowedWidth,
+        height: anchor.bbox.y1 - anchor.bbox.y0,
+      },
+    };
+  }
+
+  // Base + enhanced OCR can create a bridge of overlapping duplicate words
+  // that merges ACTUAL and CHARGED into one very wide anchor. Split only at a
+  // pronounced inter-column gap where both halves independently contain
+  // weight-header evidence; ordinary "CHARGED WEIGHT" remains one anchor.
+  const splitGroups = groups.flatMap((group) => {
+    if (group.words.length < 2) return [group];
+    const sorted = [...group.words].sort((a, b) => {
+      const ax = (a.bbox.x0 + a.bbox.x1) / 2;
+      const bx = (b.bbox.x0 + b.bbox.x1) / 2;
+      return ax - bx;
+    });
+    const heights = sorted
+      .map((word) => word.bbox.y1 - word.bbox.y0)
+      .filter((height) => height > 0)
+      .sort((a, b) => a - b);
+    const medianHeight = heights[Math.floor(heights.length / 2)] || group.bbox.height;
+    let splitIndex = -1;
+    let largestGap = 0;
+    for (let index = 1; index < sorted.length; index += 1) {
+      const previousCenter = (sorted[index - 1].bbox.x0 + sorted[index - 1].bbox.x1) / 2;
+      const center = (sorted[index].bbox.x0 + sorted[index].bbox.x1) / 2;
+      const gap = center - previousCenter;
+      if (gap > largestGap) {
+        largestGap = gap;
+        splitIndex = index;
+      }
+    }
+    if (splitIndex < 1 || largestGap < Math.max(18, medianHeight * 2.2)) return [group];
+    const leftWords = sorted.slice(0, splitIndex);
+    const rightWords = sorted.slice(splitIndex);
+    const hasEvidence = (candidateWords) => candidateWords.some((word) =>
+      isWeightAnchorText(word.text) || isWeightQualifierText(word.text)
+    );
+    if (!hasEvidence(leftWords) || !hasEvidence(rightWords)) return [group];
+    const leftText = leftWords.map((word) => normalizeQualifierText(word.text)).join('');
+    const rightText = rightWords.map((word) => normalizeQualifierText(word.text)).join('');
+    const rightMinX = Math.min(...rightWords.map((word) => word.bbox.x0));
+    const rightMaxX = Math.max(...rightWords.map((word) => word.bbox.x1));
+    const externalChargedEvidence = groups.some((otherGroup) =>
+      otherGroup !== group &&
+      otherGroup.words.some((word) => /charg/.test(normalizeQualifierText(word.text))) &&
+      Math.min(rightMaxX, otherGroup.bbox.x1) - Math.max(rightMinX, otherGroup.bbox.x0) > 0
+    );
+    // "ACTUAL WEIGHT" can be two horizontally adjacent tokens inside one
+    // wide cell. A true inter-column split has CHARGED evidence on the right
+    // (or no ACTUAL qualifier on the left due to damaged OCR).
+    if (/actual|ctual/.test(leftText) && !/charg/.test(rightText) && !externalChargedEvidence) {
+      return [group];
+    }
+    return [makeAnchor(leftWords), makeAnchor(rightWords)];
+  });
+
+  const consolidated = [];
+  for (const anchor of splitGroups.sort((a, b) => a.bbox.x0 - b.bbox.x0 || a.bbox.y0 - b.bbox.y0)) {
+    const width = anchor.bbox.x1 - anchor.bbox.x0;
+    const height = anchor.bbox.y1 - anchor.bbox.y0;
+    const existing = consolidated.find((candidate) => {
+      const candidateWidth = candidate.bbox.x1 - candidate.bbox.x0;
+      const candidateHeight = candidate.bbox.y1 - candidate.bbox.y0;
+      const overlapX = Math.min(anchor.bbox.x1, candidate.bbox.x1) -
+        Math.max(anchor.bbox.x0, candidate.bbox.x0);
+      const verticalGap = Math.max(
+        0,
+        Math.max(anchor.bbox.y0, candidate.bbox.y0) - Math.min(anchor.bbox.y1, candidate.bbox.y1)
+      );
+      return overlapX >= Math.min(width, candidateWidth) * 0.45 &&
+        verticalGap <= Math.max(height, candidateHeight) * 1.5;
+    });
+    if (existing) {
+      existing.words.push(...anchor.words.filter((word) => !existing.words.includes(word)));
+      const rebuilt = makeAnchor(existing.words);
+      existing.bbox = rebuilt.bbox;
+    } else {
+      consolidated.push(anchor);
+    }
+  }
+  return consolidated.map(narrowCompositeWeightAnchor);
 }
 
 /**
