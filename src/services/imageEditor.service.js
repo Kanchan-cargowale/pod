@@ -104,7 +104,9 @@ async function sampleLocalPaperColor(image, meta, bbox) {
 
     // Keep the lighter half of the neighbourhood so glyphs and table rules
     // cannot darken the fill, while preserving the local paper/shadow color.
-    const paperCutoff = percentile(pixels.map((pixel) => pixel.luma), 0.5);
+    // Use the 45th percentile so stray scan-bright pixels don't bias the
+    // fill toward white on gray-paper labels.
+    const paperCutoff = percentile(pixels.map((pixel) => pixel.luma), 0.45);
     const paperPixels = pixels.filter((pixel) => pixel.luma >= paperCutoff);
     return {
       r: medianChannel(paperPixels, 'r'),
@@ -160,10 +162,12 @@ async function samplePaperInsideBbox(image, meta, bbox) {
     // tint and avoids a rectangular warm/cool patch on blue or gray paper.
     const lumas = pixels.map((pixel) => pixel.luma);
     const lowerPaper = percentile(lumas, 0.35);
-    const upperPaper = percentile(lumas, 0.8);
+    const upperPaper = percentile(lumas, 0.72);
     // Use the middle paper cluster, not the brightest tail. Selecting only
     // bright pixels biased blue/gray photos several levels toward white and
     // made the restored word box visible even when its texture was correct.
+    // Cap at the 72nd percentile (down from 80th) so scan glare cannot pull
+    // the sampled fill toward white on gray/dark-paper labels.
     const paperPixels = pixels.filter(
       (pixel) => pixel.luma >= lowerPaper && pixel.luma <= upperPaper
     );
@@ -599,9 +603,12 @@ async function createSelectiveEraseOverlay(
 
         const overlayOffset = (y * width + x) * 4;
         if (overlay[overlayOffset + 3] === 0) {
-          overlay[overlayOffset] = bg.r;
-          overlay[overlayOffset + 1] = bg.g;
-          overlay[overlayOffset + 2] = bg.b;
+          // Use row-adaptive paper here too; a flat bg color is noticeably
+          // lighter than photographed gray/blue paper and produces a white strip.
+          const replacement = sameRowPaper(x, y) || bg;
+          overlay[overlayOffset] = replacement.r;
+          overlay[overlayOffset + 1] = replacement.g;
+          overlay[overlayOffset + 2] = replacement.b;
           overlay[overlayOffset + 3] = 255;
         }
       }
@@ -766,8 +773,21 @@ async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, req
     if (imageY >= valueTop && imageY <= valueBottom) {
       ruleXAtValue = Math.max(ruleXAtValue, centerX + bandRadius);
     }
+    // Only copy pixels that are genuinely dark relative to their row's paper.
+    // The band can cover non-rule pixels (old digits, noise, bright paper).
+    // Copying those as opaque would introduce a black blob or restore old
+    // digit fragments. Paint transparent wherever the pixel is paper-bright.
+    const rowPaper = rowPapers[rowIndex];
+    // A pixel qualifies as rule ink when it is at least 12% darker than the
+    // local row paper OR its absolute luma is below 160 (covers faint rules
+    // on gray paper). Both guards use the grayscale channel which is already
+    // extracted and avoids a second color decode.
+    const ruleInkLimit = Math.min(rowPaper - Math.max(8, rowPaper * 0.12), 160);
     for (let imageX = centerX - bandRadius; imageX <= centerX + bandRadius; imageX += 1) {
       if (imageX < cropLeft || imageX > cropRight) continue;
+      // Check grayscale darkness before copying full-color source
+      const grayVal = gray[imageY * grayInfo.width + imageX];
+      if (grayVal > ruleInkLimit) continue; // not rule ink – leave transparent
       const localX = imageX - cropLeft;
       const sourceOffset = (rowIndex * sourceInfo.width + localX) * sourceInfo.channels;
       const overlayOffset = (rowIndex * cropWidth + localX) * 4;
@@ -1369,9 +1389,13 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
             op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio)
           );
       const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
-      const heightLimit = preferredTextStyle
-        ? Math.max(6, op.height * 0.98)
-        : Math.max(6, op.height / 0.9);
+      const templateFontCap = Math.max(7, meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO);
+      const heightLimit = Math.min(
+        templateFontCap,
+        preferredTextStyle
+          ? Math.max(6, op.height * 0.98)
+          : Math.max(6, op.height / 0.9)
+      );
       const textRight = op.textBounds?.x1 ?? (op.rectX + op.rectW);
       const widthLimit = Math.max(4, textRight - textX - 1) /
         numericAdvanceUnits(op.replacementText, sharedTextStyle.fontFamily);
@@ -1419,9 +1443,13 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
           op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio)
         );
     const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
-    const maxFontSizeForHeight = preferredTextStyle
-      ? Math.max(6, op.height * 0.98)
-      : Math.max(6, op.height / 0.9);
+    const templateFontCap = Math.max(7, meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO);
+    const maxFontSizeForHeight = Math.min(
+      templateFontCap,
+      preferredTextStyle
+        ? Math.max(6, op.height * 0.98)
+        : Math.max(6, op.height / 0.9)
+    );
     const textRight = op.textBounds?.x1 ?? (op.rectX + op.rectW);
     const maxTextWidth = Math.max(4, textRight - textX - 1);
     const maxFontSizeForWidth =
