@@ -2116,12 +2116,12 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       0,
       qualifier.bbox.x0 - Math.max(separatorGuard, qualifierWidth * 0.28)
     );
-    const chargedSharedSeparator = kind === 'charged' && chargedHeaderQualifier
-      ? Math.max(0, chargedHeaderQualifier.bbox.x0 - separatorGuard)
-      : null;
-    const left = chargedSharedSeparator ?? (containingStructuralCell
-      ? Math.min(containingStructuralCell.cellBounds.x0, estimatedHeaderLeft)
-      : estimatedHeaderLeft);
+    // A structurally detected cell owns an actual printed border. Preserve that
+    // x-coordinate exactly; header OCR is only an estimate when no ruled cell
+    // was found and must not override physical table geometry.
+    const left = containingStructuralCell
+      ? containingStructuralCell.cellBounds.x0
+      : estimatedHeaderLeft;
     const nextQualifierLeft = kind === 'actual' ? chargedHeaderQualifier?.bbox.x0 : null;
     const rightBoundary = nextQualifierLeft && nextQualifierLeft > left
       ? nextQualifierLeft - separatorGuard
@@ -2320,19 +2320,12 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
         a.word.bbox.x0 - b.word.bbox.x0);
     const oldInkWord = candidates[0];
     if (!oldInkWord) return { ...region, headerBottom };
-    const oldInkHeight = oldInkWord.word.bbox.y1 - oldInkWord.word.bbox.y0;
-    const glyphEdgePad = Math.max(2, Math.min(6, oldInkHeight * 0.2));
     return {
       ...region,
       bbox: { ...oldInkWord.word.bbox },
-      cellBounds: {
-        ...region.cellBounds,
-        x0: Math.max(0, Math.min(
-          region.cellBounds.x0,
-          oldInkWord.word.bbox.x0 - glyphEdgePad
-        )),
-        x1: Math.max(region.cellBounds.x1, oldInkWord.word.bbox.x1 + glyphEdgePad),
-      },
+      // Keep cellBounds immutable: it describes table ownership and its left
+      // edge is later used as a divider search hint. Expanding it around OCR
+      // glyphs turns an ink coordinate into a false physical rule coordinate.
       originalText: oldInkWord.text,
       ocrConfidence: Number(oldInkWord.word.confidence) || 0,
       ocrInkLocalized: true,
@@ -2420,9 +2413,40 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
         centerX < Math.min(cellRight, region.bbox.x1 + localFragmentPad) &&
         Math.abs(centerY - rowCenter) <= Math.max(5, initialHeight * 0.8);
     });
-    const editBbox = rowFragments.length
+    // Also collect non-digit prefix symbols (>, £, :, >, etc.) that OCR reads
+    // as a separate token immediately left of the numeric value on the same row
+    // and inside the same weight cell. These must be erased along with the
+    // number or they remain as orphaned artefacts after replacement.
+    const digitEditX0 = rowFragments.length
+      ? Math.min(region.bbox.x0, ...rowFragments.map((word) => word.bbox.x0))
+      : region.bbox.x0;
+    const prefixSearchWidth = Math.max(initialHeight * 1.8, initialWidth * 0.9, 20);
+    const prefixFragments = words.filter((word) => {
+      const text = String(word.text || '').trim();
+      // Accept tokens that contain no digits at all. The key cases are:
+      // "£" (currency prefix on Delhivery labels), ">" (colon-like OCR
+      // artefact), ":", "~". Mixed tokens with digits are already in
+      // rowFragments.
+      if (text.length === 0 || text.length > 4) return false;
+      if (/[a-zA-Z]{2,}/.test(text)) return false; // skip real words
+      if (/[0-9]/.test(text)) return false;         // pure digits already in rowFragments
+      const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
+      // Must be on the same row as the value
+      if (Math.abs(centerY - rowCenter) > Math.max(5, initialHeight * 0.85)) return false;
+      // Must sit immediately left of (or just touching) the numeric edit box,
+      // within the cell. Use a generous right-edge tolerance: OCR sometimes
+      // reports the £/> bbox overlapping the digit bbox by a few pixels, so
+      // the old tight check (x1 <= digitEditX0 + small_margin) excluded it.
+      return word.bbox.x1 <= digitEditX0 + Math.max(8, initialHeight * 0.7) &&
+        word.bbox.x0 >= Math.max(cellLeft, digitEditX0 - prefixSearchWidth);
+    });
+    const editBbox = (rowFragments.length || prefixFragments.length)
       ? {
-          x0: Math.min(region.bbox.x0, ...rowFragments.map((word) => word.bbox.x0)),
+          x0: Math.min(
+            region.bbox.x0,
+            ...rowFragments.map((word) => word.bbox.x0),
+            ...prefixFragments.map((word) => word.bbox.x0)
+          ),
           y0: region.bbox.y0,
           x1: Math.max(region.bbox.x1, ...rowFragments.map((word) => word.bbox.x1)),
           y1: region.bbox.y1,
@@ -2433,12 +2457,20 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     const originalTextIsReliable = /^\d{2,6}(?:\.\d{1,3})?$/.test(region.originalText) &&
       (region.ocrConfidence === undefined || region.ocrConfidence >= config.ocrMinConfidence);
     const hasLocalizedInk = Boolean(region.inkLocalized || region.ocrInkLocalized);
-    const useCellStart = Boolean(region.cellBounds) &&
-      !originalTextIsReliable && !hasLocalizedInk;
+    // Always start clearing from the cell's left edge (+ guard) when cellBounds
+    // is available, regardless of OCR reliability. The selective erase only
+    // removes detected ink pixels so it is safe to cover the full cell width;
+    // starting from editBbox.x0 left stray fragments (£, :, old digit pieces)
+    // that OCR missed or placed outside the fragment search window.
+    const useCellStart = Boolean(region.cellBounds);
     const usesTinyScanFallback = regionHeight <= 12 && !originalTextIsReliable;
     const clearBbox = buildWeightClearBbox({ ...region, bbox: editBbox }, analysis.meta, anchors);
     const clearEdgeGuard = region.cellBounds
-      ? Math.max(4, Math.min(8, regionHeight * 0.3, analysis.meta.width * 0.008))
+      // The editor traces the real divider path before erasing and clamps the
+      // clear rectangle to two pixels beyond its outer stroke. Keep only that
+      // small paper-side inset here; the former 6–10px dead strip preserved
+      // the leading strokes of old values (for example the `3` in `30.89`).
+      ? 2
       : 0;
     const textEdgeGuard = region.cellBounds
       ? Math.max(7, Math.min(12, regionHeight * 0.55, analysis.meta.width * 0.01))
@@ -2451,7 +2483,9 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
         ? region.cellBounds.x0 + clearEdgeGuard
         : Math.max(
             region.cellBounds.x0 + clearEdgeGuard,
-            editBbox.x0 - Math.max(3, Math.min(7, regionHeight * 0.55))
+            // editBbox.x0 already includes any prefix symbol (>, £, etc.) so
+            // only add a tiny anti-alias margin rather than a full glyph pad.
+            editBbox.x0 - Math.max(1, Math.min(3, regionHeight * 0.15))
           );
       clearBbox.x1 = Math.min(
         region.cellBounds.x1 - clearEdgeGuard,
@@ -2473,7 +2507,9 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     } else if (originalTextIsReliable) {
       // Clean OCR values should be fully removed, including antialiasing, but
       // without turning a neighbouring dimension number into part of the edit.
-      clearBbox.x0 = Math.max(0, editBbox.x0 - Math.max(2, Math.min(5, regionHeight * 0.28)));
+      // Do not expand leftward beyond editBbox.x0 when prefix fragments already
+      // pushed it as far left as safe; only add a small anti-alias margin.
+      clearBbox.x0 = Math.max(0, editBbox.x0 - Math.max(1, Math.min(3, regionHeight * 0.15)));
       clearBbox.x1 = Math.min(analysis.meta.width, editBbox.x1 + Math.max(3, Math.min(7, regionHeight * 0.42)));
       clearBbox.y0 = Math.max(0, editBbox.y0 - Math.max(1, Math.min(3, regionHeight * 0.16)));
       clearBbox.y1 = Math.min(analysis.meta.height, editBbox.y1 + Math.max(2, Math.min(4, regionHeight * 0.24)));
@@ -2508,7 +2544,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       styleReferenceText: usesTinyScanFallback
         ? sharedReplacementText.replace(/\d/g, '0')
         : region.originalText,
-      preferPageStyle: useCellStart || !originalTextIsReliable,
+      preferPageStyle: !originalTextIsReliable,
       // Never use a flat rectangular erase for inferred/faint values. The
       // selective inpaint path removes only detected glyph ink, preserves
       // straight and perspective-skewed rules, and copies local paper texture.

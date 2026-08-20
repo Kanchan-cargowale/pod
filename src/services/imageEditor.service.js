@@ -251,7 +251,8 @@ async function createSelectiveEraseOverlay(
   bg,
   protectOnlyEdgeRules = false,
   protectRules = true,
-  eraseAllInterior = false
+  eraseAllInterior = false,
+  protectLeftEdgeRules = true
 ) {
   const width = rect.right - rect.x;
   const height = rect.bottom - rect.y;
@@ -406,7 +407,8 @@ async function createSelectiveEraseOverlay(
     // boundary remains safe while interior old digits are erased.
     if (slantedVerticalRulePixels.has(key)) {
       if (eraseAllInterior && protectOnlyEdgeRules) {
-        return imageX <= rect.x + 1 || imageX >= rect.right - 2;
+        return (protectLeftEdgeRules && imageX <= rect.x + 1) ||
+          imageX >= rect.right - 2;
       }
       return true;
     }
@@ -416,7 +418,8 @@ async function createSelectiveEraseOverlay(
     // masquerade as an interior table rule and survive erasure.
     if (horizontalRuleRows.has(imageY)) return true;
     return !protectOnlyEdgeRules ||
-      imageX < rect.x + edgeRuleGuard || imageX >= rect.right - edgeRuleGuard;
+      (protectLeftEdgeRules && imageX < rect.x + edgeRuleGuard) ||
+      imageX >= rect.right - edgeRuleGuard;
   };
 
   const { data, info } = await image
@@ -526,7 +529,12 @@ async function createSelectiveEraseOverlay(
       }
       const localPaperLuma = luminance(replacement);
       const darkness = localPaperLuma - pixelLuma;
-      const localInkThreshold = Math.max(2, localPaperLuma * 0.018);
+      // 0.018 (≈4 luma units on white paper) was too tight to catch
+      // anti-aliased digit edges, which are typically 8-25 units darker
+      // than paper. Raise to 0.038 (≈9 units) so soft glyph edges are
+      // fully erased while faint table rules are still protected by the
+      // shouldProtectRulePixel guard above.
+      const localInkThreshold = Math.max(4, localPaperLuma * 0.038);
       const isOldInk = eraseAllInterior || darkness >= localInkThreshold;
       if (!isOldInk) continue;
 
@@ -545,8 +553,10 @@ async function createSelectiveEraseOverlay(
   // survive the primary pass on degraded scans. After the main erase, scan
   // the clear rectangle once more with a lower luma threshold and remove any
   // remaining dark pixels that are not table rules.
+  // Use a larger fraction of bgLuma (0.045 instead of 0.01) so anti-aliased
+  // glyph edges and light ink on slightly gray paper are fully caught here.
   if (erasedPixels > 0) {
-    const residualLimit = Math.max(1, bgLuma * 0.01);
+    const residualLimit = Math.max(2, bgLuma * 0.045);
     for (let y = 0; y < height; y += 1) {
       const imageY = rect.y + y;
       for (let x = 0; x < width; x += 1) {
@@ -585,8 +595,9 @@ async function createSelectiveEraseOverlay(
   // Tertiary global sweep: catch any remaining dark fragments that were
   // missed by both the primary and residual passes. This uses a very low
   // threshold and only operates on pixels that are still un-erased.
+  // Use 0.032 (up from 0.008) so faint ink on near-white paper is removed.
   if (erasedPixels > 0) {
-    const globalLimit = Math.max(1, bgLuma * 0.008);
+    const globalLimit = Math.max(1, bgLuma * 0.032);
     for (let y = 0; y < height; y += 1) {
       const imageY = rect.y + y;
       for (let x = 0; x < width; x += 1) {
@@ -628,8 +639,12 @@ async function createSelectiveEraseOverlay(
       }
     }
     for (const seed of seeds) {
-      for (let dy = -1; dy <= 1; dy += 1) {
-        for (let dx = -1; dx <= 1; dx += 1) {
+      // 2px halo: printed digits with soft edges have 2-3px of anti-aliasing
+      // outside the core stroke. A 1px expansion left a visible ghost ring on
+      // those images. 2px covers the full soft fringe without risk of touching
+      // the table rule (which is protected by shouldProtectRulePixel).
+      for (let dy = -2; dy <= 2; dy += 1) {
+        for (let dx = -2; dx <= 2; dx += 1) {
           const x = seed.x + dx;
           const y = seed.y + dy;
           if (x < 0 || x >= width || y < 0 || y >= height) continue;
@@ -642,7 +657,10 @@ async function createSelectiveEraseOverlay(
           overlay[overlayOffset] = replacement.r;
           overlay[overlayOffset + 1] = replacement.g;
           overlay[overlayOffset + 2] = replacement.b;
-          overlay[overlayOffset + 3] = 235;
+          // Use full opacity so the one-pixel halo around erased glyphs is
+          // completely covered. A partial alpha (235) left a faint ghost ring
+          // of the old number visible on pale and mid-gray scans.
+          overlay[overlayOffset + 3] = 255;
         }
       }
     }
@@ -753,7 +771,54 @@ async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, req
   }
   if (supportedRows < Math.max(10, rowCount * 0.35)) return null;
 
-  const bandRadius = Math.max(1, Math.min(2, Math.round(valueHeight * 0.08)));
+  // The old value can begin only 2–4px to the right of the divider. Inside the
+  // value row, a darkest-path trace can briefly jump from a faint rule onto
+  // that first digit and later composite it back as if it were divider ink.
+  // Anchor the crossing to uncontaminated rule pixels immediately above and
+  // below the value, then interpolate the physical path through the glyph row.
+  const valueStartIndex = Math.max(0, Math.floor(valueTop) - scanTop);
+  const valueEndIndex = Math.min(rowCount - 1, Math.ceil(valueBottom) - scanTop);
+  const isSupportedPathRow = (rowIndex) => {
+    const imageY = scanTop + rowIndex;
+    const pathLuma = gray[imageY * grayInfo.width + path[rowIndex]];
+    return rowPapers[rowIndex] - pathLuma >= Math.max(8, rowPapers[rowIndex] * 0.045);
+  };
+  const anchorDepth = Math.max(6, Math.min(verticalMargin, Math.round(valueHeight)));
+  const aboveRows = [];
+  for (let rowIndex = Math.max(0, valueStartIndex - anchorDepth);
+    rowIndex < valueStartIndex; rowIndex += 1) {
+    if (isSupportedPathRow(rowIndex)) aboveRows.push(rowIndex);
+  }
+  const belowRows = [];
+  for (let rowIndex = valueEndIndex + 1;
+    rowIndex <= Math.min(rowCount - 1, valueEndIndex + anchorDepth); rowIndex += 1) {
+    if (isSupportedPathRow(rowIndex)) belowRows.push(rowIndex);
+  }
+  const nearestAbove = aboveRows.slice(-Math.min(6, aboveRows.length));
+  const nearestBelow = belowRows.slice(0, Math.min(6, belowRows.length));
+  const makeAnchor = (rows) => rows.length ? {
+    row: medianNumber(rows),
+    x: medianNumber(rows.map((rowIndex) => path[rowIndex])),
+  } : null;
+  const aboveAnchor = makeAnchor(nearestAbove);
+  const belowAnchor = makeAnchor(nearestBelow);
+  if (aboveAnchor || belowAnchor) {
+    for (let rowIndex = valueStartIndex; rowIndex <= valueEndIndex; rowIndex += 1) {
+      if (aboveAnchor && belowAnchor && belowAnchor.row > aboveAnchor.row) {
+        const progress = (rowIndex - aboveAnchor.row) / (belowAnchor.row - aboveAnchor.row);
+        path[rowIndex] = Math.round(
+          aboveAnchor.x + (belowAnchor.x - aboveAnchor.x) * progress
+        );
+      } else {
+        path[rowIndex] = Math.round((aboveAnchor || belowAnchor).x);
+      }
+    }
+  }
+
+  // Keep the restoration band narrow — at most 1 px on either side of the
+  // traced path. A wider band risks copying adjacent old digits or background
+  // gradients as opaque dark pixels on top of the freshly inpainted paper.
+  const bandRadius = 1;
   const cropLeft = Math.max(0, Math.min(...path) - bandRadius);
   const cropRight = Math.min(grayInfo.width - 1, Math.max(...path) + bandRadius);
   const cropWidth = cropRight - cropLeft + 1;
@@ -765,7 +830,7 @@ async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, req
     .raw()
     .toBuffer({ resolveWithObject: true });
   const overlay = Buffer.alloc(cropWidth * rowCount * 4, 0);
-  let ruleXAtValue = hintX;
+  let ruleXAtValue = -Infinity;
 
   for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
     const imageY = scanTop + rowIndex;
@@ -778,23 +843,90 @@ async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, req
     // Copying those as opaque would introduce a black blob or restore old
     // digit fragments. Paint transparent wherever the pixel is paper-bright.
     const rowPaper = rowPapers[rowIndex];
-    // A pixel qualifies as rule ink when it is at least 12% darker than the
-    // local row paper OR its absolute luma is below 160 (covers faint rules
-    // on gray paper). Both guards use the grayscale channel which is already
-    // extracted and avoids a second color decode.
-    const ruleInkLimit = Math.min(rowPaper - Math.max(8, rowPaper * 0.12), 160);
+    // A pixel qualifies as rule ink when it is at least 18% darker than the
+    // local row paper AND its absolute luma is below 140. The stricter AND
+    // condition prevents near-paper background pixels (luma 150-220) from
+    // being copied opaque into the value area and producing a dark smear.
+    // The absolute cap of 140 is intentionally tight: genuine printed rules
+    // on white or off-white paper scan well below this level, while camera
+    // shadows, aging toner, and mid-gray paper all sit above it.
+    const ruleInkLimit = Math.min(rowPaper - Math.max(10, rowPaper * 0.18), 140);
     for (let imageX = centerX - bandRadius; imageX <= centerX + bandRadius; imageX += 1) {
       if (imageX < cropLeft || imageX > cropRight) continue;
       // Check grayscale darkness before copying full-color source
       const grayVal = gray[imageY * grayInfo.width + imageX];
-      if (grayVal > ruleInkLimit) continue; // not rule ink – leave transparent
       const localX = imageX - cropLeft;
-      const sourceOffset = (rowIndex * sourceInfo.width + localX) * sourceInfo.channels;
       const overlayOffset = (rowIndex * cropWidth + localX) * 4;
-      overlay[overlayOffset] = source[sourceOffset];
-      overlay[overlayOffset + 1] = source[sourceOffset + 1];
-      overlay[overlayOffset + 2] = source[sourceOffset + 2];
-      overlay[overlayOffset + 3] = 255;
+
+      const insideValueRow = imageY >= valueTop && imageY <= valueBottom;
+      let aboveColor = null;
+      let belowColor = null;
+      if (insideValueRow) {
+        // Verify this relative band column against the traced rule immediately
+        // outside the glyph row. A dark current pixel alone is insufficient:
+        // it may be the adjacent old first digit rather than divider ink.
+        const bandOffset = imageX - centerX;
+        for (let scan = 1; scan <= 6; scan += 1) {
+          const scanRowIdx = valueStartIndex - scan;
+          if (scanRowIdx < 0) break;
+          const supportX = path[scanRowIdx] + bandOffset;
+          if (supportX < cropLeft || supportX > cropRight) continue;
+          const supportPaper = rowPapers[scanRowIdx];
+          const supportLimit = Math.min(
+            supportPaper - Math.max(10, supportPaper * 0.18),
+            140
+          );
+          if (gray[(scanTop + scanRowIdx) * grayInfo.width + supportX] <= supportLimit) {
+            const supportLocalX = supportX - cropLeft;
+            const sourceOffset = (scanRowIdx * sourceInfo.width + supportLocalX) * sourceInfo.channels;
+            aboveColor = {
+              r: source[sourceOffset],
+              g: source[sourceOffset + 1],
+              b: source[sourceOffset + 2],
+            };
+            break;
+          }
+        }
+        for (let scan = 1; scan <= 6; scan += 1) {
+          const scanRowIdx = valueEndIndex + scan;
+          if (scanRowIdx >= rowCount) break;
+          const supportX = path[scanRowIdx] + bandOffset;
+          if (supportX < cropLeft || supportX > cropRight) continue;
+          const supportPaper = rowPapers[scanRowIdx];
+          const supportLimit = Math.min(
+            supportPaper - Math.max(10, supportPaper * 0.18),
+            140
+          );
+          if (gray[(scanTop + scanRowIdx) * grayInfo.width + supportX] <= supportLimit) {
+            const supportLocalX = supportX - cropLeft;
+            const sourceOffset = (scanRowIdx * sourceInfo.width + supportLocalX) * sourceInfo.channels;
+            belowColor = {
+              r: source[sourceOffset],
+              g: source[sourceOffset + 1],
+              b: source[sourceOffset + 2],
+            };
+            break;
+          }
+        }
+        if (!aboveColor || !belowColor) continue;
+      }
+
+      if (insideValueRow) {
+        // Never copy the original value-row pixel itself: even on a verified
+        // divider column it may belong to a digit touching the rule. Rebuild
+        // the continuous line only from uncontaminated colors on both sides.
+        overlay[overlayOffset] = Math.round((aboveColor.r + belowColor.r) / 2);
+        overlay[overlayOffset + 1] = Math.round((aboveColor.g + belowColor.g) / 2);
+        overlay[overlayOffset + 2] = Math.round((aboveColor.b + belowColor.b) / 2);
+        overlay[overlayOffset + 3] = 255;
+      } else if (grayVal <= ruleInkLimit) {
+        const sourceOffset = (rowIndex * sourceInfo.width + localX) * sourceInfo.channels;
+        overlay[overlayOffset] = source[sourceOffset];
+        overlay[overlayOffset + 1] = source[sourceOffset + 1];
+        overlay[overlayOffset + 2] = source[sourceOffset + 2];
+        overlay[overlayOffset + 3] = 255;
+      }
+      // Outside the value zone and too bright → leave transparent (not rule ink)
     }
   }
 
@@ -1007,7 +1139,12 @@ function shrinkClearRectAroundRules(gray, grayInfo, rect, bg) {
   let x1 = rect.right;
   const leftProbeEnd = Math.min(rect.right - 1, rect.x + BORDER_GUARD_PX);
   for (let col = Math.max(0, rect.x - BORDER_OUTSIDE_PX); col <= leftProbeEnd; col += 1) {
-    if (columnMaxRun(col) >= minVerticalRun) x0 = Math.max(x0, col + 1);
+    if (columnMaxRun(col) >= minVerticalRun) {
+      // Leave a 2px safety gap between the rule stroke and the clear rect edge.
+      // A printed rule is typically 1-3px wide; col+1 often still sits inside the
+      // rule stroke on high-res scans and gets erased. col+2 keeps us clear.
+      x0 = Math.max(x0, col + 2);
+    }
   }
   const rightProbeStart = Math.max(x0, rect.right - BORDER_GUARD_PX);
   for (let col = rightProbeStart; col <= Math.min(imgWidth - 1, rect.right + BORDER_OUTSIDE_PX); col += 1) {
@@ -1194,10 +1331,35 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // eslint-disable-next-line no-await-in-loop
     const bg = await samplePaperInsideBbox(image, meta, bbox);
 
-    // Shrink the clear rect around any printed table rule it touches, so the
-    // vertical line left of the value (and any other border) survives intact.
+    // Resolve the physical divider before constructing the erase overlay. The
+    // worker's hint may come from header geometry, but this traced path follows
+    // the real (possibly slanted) rule at the value row. The same source-pixel
+    // overlay is restored last, making this one measurement authoritative for
+    // both where cleanup starts and which divider pixels must survive.
     // eslint-disable-next-line no-await-in-loop
     const { data: gray, info: grayInfo } = await grayPixels();
+    let detectedLeftRuleX = null;
+    if (Number.isFinite(Number(leftRuleHint))) {
+      // eslint-disable-next-line no-await-in-loop
+      const restoredRule = await createVerticalRuleRestoreOverlay(
+        image,
+        meta,
+        gray,
+        grayInfo,
+        { x: Number(leftRuleHint), y0: bbox.y0, y1: bbox.y1 }
+      );
+      if (restoredRule) {
+        ruleRestoreOverlays.push(restoredRule.overlay);
+        detectedLeftRuleX = restoredRule.ruleXAtValue;
+        // Clear through the narrow traced band itself. The final continuity-
+        // checked source overlay restores only genuine divider columns, while
+        // adjacent old digit pixels are intentionally not restored.
+        rectX = Math.min(rectX, Math.floor(detectedLeftRuleX));
+      }
+    }
+
+    // Shrink the clear rect around any other printed table rule it touches, so
+    // horizontal separators and the right border survive intact as well.
     if (!skipRuleShrink) {
       const shrunk = shrinkClearRectAroundRules(
         gray,
@@ -1210,6 +1372,16 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       rectY = shrunk.y;
       rectRight = shrunk.right;
       rectBottom = shrunk.bottom;
+    }
+
+    // Never cross back over the measured divider. If tracing was unavailable,
+    // retain a conservative two-pixel paper-side floor from the supplied hint.
+    if (Number.isFinite(detectedLeftRuleX)) {
+      // The generic rule shrink sees the same divider and would recreate a
+      // 2px dead strip. The traced/restored path is authoritative here.
+      rectX = Math.max(0, Math.floor(detectedLeftRuleX));
+    } else if (Number.isFinite(Number(leftRuleHint))) {
+      rectX = Math.max(rectX, Math.floor(Number(leftRuleHint)) + 2);
     }
     const rectW = rectRight - rectX;
     const rectH = rectBottom - rectY;
@@ -1232,7 +1404,11 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         bg,
         true,
         true,
-        forceInteriorErase
+        forceInteriorErase,
+        // A successfully traced divider lies outside this rectangle and is
+        // restored from source pixels later. Do not let the old value's first
+        // connected stroke masquerade as a second rule at the left edge.
+        !Number.isFinite(detectedLeftRuleX)
       );
       if (eraseOverlay) eraseOverlays.push(eraseOverlay);
     }
@@ -1332,33 +1508,13 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       rectH,
       textBounds,
       leftRuleHint,
+      detectedLeftRuleX,
       replacementText,
       textStyle,
       fontScale,
       textLeftPaddingRatio,
       preferTextBoundsStart,
     });
-  }
-
-  // Reconstruct every proven left rule from the untouched source after the
-  // erase/text layers are prepared. This is an authoritative repair pass,
-  // independent of whether the earlier heuristic mask recognized the rule.
-  if (textOps.some((op) => Number.isFinite(Number(op.leftRuleHint)))) {
-    const { data: gray, info: grayInfo } = await grayPixels();
-    for (const op of textOps) {
-      if (!Number.isFinite(Number(op.leftRuleHint))) continue;
-      // eslint-disable-next-line no-await-in-loop
-      const restoredRule = await createVerticalRuleRestoreOverlay(
-        image,
-        meta,
-        gray,
-        grayInfo,
-        { x: op.leftRuleHint, y0: op.bbox.y0, y1: op.bbox.y1 }
-      );
-      if (!restoredRule) continue;
-      ruleRestoreOverlays.push(restoredRule.overlay);
-      op.detectedLeftRuleX = restoredRule.ruleXAtValue;
-    }
   }
 
   if (!textOps.length) {
