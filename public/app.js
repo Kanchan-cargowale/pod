@@ -92,7 +92,7 @@
     event.preventDefault();
     if (state.isDownloading || !state.currentJobId) return;
     if (!state.selectedFilenames.size) {
-      showError('Select at least one image to download.');
+      showError('Select at least one label to download.');
       return;
     }
 
@@ -225,7 +225,7 @@
     await checkHealth();
 
     if (!imagesInput.files.length || !mappingInput.files.length) {
-      showError('Choose at least one label image and one mapping workbook.');
+      showError('Choose at least one label image or PDF and one mapping workbook.');
       return;
     }
 

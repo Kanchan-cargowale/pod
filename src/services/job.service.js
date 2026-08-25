@@ -9,6 +9,7 @@ const logger = require('../utils/logger');
 const storage = require('./storage.service');
 const { zipDirectory } = require('./zip.service');
 const { WorkerPool } = require('./workerPool.service');
+const { rasterizePdf } = require('./pdfRasterizer.service');
 
 // A single shared pool serves every job; the pool itself bounds how many
 // images are OCR'd/edited in parallel regardless of how many jobs are
@@ -17,11 +18,63 @@ const pool = new WorkerPool(config.workerPoolSize);
 
 const jobs = new Map(); // jobId -> in-memory job state (mirrors the on-disk JSON)
 
-async function preserveFailedInput(filePath, outputsDir) {
-  const originalFilename = path.basename(filePath);
-  const candidate = path.join(outputsDir, originalFilename);
+async function preserveFailedInput(filePath, outputsDir, preferredFilename = path.basename(filePath)) {
+  const outputFilename = path.basename(preferredFilename);
+  const candidate = path.join(outputsDir, outputFilename);
   await fs.copyFile(filePath, candidate);
-  return originalFilename;
+  return outputFilename;
+}
+
+function isPdfPath(filePath) {
+  return path.extname(filePath).toLowerCase() === '.pdf';
+}
+
+async function prepareInputFile(filePath, index, tempUploadsDir, renderPdf = rasterizePdf) {
+  const sourceFilename = path.basename(filePath);
+  if (!isPdfPath(filePath)) {
+    return {
+      filePath,
+      sourceFilename,
+      workFilename: sourceFilename,
+      pageNumber: null,
+      pageCount: null,
+    };
+  }
+
+  const pageDirectory = path.join(
+    tempUploadsDir || path.dirname(filePath),
+    'pdf-pages',
+    String(index + 1)
+  );
+  const [page] = await renderPdf(filePath, pageDirectory);
+  if (!page) {
+    const error = new Error('PDF renderer did not return its single page');
+    error.code = 'PDF_RASTER_INCOMPLETE';
+    throw error;
+  }
+  return {
+    filePath: page.filePath,
+    sourceFilename,
+    workFilename: `pdf-${index + 1}.jpg`,
+    pageNumber: 1,
+    pageCount: 1,
+  };
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  let nextIndex = 0;
+  const runnerCount = Math.min(items.length, Math.max(1, Number(concurrency) || 1));
+  const runners = Array.from({ length: runnerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      // Each runner completes conversion + OCR before taking another file.
+      // This gives live progress without launching every Poppler process at once.
+      // eslint-disable-next-line no-await-in-loop
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
 }
 
 function newJobState(jobId, totalFiles) {
@@ -87,22 +140,53 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
 
   const outputsDir = storage.jobOutputsDir(jobId);
 
-  const tasks = imagePaths.map((filePath) => {
-    const filename = path.basename(filePath);
+  await runWithConcurrency(imagePaths, config.workerPoolSize, async (inputPath, index) => {
+    let item;
+    try {
+      item = await prepareInputFile(inputPath, index, tempUploadsDir);
+    } catch (error) {
+      const sourceFilename = path.basename(inputPath);
+      const result = {
+        originalFilename: sourceFilename,
+        filename: sourceFilename,
+        sourceType: 'pdf',
+        sourcePageNumber: 1,
+        sourcePageCount: 1,
+        status: 'error',
+        errorCode: error.code || 'pdf_rasterization_failed',
+        reason: error.message,
+        downloadable: false,
+      };
+      state.processedFiles += 1;
+      state.unmatchedFiles += 1;
+      state.results.push(result);
+      state.updatedAt = new Date().toISOString();
+      await persist(state);
+      return;
+    }
+
+    const { filePath, sourceFilename, workFilename, pageNumber, pageCount } = item;
+    const filename = path.basename(workFilename || filePath);
     const outputPath = path.join(outputsDir, filename);
 
-    return pool
+    const result = await pool
       .run({ filePath, outputPath, idWeightMap })
       .then((result) => ({
-        originalFilename: filename,
+        originalFilename: sourceFilename,
+        sourceType: pageNumber ? 'pdf' : 'image',
+        sourcePageNumber: pageNumber,
+        sourcePageCount: pageCount,
         filename: result.outputFilename || filename,
         ...result,
       }))
       .catch(async (err) => {
         if (err.code === 'ETASKTIMEOUT') {
-          const outputFilename = await preserveFailedInput(filePath, outputsDir);
+          const outputFilename = await preserveFailedInput(filePath, outputsDir, filename);
           return {
-            originalFilename: filename,
+            originalFilename: sourceFilename,
+            sourceType: pageNumber ? 'pdf' : 'image',
+            sourcePageNumber: pageNumber,
+            sourcePageCount: pageCount,
             filename: outputFilename,
             outputFilename,
             status: 'error',
@@ -122,14 +206,20 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
             preserveReason: err.message,
           });
           return {
-            originalFilename: filename,
+            originalFilename: sourceFilename,
+            sourceType: pageNumber ? 'pdf' : 'image',
+            sourcePageNumber: pageNumber,
+            sourcePageCount: pageCount,
             filename: recovered.outputFilename || filename,
             ...recovered,
           };
         } catch (scanErr) {
-          const outputFilename = await preserveFailedInput(filePath, outputsDir);
+          const outputFilename = await preserveFailedInput(filePath, outputsDir, filename);
           return {
-            originalFilename: filename,
+            originalFilename: sourceFilename,
+            sourceType: pageNumber ? 'pdf' : 'image',
+            sourcePageNumber: pageNumber,
+            sourcePageCount: pageCount,
             filename: outputFilename,
             outputFilename,
             status: 'error',
@@ -137,19 +227,15 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
             downloadable: true,
           };
         }
-      })
-      .then(async (result) => {
-        state.processedFiles += 1;
-        if (result.status === 'ok') state.matchedFiles += 1;
-        else state.unmatchedFiles += 1;
-        state.results.push(result);
-        state.updatedAt = new Date().toISOString();
-        await persist(state);
-        return result;
       });
-  });
 
-  await Promise.all(tasks);
+    state.processedFiles += 1;
+    if (result.status === 'ok') state.matchedFiles += 1;
+    else state.unmatchedFiles += 1;
+    state.results.push(result);
+    state.updatedAt = new Date().toISOString();
+    await persist(state);
+  });
 
   const zipPath = storage.jobZipFile(jobId);
   await zipDirectory(outputsDir, zipPath);
@@ -190,4 +276,14 @@ async function shutdown() {
   await pool.shutdown();
 }
 
-module.exports = { createJob, getJob, getZipPath, getSelectedZipPath, getOutputsDir, shutdown, _pool: pool };
+module.exports = {
+  createJob,
+  getJob,
+  getZipPath,
+  getSelectedZipPath,
+  getOutputsDir,
+  shutdown,
+  prepareInputFile,
+  runWithConcurrency,
+  _pool: pool,
+};

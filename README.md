@@ -1,6 +1,6 @@
 # Courier Label Editor
 
-Bulk courier/POD label weight editor. Upload a batch of JPG/PNG shipment
+Bulk courier/POD label weight editor. Upload a batch of JPG/PNG/PDF shipment
 labels plus an Excel mapping of `Shipment ID -> New Weight`, and get back a
 ZIP where each label has had its printed weight value(s) replaced —
 pixel-for-pixel identical everywhere else — with the new weight from the
@@ -13,11 +13,14 @@ real files, not mocks.
 
 ## How it works
 
-1. **Upload** — `POST /api/jobs` with `images` (one or more JPG/PNG files)
+1. **Upload** — `POST /api/jobs` with `images` (one or more JPG/PNG/PDF files)
    and `mapping` (an `.xlsx` with `ID` and `Weight` columns).
-2. **OCR** — each image is run through Tesseract.js (a real, local OCR
+2. **Rasterize PDFs** — each single-page PDF is rendered directly to a
+   high-quality 200-DPI JPEG using Poppler, normalized to landscape when the
+   scan is sideways, then enters the exact same image pipeline.
+3. **OCR** — each image is run through Tesseract.js (a real, local OCR
    engine — no cloud calls), producing word-level text + bounding boxes.
-3. **Match** — `src/services/labelMatcher.service.js`:
+4. **Match** — `src/services/labelMatcher.service.js`:
    - Finds which shipment ID (from the mapping) is printed on the label,
      via exact match with a bounded-Levenshtein fuzzy fallback for OCR
      misreads.
@@ -27,7 +30,7 @@ real files, not mocks.
      column. This is anchor-based and generalizes across labels where a
      "weight" header sits above its value, rather than hard-coding pixel
      coordinates for one template.
-4. **Edit** — `src/services/imageEditor.service.js` uses Sharp to:
+5. **Edit** — `src/services/imageEditor.service.js` uses Sharp to:
    - Sample the real local background color around each matched value box
      (not just assume white), ignoring any table rule crossing the sample.
    - Shrink the clearing rectangle around detected table rules so printed
@@ -38,12 +41,12 @@ real files, not mocks.
      so the replacement matches the image's typography even when the
      original value is faint or blurred, leaving every other pixel
      byte-identical.
-5. **Scale** — each image is OCR'd + edited inside a dedicated
+6. **Scale** — each image is OCR'd + edited inside a dedicated
    `worker_threads` worker (`src/workers/imageProcessor.worker.js`), pooled
    by `src/services/workerPool.service.js`, so hundreds of labels are
    processed truly in parallel across CPU cores, not just interleaved on
    one event loop.
-6. **Deliver** — once every image in the batch is processed, the outputs
+7. **Deliver** — once every image in the batch is processed, the outputs
    directory is zipped (`archiver`) and made available at
    `GET /api/jobs/:id/download`.
 
@@ -112,6 +115,10 @@ If you'd rather drive it without a browser, see the API section below.
 docker compose up --build
 ```
 
+The Docker image includes Poppler for PDF support. For a local installation,
+install Poppler and ensure `pdftoppm` is on `PATH`. On Windows, you can instead
+set `PDFTOPPM_PATH` to the full path of `pdftoppm.exe`.
+
 ## API
 
 ### `POST /api/jobs`
@@ -120,7 +127,7 @@ docker compose up --build
 
 | field     | type          | required | notes                                   |
 |-----------|---------------|----------|------------------------------------------|
-| `images`  | file[]        | yes      | JPG/PNG, up to `MAX_FILES_PER_JOB`       |
+| `images`  | file[]        | yes      | JPG/PNG/PDF, up to `MAX_FILES_PER_JOB`   |
 | `mapping` | file          | yes      | `.xlsx` with `ID` and `Weight` columns   |
 
 Response `202`:
@@ -175,6 +182,7 @@ be located — flagged for manual review), or `error`.
 
 Streams a single edited label image inline (used by the web UI to show
 each result as it finishes). Only available for files with `status: "ok"`.
+The single PDF page is returned as a JPEG preview and JPEG file in the result ZIP.
 
 ### `GET /api/jobs/:id/download`
 
@@ -191,6 +199,11 @@ See `.env.example`. Key knobs:
 - `MATCH_VERTICAL_WINDOW_RATIO` / `MATCH_HORIZONTAL_TOLERANCE_PX` — tune
   these if a carrier's template places the weight value unusually far from
   its header.
+- `PDFTOPPM_PATH` — Poppler executable name or absolute path used to rasterize
+  single-page PDFs.
+- `PDF_RASTER_DENSITY` — PDF render resolution in DPI (default `200`).
+- `PDF_RASTER_JPEG_QUALITY` — fast intermediate JPEG quality (default `95`).
+- `PDF_RASTER_TIMEOUT_MS` — timeout for rendering one PDF.
 
 ## OCR language data
 

@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..', '..');
+const configuredPdftoppmPath = process.env.PDFTOPPM_PATH || 'pdftoppm';
 
 module.exports = {
   port: Number(process.env.PORT || 3000),
@@ -27,6 +28,12 @@ module.exports = {
   imageProcessingTimeoutMs: Number(process.env.IMAGE_PROCESSING_TIMEOUT_MS || 180000),
   maxConcurrentUploads: Number(process.env.MAX_FILES_PER_JOB || 1000),
   maxUploadFileSizeMb: Number(process.env.MAX_UPLOAD_FILE_SIZE_MB || 25),
+
+  // PDF input rasterization (Poppler)
+  pdftoppmPath: configuredPdftoppmPath,
+  pdfRasterDensity: Number(process.env.PDF_RASTER_DENSITY || 200),
+  pdfRasterJpegQuality: Number(process.env.PDF_RASTER_JPEG_QUALITY || 95),
+  pdfRasterTimeoutMs: Number(process.env.PDF_RASTER_TIMEOUT_MS || 120000),
 
   // Matching heuristics (see services/labelMatcher.service.js)
   matching: {

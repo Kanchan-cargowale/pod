@@ -11,7 +11,7 @@ async function createJob(req, res) {
   const mappingFile = req.files?.mapping?.[0];
 
   if (!images.length) {
-    return res.status(400).json({ error: 'At least one image (field "images") is required' });
+    return res.status(400).json({ error: 'At least one label image or PDF (field "images") is required' });
   }
   if (!mappingFile) {
     return res.status(400).json({ error: 'A mapping workbook (field "mapping") is required' });

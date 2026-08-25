@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips-dev \
     fontconfig \
     fonts-dejavu-core \
+    poppler-utils \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

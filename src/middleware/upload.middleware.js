@@ -6,8 +6,8 @@ const { randomUUID } = require('crypto');
 const multer = require('multer');
 const config = require('../config');
 
-const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png']);
-const ALLOWED_IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png']);
+const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'application/pdf']);
+const ALLOWED_IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.pdf']);
 const ALLOWED_MAPPING_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.ms-excel',
@@ -41,7 +41,7 @@ function fileFilter(req, file, cb) {
     const okByMime = ALLOWED_IMAGE_TYPES.has(file.mimetype);
     const okByExt = ALLOWED_IMAGE_EXTS.has(ext);
     if (!okByMime && !okByExt) {
-      return cb(new Error(`Unsupported image type: ${file.originalname} (only JPG/PNG allowed)`));
+      return cb(new Error(`Unsupported label type: ${file.originalname} (only JPG/PNG/PDF allowed)`));
     }
   } else if (file.fieldname === 'mapping') {
     const okByMime = ALLOWED_MAPPING_TYPES.has(file.mimetype);
