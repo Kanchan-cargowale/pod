@@ -7,6 +7,9 @@ const {
   inferSiblingFromAnchors,
   inferSiblingFromTableRules,
   inferWeightRegionsFromAnchors,
+  inferSingleWeightRegionFromAnchor,
+  isRegionWithinWeightValueBand,
+  reconcileHeaderOwnedWeightRegions,
   inferWeightRegionsFromTable,
 } = require('../../src/services/weightRegionFallback.service');
 
@@ -312,5 +315,96 @@ describe('weightRegionFallback.service', () => {
 
     expect(inferred).toHaveLength(1);
     expect(inferred[0].kind).toBe('actual');
+  });
+
+  it('does not mistake signature-row ink for a missing weight value', async () => {
+    const image = Buffer.from(
+      '<svg width="800" height="700" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect width="800" height="700" fill="white" />' +
+        '<path d="M200 190V660 M350 190V660" stroke="black" stroke-width="2" />' +
+        '<text x="225" y="620" font-size="22" fill="black">SHIPPER SIGN</text>' +
+        '</svg>'
+    );
+    const anchors = [{
+      bbox: { x0: 220, y0: 235, x1: 330, y1: 270 },
+      words: [{ text: 'ACTUAL WEIGHT' }],
+    }];
+
+    const regions = await inferSingleWeightRegionFromAnchor(
+      image,
+      anchors,
+      [],
+      { width: 800, height: 700 }
+    );
+
+    expect(regions).toHaveLength(1);
+    expect(regions[0].bbox.y0).toBeGreaterThan(anchors[0].bbox.y1);
+    expect(regions[0].bbox.y1).toBeLessThan(350);
+  });
+
+  it('rejects any final fallback region that drifts into the signature row', () => {
+    const anchors = [
+      { bbox: { x0: 210, y0: 330, x1: 330, y1: 365 } },
+      // False OCR anchor closer in x, but located in the signature section.
+      { bbox: { x0: 335, y0: 590, x1: 390, y1: 612 } },
+    ];
+    const meta = { width: 1080, height: 768 };
+
+    expect(isRegionWithinWeightValueBand(
+      { bbox: { x0: 220, y0: 385, x1: 275, y1: 400 } },
+      anchors,
+      meta
+    )).toBe(true);
+    expect(isRegionWithinWeightValueBand(
+      { bbox: { x0: 338, y0: 616, x1: 384, y1: 623 } },
+      anchors,
+      meta
+    )).toBe(false);
+  });
+
+  it('snaps CHARGED back from SAID TO CONTAIN and preserves both header-owned fields', () => {
+    const words = [
+      { text: 'ACTUAL', confidence: 90, bbox: { x0: 235, y0: 312, x1: 284, y1: 321 } },
+      { text: 'CHARGED', confidence: 90, bbox: { x0: 354, y0: 315, x1: 414, y1: 324 } },
+      { text: 'CONTAIN', confidence: 75, bbox: { x0: 474, y0: 331, x1: 529, y1: 343 } },
+      { text: '60.00', confidence: 93, bbox: { x0: 236, y0: 345, x1: 270, y1: 375 } },
+      { text: '45.85', confidence: 67, bbox: { x0: 353, y0: 359, x1: 389, y1: 368 } },
+      { text: 'EMAN', confidence: 20, bbox: { x0: 469, y0: 360, x1: 511, y1: 371 } },
+    ];
+    const reconciled = reconcileHeaderOwnedWeightRegions([
+      {
+        kind: 'actual',
+        bbox: { x0: 236, y0: 345, x1: 270, y1: 375 },
+        originalText: '60.00',
+      },
+      {
+        kind: 'charged',
+        bbox: { x0: 467, y0: 358, x1: 478, y1: 369 },
+        originalText: '45.85',
+      },
+    ], words, { width: 1118, height: 787 });
+
+    expect(reconciled).toHaveLength(2);
+    expect(reconciled[0].kind).toBe('actual');
+    expect(reconciled[1].kind).toBe('charged');
+    expect(reconciled[1].bbox).toEqual(words[4].bbox);
+    expect(reconciled[1].cellBounds.x0).toBeGreaterThan(340);
+    expect(reconciled[1].cellBounds.x1).toBeLessThan(474);
+  });
+
+  it('recreates a missing CHARGED region when both qualifiers prove the schema', () => {
+    const words = [
+      { text: 'ACTUAL', confidence: 90, bbox: { x0: 300, y0: 300, x1: 350, y1: 314 } },
+      { text: 'CHARGED', confidence: 90, bbox: { x0: 410, y0: 300, x1: 475, y1: 314 } },
+      { text: 'SAID', confidence: 90, bbox: { x0: 520, y0: 300, x1: 555, y1: 314 } },
+      { text: '90.00', confidence: 90, bbox: { x0: 305, y0: 338, x1: 345, y1: 352 } },
+      { text: '61.56', confidence: 80, bbox: { x0: 415, y0: 339, x1: 455, y1: 353 } },
+    ];
+    const reconciled = reconcileHeaderOwnedWeightRegions([
+      { kind: 'actual', bbox: words[3].bbox, originalText: '90.00' },
+    ], words, { width: 1100, height: 780 });
+
+    expect(reconciled.map((region) => region.kind)).toEqual(['actual', 'charged']);
+    expect(reconciled[1].bbox).toEqual(words[4].bbox);
   });
 });

@@ -1012,8 +1012,10 @@ async function inferSingleWeightRegionFromAnchor(imageInput, anchors, words, met
     anchor.bbox.y1
   );
   const minimumValueGap = Math.max(12, info.height * 0.02);
+  const maximumValueGap = Math.max(60, info.height * 0.12);
   const cluster = clusters.find((candidate) =>
-    candidate.top - anchor.bbox.y1 >= minimumValueGap
+    candidate.top - anchor.bbox.y1 >= minimumValueGap &&
+    candidate.top - anchor.bbox.y1 <= maximumValueGap
   ) || null;
   const fallbackBbox = {
     x0: Math.round(leftBorder.x + cellWidth * 0.045),
@@ -1045,6 +1047,131 @@ async function inferSingleWeightRegionFromAnchor(imageInput, anchors, words, met
     anchorText: 'structural ACTUAL WEIGHT',
     kind: 'actual',
   }];
+}
+
+function isRegionWithinWeightValueBand(region, anchors, meta) {
+  if (!region?.bbox || !anchors?.length || !meta?.height || !meta?.width) return false;
+  const regionCenterX = (region.bbox.x0 + region.bbox.x1) / 2;
+  const anchor = [...anchors]
+    .filter((candidate) => {
+      if (!candidate?.bbox) return false;
+      const centerY = (candidate.bbox.y0 + candidate.bbox.y1) / 2;
+      // Real ACTUAL/CHARGED headers sit in the upper table. OCR fragments in
+      // signature/footer rows must never authorize a destructive edit.
+      return centerY >= meta.height * 0.2 && centerY <= meta.height * 0.58;
+    })
+    .sort((a, b) => {
+      const aCenterX = (a.bbox.x0 + a.bbox.x1) / 2;
+      const bCenterX = (b.bbox.x0 + b.bbox.x1) / 2;
+      return Math.abs(aCenterX - regionCenterX) - Math.abs(bCenterX - regionCenterX);
+    })[0];
+  if (!anchor) return false;
+  const anchorCenterX = (anchor.bbox.x0 + anchor.bbox.x1) / 2;
+  if (Math.abs(anchorCenterX - regionCenterX) > meta.width * 0.18) return false;
+
+  const gap = region.bbox.y0 - anchor.bbox.y1;
+  return gap >= -meta.height * 0.01 && gap <= Math.max(60, meta.height * 0.12);
+}
+
+/**
+ * Reassert ACTUAL/CHARGED ownership after pixel localization. A faint value
+ * row can make the first ink cluster in CHARGED look like product text in the
+ * following SAID TO CONTAIN cell. Explicit qualifiers are authoritative: they
+ * define both cell boundaries and can recover a sibling that a later scan
+ * refinement accidentally dropped.
+ */
+function reconcileHeaderOwnedWeightRegions(regions, words, meta) {
+  if (!Array.isArray(regions) || !Array.isArray(words) || !meta?.width || !meta?.height) {
+    return regions || [];
+  }
+  const normalized = (text) => String(text || '').replace(/[^a-z]/gi, '').toLowerCase();
+  const actualWords = words.filter((word) => /^(?:actual|ctual)$/.test(normalized(word.text)));
+  const chargedWords = words.filter((word) =>
+    /^(?:charged|chargeable|chargd|chargeq|charget|cherged)$/.test(normalized(word.text))
+  );
+  const actual = [...actualWords].sort((a, b) => b.confidence - a.confidence)[0];
+  const charged = chargedWords
+    .filter((word) => !actual || word.bbox.x0 > actual.bbox.x0)
+    .sort((a, b) => b.confidence - a.confidence)[0];
+  if (!actual || !charged) return regions;
+
+  const columnStep = charged.bbox.x0 - actual.bbox.x0;
+  if (columnStep < meta.width * 0.055 || columnStep > meta.width * 0.18) return regions;
+
+  const separator = charged.bbox.x0 - Math.max(2, meta.width * 0.003);
+  const saidLeft = words
+    .filter((word) => /^(?:said|sain|contain|comtain)$/.test(normalized(word.text)))
+    .filter((word) => word.bbox.x0 > charged.bbox.x0)
+    .sort((a, b) => a.bbox.x0 - b.bbox.x0)[0]?.bbox.x0;
+  const actualLeft = Math.max(0, actual.bbox.x0 - Math.max(3, meta.width * 0.008));
+  const chargedRight = Number.isFinite(saidLeft) && saidLeft > separator
+    ? saidLeft - Math.max(2, meta.width * 0.003)
+    : separator + columnStep;
+  if (separator <= actualLeft || chargedRight <= separator) return regions;
+
+  const headerBottom = Math.max(actual.bbox.y1, charged.bbox.y1);
+  const numericWords = words
+    .map((word) => {
+      const match = String(word.text || '').match(/\d{1,6}(?:[.,]\d{1,3})/);
+      return match ? { word, text: match[0].replace(',', '.') } : null;
+    })
+    .filter(Boolean)
+    .filter(({ word }) => word.bbox.y0 >= headerBottom + 2 &&
+      word.bbox.y0 <= headerBottom + meta.height * 0.12);
+  const input = [...regions];
+  const regionCenterX = (region) => (region.bbox.x0 + region.bbox.x1) / 2;
+  const sourceFor = (kind, qualifier) => input
+    .filter((region) => region?.bbox)
+    .sort((a, b) => {
+      const aKind = a.kind === kind ? 0 : 1;
+      const bKind = b.kind === kind ? 0 : 1;
+      return aKind - bKind ||
+        Math.abs(regionCenterX(a) - qualifier.bbox.x0) -
+        Math.abs(regionCenterX(b) - qualifier.bbox.x0);
+    })[0];
+  const build = (kind, qualifier, left, right, fallbackShift) => {
+    const source = sourceFor(kind, qualifier);
+    const candidate = numericWords
+      .filter(({ word }) => {
+        const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
+        return centerX > left && centerX < right;
+      })
+      .sort((a, b) =>
+        Math.abs(a.word.bbox.x0 - qualifier.bbox.x0) -
+        Math.abs(b.word.bbox.x0 - qualifier.bbox.x0) ||
+        a.word.bbox.y0 - b.word.bbox.y0
+      )[0];
+    const sourceIsInside = source && regionCenterX(source) > left && regionCenterX(source) < right;
+    const sourceNearQualifier = sourceIsInside &&
+      Math.abs(source.bbox.x0 - qualifier.bbox.x0) <= Math.max(8, meta.width * 0.035);
+    const bbox = candidate
+      ? { ...candidate.word.bbox }
+      : sourceNearQualifier
+        ? { ...source.bbox }
+        : source
+          ? {
+              x0: source.bbox.x0 + fallbackShift,
+              y0: source.bbox.y0,
+              x1: source.bbox.x1 + fallbackShift,
+              y1: source.bbox.y1,
+            }
+          : null;
+    if (!bbox) return null;
+    return {
+      ...(source || {}),
+      bbox,
+      cellBounds: { x0: left, x1: right },
+      originalText: candidate?.text || (sourceNearQualifier ? source.originalText : ''),
+      ocrConfidence: candidate ? Number(candidate.word.confidence) || 0 : source?.ocrConfidence,
+      anchorText: `final header-owned ${kind.toUpperCase()} WEIGHT value`,
+      kind,
+      anchorBbox: { ...qualifier.bbox },
+    };
+  };
+
+  const actualRegion = build('actual', actual, actualLeft, separator, -columnStep);
+  const chargedRegion = build('charged', charged, separator, chargedRight, columnStep);
+  return actualRegion && chargedRegion ? [actualRegion, chargedRegion] : regions;
 }
 
 /**
@@ -1215,6 +1342,8 @@ module.exports = {
   inferSiblingFromTableRules,
   inferWeightRegionsFromAnchors,
   inferSingleWeightRegionFromAnchor,
+  isRegionWithinWeightValueBand,
+  reconcileHeaderOwnedWeightRegions,
   inferWeightRegionsFromTable,
   localizeWeightInkInCells,
 };

@@ -12,10 +12,22 @@ const MAX_PAGE_STYLE_REFERENCES = 40; // sibling numbers sampled per value
 const PAGE_STYLE_HEIGHT_RATIO_MIN = 0.45; // ignore much smaller page text
 const PAGE_STYLE_HEIGHT_RATIO_MAX = 2.4; // ignore much larger page text (e.g. barcode IDs)
 const PAGE_STYLE_SIZE_DEVIATION = 0.45; // trust own ink unless it disagrees wildly
+const STYLE_SIZE_OUTLIER_RATIO = 0.3; // reject malformed OCR boxes before style consensus
 // 306601375 establishes the desired visual scale: roughly 8-12px on a
 // 1024px-wide label. Scale with source resolution, never with a tall/skewed
 // OCR rectangle alone.
-const MAX_WEIGHT_FONT_WIDTH_RATIO = 0.012;
+const MIN_WEIGHT_FONT_WIDTH_RATIO = 0.0105;
+const MAX_WEIGHT_FONT_WIDTH_RATIO = 0.011;
+// Candidate optical strokes used to calibrate SVG text against native pixels.
+const CALIBRATION_STROKE_RATIOS = [0, 0.025, 0.045, 0.065];
+// Delhivery body values always retain some print gain. A plain 400 SVG face
+// looks visibly thinner than the surrounding scan even when its raw pixel
+// density scores well, so regular candidates receive a medium optical floor.
+const MIN_BODY_OPTICAL_STROKE_RATIO = 0.065;
+const MIN_BOLD_BODY_OPTICAL_STROKE_RATIO = 0.025;
+const MAX_BODY_OPTICAL_STROKE_RATIO = 0.085;
+const MIN_LOCKED_WEIGHT_STROKE_PX = 0.2;
+const MAX_LOCKED_WEIGHT_STROKE_PX = 1.35;
 const DEFAULT_TEXT_STYLE = {
   fontFamily: 'Arial, Helvetica, sans-serif',
   fontWeight: 400,
@@ -126,6 +138,95 @@ function luminance({ r, g, b }) {
   return r * 0.2126 + g * 0.7152 + b * 0.0722;
 }
 
+function compensateRasterizedInk(
+  fillRgb,
+  paperRgb,
+  fontSize,
+  fontWeight,
+  blurred,
+  measuredCoverage = null
+) {
+  if (!fillRgb || !paperRgb) return fillRgb || { r: 0, g: 0, b: 0 };
+  // Bold glyphs at label sizes already contain opaque core pixels, so their
+  // sampled body-value color should be used directly. Compensating them made
+  // replacements 15-25 luma levels darker than neighbouring box values.
+  if (fontWeight >= 700 && !Number.isFinite(measuredCoverage)) return fillRgb;
+  // Small regular glyphs rarely contain a fully opaque pixel after SVG
+  // antialiasing (and the optional scan blur). Darken the paint just enough
+  // for the rendered core to land on the sampled source-ink tone.
+  const estimatedCoverage = Number.isFinite(measuredCoverage)
+    ? Math.max(0.35, Math.min(1, measuredCoverage))
+    : Math.max(0.55, Math.min(1, 0.43 + fontSize * 0.035 - (blurred ? 0.06 : 0)));
+  if (estimatedCoverage >= 0.98) return fillRgb;
+
+  const compensate = (ink, paper) => Math.max(
+    0,
+    Math.min(255, Math.round(paper - (paper - ink) / estimatedCoverage))
+  );
+  return {
+    r: compensate(fillRgb.r, paperRgb.r),
+    g: compensate(fillRgb.g, paperRgb.g),
+    b: compensate(fillRgb.b, paperRgb.b),
+  };
+}
+
+function calculateLockedStrokeWidth(
+  fontSize,
+  fontWeight,
+  lockedBodyTypography,
+  opticalStrokeRatio = 0
+) {
+  if (
+    !lockedBodyTypography ||
+    fontWeight < 400 ||
+    !Number.isFinite(fontSize) ||
+    !Number.isFinite(opticalStrokeRatio) ||
+    opticalStrokeRatio <= 0
+  ) return 0;
+  return Math.max(
+    MIN_LOCKED_WEIGHT_STROKE_PX,
+    Math.min(MAX_LOCKED_WEIGHT_STROKE_PX, fontSize * opticalStrokeRatio)
+  );
+}
+
+function calculateBodyFontLimits(pageWidth, measuredBodyFontSize = null) {
+  const width = Math.max(1, Number(pageWidth) || 1);
+  const canvasFloor = Math.max(7, Math.min(12, width * MIN_WEIGHT_FONT_WIDTH_RATIO));
+  const canvasCap = Math.max(canvasFloor, width * MAX_WEIGHT_FONT_WIDTH_RATIO);
+  if (Number.isFinite(Number(measuredBodyFontSize)) && Number(measuredBodyFontSize) > 0) {
+    // The photograph can contain large white margins, so page width is not a
+    // reliable lower bound. Keep the rendered value close to the native body
+    // specimen and use the canvas ratio only as an absolute upper guard.
+    const specimenSize = Math.max(6, Math.min(Number(measuredBodyFontSize), canvasCap));
+    const floor = Math.max(6, specimenSize * 0.9);
+    return {
+      floor,
+      cap: Math.max(floor, Math.min(canvasCap, specimenSize * 1.03)),
+    };
+  }
+  return {
+    floor: canvasFloor,
+    // This is a hard safety ceiling, not a fixed size. Dynamic matching stays
+    // active below it, while malformed OCR/reference boxes can no longer make
+    // a body value visibly larger than the surrounding printed values.
+    cap: canvasCap,
+  };
+}
+
+function resolveBodyOpticalStrokeRatio(fontWeight, opticalStrokeRatio = 0) {
+  const measured = Number.isFinite(Number(opticalStrokeRatio))
+    ? Number(opticalStrokeRatio)
+    : 0;
+  const floor = Number(fontWeight) >= 700
+    ? MIN_BOLD_BODY_OPTICAL_STROKE_RATIO
+    : MIN_BODY_OPTICAL_STROKE_RATIO;
+  return Math.max(floor, Math.min(MAX_BODY_OPTICAL_STROKE_RATIO, measured));
+}
+
+function hasNumericFontWeightOverride(value) {
+  return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+}
+
 function percentile(values, ratio) {
   if (!values.length) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -217,7 +318,17 @@ function mergeUniformTextStyle(styles) {
   if (!usable.length) return null;
   if (usable.length === 1) return { ...usable[0] };
 
-  const fillRgbs = usable.map((style) => style.fillRgb).filter(Boolean);
+  const measuredSizes = usable.map((style) => style.fontSize).filter(Number.isFinite);
+  const medianSize = medianNumber(measuredSizes);
+  const sizeTolerance = Math.max(1.5, medianSize * STYLE_SIZE_OUTLIER_RATIO);
+  const consensus = usable.filter(
+    (style) => !Number.isFinite(style.fontSize) || Math.abs(style.fontSize - medianSize) <= sizeTolerance
+  );
+  const selected = consensus.length ? consensus : usable;
+  const rasterInkCoverages = selected
+    .map((style) => style.rasterInkCoverage)
+    .filter(Number.isFinite);
+  const fillRgbs = selected.map((style) => style.fillRgb).filter(Boolean);
   const fillRgb = fillRgbs.length
     ? {
         r: medianChannel(fillRgbs, 'r'),
@@ -228,14 +339,28 @@ function mergeUniformTextStyle(styles) {
 
   return {
     fontFamily: mostCommon(
-      usable.map((style) => style.fontFamily),
+      selected.map((style) => style.fontFamily),
       DEFAULT_TEXT_STYLE.fontFamily
     ),
-    fontWeight: mostCommon(
-      usable.map((style) => style.fontWeight || 400),
-      400
+    // Be conservative on noisy scans: one thick/blurred specimen must not
+    // turn an otherwise regular body row bold.
+    fontWeight: medianNumber(selected.map((style) => style.fontWeight || 400)) >= 600
+      ? 700
+      : 400,
+    fontSize: Math.max(8, medianNumber(selected.map((style) => style.fontSize).filter(Boolean))),
+    strokeDensity: medianNumber(
+      selected.map((style) => style.strokeDensity).filter(Number.isFinite)
     ),
-    fontSize: Math.max(8, medianNumber(usable.map((style) => style.fontSize).filter(Boolean))),
+    normalizedStrokeThickness: medianNumber(
+      selected.map((style) => style.normalizedStrokeThickness).filter(Number.isFinite)
+    ),
+    characterAspect: medianNumber(
+      selected.map((style) => style.characterAspect).filter(Number.isFinite)
+    ),
+    opticalStrokeRatio: medianNumber(
+      selected.map((style) => style.opticalStrokeRatio).filter(Number.isFinite)
+    ),
+    rasterInkCoverage: rasterInkCoverages.length ? medianNumber(rasterInkCoverages) : null,
     fillRgb,
     fillLuma: luminance(fillRgb),
     fill: rgbToCss(fillRgb),
@@ -947,9 +1072,13 @@ function estimateFontFamily(inkWidth, inkHeight, strokeThickness, originalText) 
   const characterAspect = inkWidth / Math.max(1, inkHeight * characterCount);
   const strokeRatio = strokeThickness / Math.max(1, inkHeight);
 
-  if (strokeRatio > 0.16 && characterAspect > 0.5) return 'Arial Black, Arial, sans-serif';
+  // Stroke thickness belongs in font-weight, not font-family. Camera blur and
+  // low-resolution scans commonly make regular Arial look thick; selecting
+  // Arial Black here doubled that error in the rendered replacement.
   if (characterAspect < 0.42) return 'Arial Narrow, Arial, sans-serif';
-  if (characterAspect > 0.82) return 'Courier New, monospace';
+  // Wide dimension tokens contain several full-width "x" glyphs and often
+  // produce loose OCR boxes. That is not evidence of a monospace face; these
+  // POD body rows use Arial-family print, and Courier made values look thin.
   return DEFAULT_TEXT_STYLE.fontFamily;
 }
 
@@ -1074,17 +1203,47 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
       b: medianChannel(colorPixels, 'b'),
     };
     const fill = rgbToCss(fillRgb);
+    const inkCoverage = Math.max(
+      0,
+      Math.min(1, (localBackground - luminance(fillRgb)) / Math.max(1, localBackground))
+    );
 
     const inkArea = Math.max(1, inkWidth * inkHeight);
     const strokeDensity = inkPixels.length / inkArea;
     const strokeThickness = estimateStrokeThickness(inkPixels, info.width, info.height);
-    const fontWeight = strokeDensity >= 0.22 || strokeThickness >= 2.2 ? 700 : 400;
+    const normalizedStrokeThickness = strokeThickness / Math.max(1, inkHeight);
+    const characterAspect = inkWidth /
+      Math.max(1, inkHeight * Math.max(1, String(originalText).replace(/\s/g, '').length));
+    // Bold requires both broad coverage and thick strokes. The previous OR
+    // condition classified nearly every blurred 9-12px body value as bold.
+    const densityThreshold = 0.42 + Math.max(0, 14 - inkHeight) * 0.1;
+    const fontWeight = strokeDensity >= densityThreshold && normalizedStrokeThickness >= 0.08
+      ? 700
+      : 400;
     const fontFamily = estimateFontFamily(inkWidth, inkHeight, strokeThickness, originalText);
     const widthBasedSize = inkWidth / numericAdvanceUnits(originalText, fontFamily);
     const heightBasedSize = inkHeight / 0.85;
     const fontSize = Math.max(8, Math.min(widthBasedSize, heightBasedSize));
 
-    return { fontFamily, fontWeight, fill, fillRgb, fillLuma: luminance(fillRgb), measured: true, fontSize };
+    return {
+      fontFamily,
+      fontWeight,
+      fill,
+      fillRgb,
+      fillLuma: luminance(fillRgb),
+      localBackground,
+      inkCoverage,
+      measured: true,
+      fontSize,
+      strokeDensity,
+      strokeThickness,
+      normalizedStrokeThickness,
+      inkWidth,
+      inkHeight,
+      characterAspect,
+      densityThreshold,
+      contrastRange,
+    };
   } catch (err) {
     return {
       ...DEFAULT_TEXT_STYLE,
@@ -1094,6 +1253,118 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
       fontSize: calculateFontSize(width, height, originalText),
     };
   }
+}
+
+function relativeDifference(actual, expected, floor) {
+  if (!Number.isFinite(actual) || !Number.isFinite(expected)) return 1;
+  return Math.abs(actual - expected) / Math.max(floor, Math.abs(expected));
+}
+
+/**
+ * Finds the SVG weight/stroke combination whose rasterized pixels most closely
+ * resemble a native numeric specimen from this exact image. Matching rendered
+ * candidates avoids treating CSS font-weight as a reliable visual thickness.
+ */
+async function calibrateTextRendering(referenceStyle, referenceText) {
+  if (!referenceStyle?.measured || !referenceText) {
+    return {
+      fontWeight: referenceStyle?.fontWeight || 400,
+      opticalStrokeRatio: 0,
+      rasterInkCoverage: null,
+    };
+  }
+
+  const fontSize = Math.max(8, Math.min(40, referenceStyle.fontSize || 12));
+  const fontFamily = referenceStyle.fontFamily || DEFAULT_TEXT_STYLE.fontFamily;
+  const width = Math.max(
+    48,
+    Math.ceil(numericAdvanceUnits(referenceText, fontFamily) * fontSize + fontSize * 1.5)
+  );
+  const height = Math.ceil(fontSize * 1.6 + 12);
+  const baseline = Math.ceil(fontSize * 1.1);
+  let best = null;
+
+  for (const fontWeight of [400, 700]) {
+    for (const opticalStrokeRatio of CALIBRATION_STROKE_RATIOS) {
+      const strokeWidth = opticalStrokeRatio > 0 ? fontSize * opticalStrokeRatio : 0;
+      const strokeAttributes = strokeWidth > 0
+        ? ` stroke="black" stroke-width="${strokeWidth.toFixed(2)}" ` +
+          'paint-order="stroke fill" stroke-linejoin="round"'
+        : '';
+      const svg = Buffer.from(
+        `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">` +
+          `<rect width="${width}" height="${height}" fill="white"/>` +
+          `<text x="8" y="${baseline}" font-family="${fontFamily}" font-size="${fontSize}" ` +
+          `font-weight="${fontWeight}" fill="black"${strokeAttributes}>` +
+          `${escapeXml(referenceText)}</text></svg>`
+      );
+      const candidateImage = sharp(svg);
+      // eslint-disable-next-line no-await-in-loop
+      const candidateMeta = await candidateImage.metadata();
+      // eslint-disable-next-line no-await-in-loop
+      const candidate = await sampleTextStyle(
+        candidateImage,
+        candidateMeta,
+        { x0: 4, y0: 1, x1: width - 2, y1: height - 2 },
+        referenceText
+      );
+      const score =
+        relativeDifference(candidate.strokeDensity, referenceStyle.strokeDensity, 0.12) * 0.4 +
+        relativeDifference(
+          candidate.normalizedStrokeThickness,
+          referenceStyle.normalizedStrokeThickness,
+          0.06
+        ) * 0.2 +
+        relativeDifference(candidate.characterAspect, referenceStyle.characterAspect, 0.15) * 0.1 +
+        relativeDifference(candidate.inkCoverage, referenceStyle.inkCoverage, 0.2) * 0.3;
+      if (!best || score < best.score) {
+        best = {
+          fontWeight,
+          opticalStrokeRatio,
+          rasterInkCoverage: candidate.inkCoverage,
+          score,
+        };
+      }
+    }
+  }
+
+  return best || {
+    fontWeight: referenceStyle.fontWeight || 400,
+    opticalStrokeRatio: 0,
+    rasterInkCoverage: null,
+  };
+}
+
+async function buildCalibratedConsensus(styleReferences) {
+  const measured = styleReferences.filter(({ style }) => style?.measured);
+  const merged = mergeUniformTextStyle(measured.map(({ style }) => style));
+  if (!merged || !measured.length) return merged;
+
+  const sizeTolerance = Math.max(1.5, merged.fontSize * STYLE_SIZE_OUTLIER_RATIO);
+  const consensus = measured.filter(
+    ({ style }) => Math.abs(style.fontSize - merged.fontSize) <= sizeTolerance
+  );
+  const candidates = consensus.length ? consensus : measured;
+  const calibrated = [];
+  for (const { style, ref } of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    calibrated.push(await calibrateTextRendering(style, ref.text));
+  }
+  calibrated.sort((a, b) =>
+    (a.fontWeight + a.opticalStrokeRatio * 1000) -
+    (b.fontWeight + b.opticalStrokeRatio * 1000)
+  );
+  const representative = calibrated[Math.floor(calibrated.length / 2)];
+  const opticalStrokeRatio = resolveBodyOpticalStrokeRatio(
+    representative.fontWeight,
+    representative.opticalStrokeRatio
+  );
+  return {
+    ...merged,
+    fontWeight: representative.fontWeight,
+    opticalStrokeRatio,
+    rasterInkCoverage: representative.rasterInkCoverage,
+  };
 }
 
 /**
@@ -1209,6 +1480,7 @@ async function computePageStyle(image, meta, styleReferences, regionBbox, cache)
 
   const sizes = [];
   const fillRgbs = [];
+  const sampledStyles = [];
   for (const { ref } of selected) {
     let style = cache.get(ref);
     if (style === undefined) {
@@ -1219,6 +1491,7 @@ async function computePageStyle(image, meta, styleReferences, regionBbox, cache)
     if (!style.measured) continue;
     sizes.push(style.fontSize);
     fillRgbs.push(style.fillRgb);
+    sampledStyles.push(style);
   }
   if (!sizes.length) return null;
 
@@ -1229,6 +1502,13 @@ async function computePageStyle(image, meta, styleReferences, regionBbox, cache)
   };
   return {
     fontSize: percentile(sizes, 0.5),
+    fontFamily: mostCommon(
+      sampledStyles.map((style) => style.fontFamily),
+      DEFAULT_TEXT_STYLE.fontFamily
+    ),
+    fontWeight: medianNumber(sampledStyles.map((style) => style.fontWeight || 400)) >= 600
+      ? 700
+      : 400,
     fillRgb,
     fillLuma: luminance(fillRgb),
   };
@@ -1253,7 +1533,7 @@ function calculateFontSize(width, height, replacementText) {
  *
  * @param {string|Buffer} filePath source image path or normalized image buffer
  * @param {Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, clearBbox?:{x0:number,y0:number,x1:number,y1:number}, replacementText:string}>} replacements
- * @param {{styleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>}} [options]
+ * @param {{styleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, validationStyleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, matchValidationInk?: boolean, preferSourceInk?: boolean, lockBodyTypography?: boolean, fontFamilyOverride?: string|null, fontWeightOverride?: number|null, fixedFontSizeRatio?: number|null}} [options]
  *        styleReferences are other numeric words on the same page used for
  *        per-image typography (size + ink color), e.g. box dimension values.
  */
@@ -1261,8 +1541,18 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   const {
     styleReferences = [],
     preferredStyleReferences = [],
+    validationStyleReferences = [],
+    matchValidationInk = false,
+    preferSourceInk = false,
+    lockBodyTypography = false,
+    fontFamilyOverride = null,
+    fontWeightOverride = null,
+    fixedFontSizeRatio = null,
     uniformTextStyle = true,
   } = options;
+  const hasFontWeightOverride = hasNumericFontWeightOverride(fontWeightOverride);
+  const hasFixedFontSize = Number.isFinite(Number(fixedFontSizeRatio)) &&
+    Number(fixedFontSizeRatio) > 0;
   const image = sharp(filePath);
   const meta = await image.metadata();
 
@@ -1292,9 +1582,19 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     for (const ref of preferredStyleReferences.slice(0, 6)) {
       // eslint-disable-next-line no-await-in-loop
       const style = await sampleTextStyle(image, meta, ref.bbox, ref.text);
-      if (style.measured) preferredStyles.push(style);
+      if (style.measured) preferredStyles.push({ style, ref });
     }
-    preferredTextStyle = mergeUniformTextStyle(preferredStyles);
+    preferredTextStyle = await buildCalibratedConsensus(preferredStyles);
+  }
+  let validationTextStyle = null;
+  if (validationStyleReferences.length) {
+    const validationStyles = [];
+    for (const ref of validationStyleReferences.slice(0, 6)) {
+      // eslint-disable-next-line no-await-in-loop
+      const style = await sampleTextStyle(image, meta, ref.bbox, ref.text);
+      if (style.measured) validationStyles.push({ style, ref });
+    }
+    validationTextStyle = await buildCalibratedConsensus(validationStyles);
   }
 
   for (const {
@@ -1346,7 +1646,10 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         meta,
         gray,
         grayInfo,
-        { x: Number(leftRuleHint), y0: bbox.y0, y1: bbox.y1 }
+        // Restore the complete erase height, including antialias padding above
+        // and below the OCR glyph box. Restoring only bbox.y0..bbox.y1 left a
+        // short visible break in the divider on some photographed labels.
+        { x: Number(leftRuleHint), y0: rectY, y1: rectBottom }
       );
       if (restoredRule) {
         ruleRestoreOverlays.push(restoredRule.overlay);
@@ -1419,6 +1722,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // still available for per-image style matching.
     // eslint-disable-next-line no-await-in-loop
     let textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
+    const originalValueStyleMeasured = textStyle.measured;
 
     // Prefer the original weight pixels whenever they are measurable. Nearby
     // dimensions are only a fallback specimen; overriding a faint but valid
@@ -1450,6 +1754,46 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       };
     }
 
+    // A readable old weight is the only specimen from the same printer field.
+    // Its calibrated weight/stroke takes precedence, while this individual
+    // cell's sampled color remains local so shadows and scan tint still match.
+    if (preferredTextStyle && originalValueStyleMeasured && !preferPageStyle) {
+      textStyle = {
+        ...textStyle,
+        fontFamily: preferredTextStyle.fontFamily || textStyle.fontFamily,
+        fontWeight: preferredTextStyle.fontWeight || textStyle.fontWeight,
+        opticalStrokeRatio: preferredTextStyle.opticalStrokeRatio || 0,
+        rasterInkCoverage: preferredTextStyle.rasterInkCoverage,
+      };
+    }
+
+    // Dimensions/count values in the BOXES section establish the body-value
+    // ink and optical size. A strict page-scale cap below prevents a loose
+    // multi-row OCR box from making this reference oversized.
+    if (validationTextStyle && textStyle.measured && !preferPageStyle) {
+      textStyle = {
+        ...textStyle,
+        fontFamily: validationTextStyle.fontFamily || textStyle.fontFamily,
+        fontWeight: preferredTextStyle
+          ? textStyle.fontWeight
+          : (validationTextStyle.fontWeight || textStyle.fontWeight),
+        fontSize: validationTextStyle.fontSize,
+        opticalStrokeRatio: preferredTextStyle
+          ? (textStyle.opticalStrokeRatio || 0)
+          : (validationTextStyle.opticalStrokeRatio || 0),
+        rasterInkCoverage: preferredTextStyle
+          ? textStyle.rasterInkCoverage
+          : validationTextStyle.rasterInkCoverage,
+        ...(matchValidationInk && (!preferSourceInk || !originalValueStyleMeasured)
+          ? {
+              fill: validationTextStyle.fill,
+              fillRgb: validationTextStyle.fillRgb,
+              fillLuma: validationTextStyle.fillLuma,
+            }
+          : {}),
+      };
+    }
+
     // Align the replacement with the page's other numbers (size + ink color)
     // when the value's own ink measurement is missing, wildly off, or lighter.
     if (styleReferences.length) {
@@ -1459,6 +1803,9 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         if (!textStyle.measured) {
           textStyle = {
             ...textStyle,
+            fontFamily: pageStyle.fontFamily,
+            fontWeight: pageStyle.fontWeight,
+            fontSize: Math.max(8, Math.min(pageStyle.fontSize, height / 0.6)),
             fill: rgbToCss(pageStyle.fillRgb),
             fillRgb: pageStyle.fillRgb,
             fillLuma: pageStyle.fillLuma,
@@ -1490,13 +1837,35 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         b: Math.max(0, Math.round(sampledFill.b * scale)),
       };
     }
-    const templateFontCap = Math.max(7, meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO);
+    // The minimum prevents tiny low-resolution OCR boxes from collapsing the
+    // text, but must not scale without bound on 250-300 DPI scans. Their real
+    // dimension specimen remains free to select a larger size.
+    const { floor: templateFontFloor, cap: templateFontCap } =
+      calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize);
     textStyle = {
       ...textStyle,
+      fontFamily: fontFamilyOverride || textStyle.fontFamily,
+      fontWeight: hasFontWeightOverride
+        ? Number(fontWeightOverride)
+        : textStyle.fontWeight,
+      // A fixed template controls glyph shape and weight. Do not carry a
+      // per-image calibration outline into that template; only ink color is
+      // allowed to vary between scans.
+      opticalStrokeRatio: fontFamilyOverride || hasFontWeightOverride
+        ? 0
+        : textStyle.opticalStrokeRatio,
+      rasterInkCoverage: fontFamilyOverride || hasFontWeightOverride
+        ? null
+        : textStyle.rasterInkCoverage,
       fillRgb: visibleFill,
       fillLuma: luminance(visibleFill),
       fill: rgbToCss(visibleFill),
-      fontSize: Math.min(textStyle.fontSize || templateFontCap, templateFontCap),
+      fontSize: hasFixedFontSize
+        ? Math.max(6, meta.width * Number(fixedFontSizeRatio))
+        : Math.max(
+            templateFontFloor,
+            Math.min(textStyle.fontSize || templateFontCap, templateFontCap)
+          ),
     };
 
     textOps.push({
@@ -1511,6 +1880,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       detectedLeftRuleX,
       replacementText,
       textStyle,
+      bg,
       fontScale,
       textLeftPaddingRatio,
       preferTextBoundsStart,
@@ -1545,13 +1915,18 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
             op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio)
           );
       const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
-      const templateFontCap = Math.max(7, meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO);
-      const heightLimit = Math.min(
-        templateFontCap,
-        preferredTextStyle
-          ? Math.max(6, op.height * 0.98)
-          : Math.max(6, op.height / 0.9)
-      );
+      const templateFontCap = hasFixedFontSize
+        ? Math.max(6, meta.width * Number(fixedFontSizeRatio))
+        : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize).cap;
+      const lockedBodyTypography = lockBodyTypography || hasFontWeightOverride;
+      const heightLimit = lockedBodyTypography
+        ? templateFontCap
+        : Math.min(
+            templateFontCap,
+            preferredTextStyle
+              ? Math.max(6, op.height * 0.98)
+              : Math.max(6, op.height / 0.9)
+          );
       const textRight = op.textBounds?.x1 ?? (op.rectX + op.rectW);
       const widthLimit = Math.max(4, textRight - textX - 1) /
         numericAdvanceUnits(op.replacementText, sharedTextStyle.fontFamily);
@@ -1585,7 +1960,16 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   }
 
   const texts = textOps.map((op) => {
-    const textStyle = sharedTextStyle || op.textStyle;
+    // Size, family and weight are shared across sibling weight cells, while
+    // ink color remains local to each cell to follow shadows and scan tint.
+    const textStyle = sharedTextStyle
+      ? {
+          ...sharedTextStyle,
+          fill: op.textStyle.fill,
+          fillRgb: op.textStyle.fillRgb,
+          fillLuma: op.textStyle.fillLuma,
+        }
+      : op.textStyle;
     const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
     const detectedRuleX = Number.isFinite(op.detectedLeftRuleX)
       ? op.detectedLeftRuleX
@@ -1599,13 +1983,18 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
           op.rectX + Math.max(1, op.rectW * op.textLeftPaddingRatio)
         );
     const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
-    const templateFontCap = Math.max(7, meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO);
-    const maxFontSizeForHeight = Math.min(
-      templateFontCap,
-      preferredTextStyle
-        ? Math.max(6, op.height * 0.98)
-        : Math.max(6, op.height / 0.9)
-    );
+    const templateFontCap = hasFixedFontSize
+      ? Math.max(6, meta.width * Number(fixedFontSizeRatio))
+      : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize).cap;
+    const lockedBodyTypography = lockBodyTypography || hasFontWeightOverride;
+    const maxFontSizeForHeight = lockedBodyTypography
+      ? templateFontCap
+      : Math.min(
+          templateFontCap,
+          preferredTextStyle
+            ? Math.max(6, op.height * 0.98)
+            : Math.max(6, op.height / 0.9)
+        );
     const textRight = op.textBounds?.x1 ?? (op.rectX + op.rectW);
     const maxTextWidth = Math.max(4, textRight - textX - 1);
     const maxFontSizeForWidth =
@@ -1618,11 +2007,37 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       op.bbox.y1 - 1,
       Math.max(op.bbox.y0 + renderedFontSize * 0.72, op.bbox.y0 + op.height / 2 + renderedFontSize * 0.28)
     );
+    const willBlur = Boolean(
+      preferredTextStyle &&
+      !lockedBodyTypography &&
+      Math.max(meta.width, meta.height) <= 2400
+    );
+    const renderedFill = compensateRasterizedInk(
+      textStyle.fillRgb,
+      op.bg,
+      renderedFontSize,
+      textStyle.fontWeight,
+      willBlur,
+      textStyle.rasterInkCoverage
+    );
+    const finalOpticalStrokeRatio = hasFontWeightOverride
+      ? textStyle.opticalStrokeRatio
+      : resolveBodyOpticalStrokeRatio(textStyle.fontWeight, textStyle.opticalStrokeRatio);
+    const opticalStrokeWidth = calculateLockedStrokeWidth(
+      renderedFontSize,
+      textStyle.fontWeight,
+      lockedBodyTypography,
+      finalOpticalStrokeRatio
+    );
+    const opticalStroke = opticalStrokeWidth > 0
+      ? ` stroke="${rgbToCss(renderedFill)}" stroke-width="${opticalStrokeWidth.toFixed(2)}" ` +
+        'paint-order="stroke fill" stroke-linejoin="round"'
+      : '';
 
     return (
       `<text x="${textX}" y="${baselineY}" font-family="${textStyle.fontFamily}" ` +
       `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
-      `fill="${textStyle.fill}">` +
+      `fill="${rgbToCss(renderedFill)}"${opticalStroke}>` +
       `${escapeXml(op.replacementText)}</text>`
     );
   });
@@ -1634,7 +2049,12 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   );
 
   let renderedTextOverlay = overlaySvg;
-  if (preferredTextStyle && Math.max(meta.width, meta.height) <= 2400) {
+  if (
+    preferredTextStyle &&
+    !lockBodyTypography &&
+    !hasFontWeightOverride &&
+    Math.max(meta.width, meta.height) <= 2400
+  ) {
     // Native label text in low-resolution scans has a small optical/scan blur;
     // raw SVG edges look conspicuously digital beside it. Apply only a subtle
     // resolution-aware blur and keep high-resolution source text untouched.
@@ -1660,6 +2080,12 @@ module.exports = {
   samplePaperInsideBbox,
   sampleTextStyle,
   calculateFontSize,
+  calculateLockedStrokeWidth,
+  calculateBodyFontLimits,
+  resolveBodyOpticalStrokeRatio,
+  hasNumericFontWeightOverride,
+  calibrateTextRendering,
+  buildCalibratedConsensus,
   shrinkClearRectAroundRules,
   computePageStyle,
 };

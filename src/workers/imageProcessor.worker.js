@@ -11,6 +11,8 @@ const {
   inferActualSiblingRegion,
   inferSiblingFromTableRules,
   inferSingleWeightRegionFromAnchor,
+  isRegionWithinWeightValueBand,
+  reconcileHeaderOwnedWeightRegions,
   inferWeightRegionsFromAnchors,
   inferWeightRegionsFromTable,
   localizeWeightInkInCells,
@@ -1421,6 +1423,12 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       (digitCount === 1 && wideStructuralBand);
   });
   regions = regions.map((region) => clampTallNumericRegion(region, analysis.meta));
+  // Every detector converges here before pixels are erased. Reject inferred
+  // regions that drift beyond the immediate value band below a WEIGHT header;
+  // signatures and footer text can otherwise look like strong numeric ink.
+  regions = regions.filter((region) =>
+    isRegionWithinWeightValueBand(region, anchors, analysis.meta)
+  );
 
   // Recover the complete glyph box when an enhanced/structural pass retained
   // only the tail of a number. Use the same normalized digits, same row and a
@@ -2342,6 +2350,24 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     })),
     analysis.meta
   );
+  // Pixel scans refine glyph bounds, but explicit ACTUAL/CHARGED qualifiers
+  // remain the authority for business-cell ownership. Reconcile once at the
+  // final boundary so a faint sibling cannot disappear or drift into SAID TO
+  // CONTAIN after the earlier schema checks succeeded.
+  regions = reconcileHeaderOwnedWeightRegions(regions, words, analysis.meta);
+  // This is the final region-producing step. Enforce the value-row band here
+  // so no OCR/table fallback can place replacement text in signatures or the
+  // footer after an earlier geometry check has already run.
+  regions = regions.filter((region) => {
+    const headerBottom = Number.isFinite(region.headerBottom)
+      ? region.headerBottom
+      : headerBottomForRegion(region);
+    const gap = region.bbox.y0 - headerBottom;
+    const centerY = (region.bbox.y0 + region.bbox.y1) / 2;
+    return centerY <= analysis.meta.height * 0.68 &&
+      gap >= -analysis.meta.height * 0.01 &&
+      gap <= Math.max(60, analysis.meta.height * 0.12);
+  });
 
   const newWeight = idWeightMap.get(match.id);
 
@@ -2557,9 +2583,8 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       preferSourceStyle: originalTextIsReliable &&
         regionWidth <= analysis.meta.width * 0.09 &&
         regionHeight <= analysis.meta.height * 0.035,
-      // Measured source ink or the local template specimen already supplies
-      // the correct size; width/height fitting in the renderer is the only
-      // scaling needed.
+      // The editor already clamps locked typography to a safe page-scale band;
+      // render the measured box-value size without an additional reduction.
       fontScale: 1,
       textLeftPaddingRatio: usesTinyScanFallback ? 0.03 : undefined,
       preferTextBoundsStart: useCellStart,
@@ -2709,50 +2734,47 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
       const compact = String(word.text || '').replace(/\s/g, '');
       const isDimensionValue = /\d{1,3}[xX\u00d7]\d{1,3}[xX\u00d7]\d{1,3}/.test(compact);
+      const isLooseDimensionValue = compact.length >= 5 &&
+        (compact.match(/[xX\u00d7]/g) || []).length >= 2;
+      const isBoxValuePrefix = /^\W*\d*boxes?:?$/i.test(compact);
       const isPlainNumber = /^\d{1,4}(?:[.,]\d{1,3})?$/.test(compact);
       return word.bbox.x1 < firstWeightX - 2 &&
         word.bbox.x0 > analysis.meta.width * 0.02 &&
         Math.abs(centerY - replacementCenterY) <= maxReferenceYDistance &&
         width >= 4 && height >= 4 && height <= Math.max(24, analysis.meta.height * 0.045) &&
         compact.length >= 2 && compact.length <= 18 &&
-        (isDimensionValue || isPlainNumber);
+        (isDimensionValue || isLooseDimensionValue || isBoxValuePrefix || isPlainNumber);
     })
     .map((word) => ({
       bbox: word.bbox,
       text: word.text,
       centerY: (word.bbox.y0 + word.bbox.y1) / 2,
-      priority: /\d{1,3}[xX\u00d7]\d{1,3}[xX\u00d7]\d{1,3}/.test(
-        String(word.text || '').replace(/\s/g, '')
-      ) ? 0 : 1,
+      priority: (() => {
+        const compact = String(word.text || '').replace(/\s/g, '');
+        if (/\d{1,3}[xX\u00d7]\d{1,3}[xX\u00d7]\d{1,3}/.test(compact)) return 0;
+        if ((compact.match(/[xX\u00d7]/g) || []).length >= 2) return 1;
+        if (/^\W*\d*boxes?:?$/i.test(compact)) return 2;
+        return 3;
+      })(),
     }))
     .sort((a, b) =>
       a.priority - b.priority ||
       Math.abs(a.centerY - replacementCenterY) - Math.abs(b.centerY - replacementCenterY) ||
       b.bbox.x1 - a.bbox.x1
     );
-  const bestReferenceY = localReferenceCandidates[0]?.centerY;
   const bestReferencePriority = localReferenceCandidates[0]?.priority;
-  const preferredStyleReferences = bestReferenceY === undefined
-    ? []
-    : localReferenceCandidates
-      .filter((candidate) =>
-        candidate.priority === bestReferencePriority &&
-        Math.abs(candidate.centerY - bestReferenceY) <= Math.max(4, analysis.meta.height * 0.008)
-      )
-      .slice(0, 6)
-      .map(({ bbox, text }) => ({ bbox, text }));
-  const reliableWeightStyleReferences = regions
-    .filter((region) => /^\d{2,6}(?:[.,]\d{1,3})?$/.test(String(region.originalText || '').trim()))
-    .filter((region) =>
-      region.ocrConfidence === undefined || region.ocrConfidence >= config.ocrMinConfidence
-    )
-    .map((region) => ({ bbox: region.bbox, text: region.originalText }));
-  // A clean original weight is the exact printer/font specimen for this
-  // label. Use dimensions only when no reliable old weight remains readable.
-  const exactPreferredStyleReferences = reliableWeightStyleReferences.length
-    ? reliableWeightStyleReferences
-    : preferredStyleReferences;
-
+  const preferredStyleReferences = [];
+  for (const candidate of localReferenceCandidates) {
+    if (candidate.priority !== bestReferencePriority) continue;
+    const duplicateRow = preferredStyleReferences.some((existing) =>
+      Math.abs(
+        (existing.bbox.y0 + existing.bbox.y1) / 2 - candidate.centerY
+      ) <= Math.max(2, analysis.meta.height * 0.003)
+    );
+    if (duplicateRow) continue;
+    preferredStyleReferences.push({ bbox: candidate.bbox, text: candidate.text });
+    if (preferredStyleReferences.length >= 6) break;
+  }
   // Sibling numeric words on the same page (box dimensions, counts, dates,
   // etc.) act as per-image typography references so the replacement text
   // matches the size and ink color of the surrounding print, even when the
@@ -2782,7 +2804,15 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     replacements,
     {
     styleReferences,
-    preferredStyleReferences: exactPreferredStyleReferences,
+    preferredStyleReferences,
+    // The left-side BOXES/DIMENSION rows are the requested visual target for
+    // size, ink and stroke. Old weight values can use a different print style.
+    validationStyleReferences: preferredStyleReferences,
+    matchValidationInk: true,
+    preferSourceInk: false,
+    // Lock out malformed OCR box scaling, but derive the actual size, weight,
+    // stroke and ink from a consensus of this image's BOXES/DIMENSION rows.
+    lockBodyTypography: true,
     }
   );
   await fs.mkdir(path.dirname(outputPath), { recursive: true });

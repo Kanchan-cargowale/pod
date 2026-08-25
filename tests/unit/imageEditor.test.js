@@ -13,6 +13,12 @@ const {
   computePageStyle,
   samplePaperInsideBbox,
   estimateStrokeThickness,
+  calculateLockedStrokeWidth,
+  calculateBodyFontLimits,
+  resolveBodyOpticalStrokeRatio,
+  hasNumericFontWeightOverride,
+  calibrateTextRendering,
+  buildCalibratedConsensus,
 } = require('../../src/services/imageEditor.service');
 
 describe('imageEditor.service', () => {
@@ -131,7 +137,9 @@ describe('imageEditor.service', () => {
       const regularRed = Number(regular.fill.match(/\d+/)[0]);
       const boldRed = Number(bold.fill.match(/\d+/)[0]);
       expect(regularRed).toBeGreaterThan(boldRed + 40);
-      expect(regular.fontWeight).toBeLessThanOrEqual(bold.fontWeight);
+      expect(regular.fontWeight).toBe(400);
+      expect(bold.fontWeight).toBe(700);
+      expect(regular.fontFamily).not.toContain('Arial Black');
       expect(regular.fontSize).toBeGreaterThan(8);
       expect(bold.fontSize).toBeGreaterThan(8);
     });
@@ -161,6 +169,25 @@ describe('imageEditor.service', () => {
       const red = Number(style.fill.match(/\d+/)[0]);
       expect(red).toBeLessThan(100); // dark cluster (~60), not the halo (~150)
       expect(style.measured).toBe(true);
+    });
+
+    it('does not mistake a wide dimension token for monospace text', async () => {
+      const image = sharp(Buffer.from(
+        '<svg width="190" height="55" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="190" height="55" fill="white"/>' +
+          '<text x="8" y="39" font-family="Arial" font-size="24" font-weight="700">' +
+          '55x52x34</text></svg>'
+      ));
+      const meta = await image.metadata();
+      const style = await sampleTextStyle(
+        image,
+        meta,
+        { x0: 6, y0: 12, x1: 125, y1: 44 },
+        '55x52x34'
+      );
+
+      expect(style.fontFamily).toContain('Arial');
+      expect(style.fontFamily).not.toContain('Courier');
     });
   });
 
@@ -485,6 +512,7 @@ describe('imageEditor.service', () => {
       bbox: valueBbox,
       replacementText: '88.00',
       originalText: '12.50',
+      forceInteriorErase: true,
     };
     const darkestPixel = async (buffer) => {
       const { data, info } = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
@@ -586,6 +614,407 @@ describe('imageEditor.service', () => {
     };
 
     expect(Math.abs(inkHeight(18, 95) - inkHeight(148, 235))).toBeLessThanOrEqual(2);
+  });
+
+  describe('calculateLockedStrokeWidth', () => {
+    it('uses the calibrated ratio and keeps it bounded across scan resolutions', () => {
+      expect(calculateLockedStrokeWidth(12, 700, true, 0.065)).toBeCloseTo(0.78, 2);
+      expect(calculateLockedStrokeWidth(30, 700, true, 0.065)).toBe(1.35);
+      expect(calculateLockedStrokeWidth(12, 400, true, 0)).toBe(0);
+      expect(calculateLockedStrokeWidth(12, 700, false, 0.065)).toBe(0);
+    });
+
+  });
+
+  describe('calculateBodyFontLimits', () => {
+    it('uses the measured body specimen instead of enlarging text from canvas margins', () => {
+      expect(calculateBodyFontLimits(1000, 8)).toEqual({ floor: 7.2, cap: 8.24 });
+      expect(calculateBodyFontLimits(2000, 10)).toEqual({ floor: 9, cap: 10.3 });
+      expect(calculateBodyFontLimits(1000)).toEqual({ floor: 10.5, cap: 11 });
+    });
+  });
+
+  describe('resolveBodyOpticalStrokeRatio', () => {
+    it('prevents both regular and bold dynamic body text from rendering with zero print gain', () => {
+      expect(resolveBodyOpticalStrokeRatio(400, 0)).toBe(0.065);
+      expect(resolveBodyOpticalStrokeRatio(700, 0)).toBe(0.025);
+      expect(resolveBodyOpticalStrokeRatio(700, 0.065)).toBe(0.065);
+      expect(resolveBodyOpticalStrokeRatio(400, 0.2)).toBe(0.085);
+    });
+  });
+
+  describe('hasNumericFontWeightOverride', () => {
+    it('does not coerce a missing override into font weight zero', () => {
+      expect(hasNumericFontWeightOverride(null)).toBe(false);
+      expect(hasNumericFontWeightOverride(undefined)).toBe(false);
+      expect(hasNumericFontWeightOverride('')).toBe(false);
+      expect(hasNumericFontWeightOverride(400)).toBe(true);
+      expect(hasNumericFontWeightOverride(700)).toBe(true);
+    });
+  });
+
+  describe('calibrateTextRendering', () => {
+    it('does not force the same optical stroke onto regular and heavy specimens', async () => {
+      const specimen = async (weight, strokeWidth) => {
+        const stroke = strokeWidth > 0
+          ? ` stroke="black" stroke-width="${strokeWidth}" paint-order="stroke fill"`
+          : '';
+        const image = sharp(Buffer.from(
+          '<svg width="180" height="55" xmlns="http://www.w3.org/2000/svg">' +
+            '<rect width="180" height="55" fill="white"/>' +
+            `<text x="8" y="38" font-family="Arial" font-size="24" font-weight="${weight}" ` +
+            `fill="black"${stroke}>45x32x20</text></svg>`
+        ));
+        const meta = await image.metadata();
+        return sampleTextStyle(image, meta, { x0: 5, y0: 8, x1: 150, y1: 44 }, '45x32x20');
+      };
+      const regular = await calibrateTextRendering(await specimen(400, 0), '45x32x20');
+      const heavy = await calibrateTextRendering(await specimen(700, 1.1), '45x32x20');
+      const regularStrength = regular.fontWeight + regular.opticalStrokeRatio * 1000;
+      const heavyStrength = heavy.fontWeight + heavy.opticalStrokeRatio * 1000;
+
+      expect(heavyStrength).toBeGreaterThan(regularStrength);
+      expect(regular.opticalStrokeRatio).toBeLessThanOrEqual(0.025);
+    });
+  });
+
+  describe('buildCalibratedConsensus', () => {
+    it('rejects one oversized OCR specimen when the dimension rows agree', async () => {
+      const style = (fontSize, gray) => ({
+        measured: true,
+        fontFamily: 'Arial, Helvetica, sans-serif',
+        fontWeight: 400,
+        fontSize,
+        fill: `rgb(${gray},${gray},${gray})`,
+        fillRgb: { r: gray, g: gray, b: gray },
+        fillLuma: gray,
+        localBackground: 245,
+        inkCoverage: 0.68,
+        strokeDensity: 0.53,
+        strokeThickness: 2,
+        normalizedStrokeThickness: 0.2,
+        characterAspect: 0.72,
+      });
+      const consensus = await buildCalibratedConsensus([
+        { style: style(11.5, 70), ref: { text: '64x42x27' } },
+        { style: style(12, 80), ref: { text: '55x52x34' } },
+        { style: style(27, 180), ref: { text: '84x44x31' } },
+      ]);
+
+      expect(consensus.fontSize).toBeCloseTo(11.75, 2);
+      expect(consensus.fillRgb.r).toBe(80);
+      expect(consensus.fontWeight + consensus.opticalStrokeRatio * 1000)
+        .toBeGreaterThanOrEqual(445);
+    });
+
+    it('never emits plain regular text for printed body values', async () => {
+      const regular = {
+        measured: true,
+        fontFamily: 'Arial, Helvetica, sans-serif',
+        fontWeight: 400,
+        fontSize: 12,
+        fill: 'rgb(80,80,80)',
+        fillRgb: { r: 80, g: 80, b: 80 },
+        fillLuma: 80,
+        localBackground: 245,
+        inkCoverage: 0.6,
+        strokeDensity: 0.42,
+        strokeThickness: 1,
+        normalizedStrokeThickness: 0.1,
+        characterAspect: 0.7,
+      };
+      const consensus = await buildCalibratedConsensus([
+        { style: regular, ref: { text: '63x41x27' } },
+      ]);
+
+      expect(consensus.fontWeight).toBeGreaterThanOrEqual(400);
+      expect(consensus.opticalStrokeRatio).toBeGreaterThanOrEqual(0.065);
+    });
+  });
+
+  it('shares typography but preserves each weight cell local ink color', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="1000" height="140" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="1000" height="140" fill="rgb(245,245,245)" />' +
+          '<text x="40" y="75" font-family="Arial" font-size="20" fill="rgb(65,65,65)">40.00</text>' +
+          '<text x="520" y="75" font-family="Arial" font-size="20" fill="rgb(155,155,155)">40.00</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+
+    const edited = await replaceWeightRegions(input, [
+      {
+        bbox: { x0: 40, y0: 57, x1: 105, y1: 79 },
+        clearBbox: { x0: 36, y0: 53, x1: 120, y1: 83 },
+        originalText: '40.00',
+        replacementText: '55.00',
+        forceInteriorErase: true,
+      },
+      {
+        bbox: { x0: 520, y0: 57, x1: 585, y1: 79 },
+        clearBbox: { x0: 516, y0: 53, x1: 600, y1: 83 },
+        originalText: '40.00',
+        replacementText: '55.00',
+        forceInteriorErase: true,
+      },
+    ]);
+    const { data, info } = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const darkest = (x0, x1) => {
+      let result = 255;
+      for (let y = 55; y < 82; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          result = Math.min(result, data[(y * info.width + x) * info.channels]);
+        }
+      }
+      return result;
+    };
+
+    expect(darkest(36, 130)).toBeLessThan(darkest(516, 620) - 50);
+  });
+
+  it('keeps the approved weight typography fixed across different source styles', async () => {
+    const makeInput = (referenceSize, referenceWeight) => sharp(Buffer.from(
+      '<svg width="1000" height="170" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect width="1000" height="170" fill="white" />' +
+        '<text x="50" y="65" font-family="Arial" font-size="13" fill="rgb(80,80,80)">40.00</text>' +
+        `<text x="50" y="135" font-family="Arial" font-size="${referenceSize}" ` +
+        `font-weight="${referenceWeight}" fill="rgb(80,80,80)">55x52x34</text>` +
+        '</svg>'
+    )).png().toBuffer();
+    const replacement = {
+      bbox: { x0: 50, y0: 53, x1: 88, y1: 67 },
+      clearBbox: { x0: 47, y0: 49, x1: 105, y1: 70 },
+      originalText: '40.00',
+      replacementText: '77.70',
+      forceInteriorErase: true,
+    };
+    const render = async (referenceSize, referenceWeight) => replaceWeightRegions(
+      await makeInput(referenceSize, referenceWeight),
+      [replacement],
+      {
+        validationStyleReferences: [
+          { bbox: { x0: 48, y0: 105, x1: 180, y1: 140 }, text: '55x52x34' },
+        ],
+        matchValidationInk: true,
+        lockBodyTypography: true,
+        fontFamilyOverride: 'Arial, Helvetica, sans-serif',
+        fontWeightOverride: 700,
+        fixedFontSizeRatio: 0.0115,
+      }
+    );
+    const [smallRegular, largeBold] = await Promise.all([
+      render(12, 400),
+      render(24, 700),
+    ]);
+    const glyphBounds = async (buffer) => {
+      const { data, info } = await sharp(buffer)
+      .extract({ left: 45, top: 45, width: 90, height: 35 })
+      .greyscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+      let left = Infinity;
+      let top = Infinity;
+      let right = -Infinity;
+      let bottom = -Infinity;
+      for (let y = 0; y < info.height; y += 1) {
+        for (let x = 0; x < info.width; x += 1) {
+          if (data[y * info.width + x] >= 210) continue;
+          left = Math.min(left, x);
+          top = Math.min(top, y);
+          right = Math.max(right, x);
+          bottom = Math.max(bottom, y);
+        }
+      }
+      return { left, top, right, bottom };
+    };
+    const [firstBounds, secondBounds] = await Promise.all([
+      glyphBounds(smallRegular),
+      glyphBounds(largeBold),
+    ]);
+
+    expect(firstBounds).toEqual(secondBounds);
+  });
+
+  it('uses a nearby dimension value to reject an oversized weight OCR box', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="3000" height="260" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="3000" height="260" fill="white" />' +
+          '<text x="100" y="105" font-family="Arial" font-size="40">90.00</text>' +
+          '<text x="100" y="210" font-family="Arial" font-size="18">55x52x34</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+
+    const edited = await replaceWeightRegions(input, [{
+      bbox: { x0: 100, y0: 67, x1: 230, y1: 112 },
+      clearBbox: { x0: 94, y0: 62, x1: 250, y1: 116 },
+      originalText: '90.00',
+      replacementText: '95.00',
+      forceInteriorErase: true,
+    }], {
+      validationStyleReferences: [
+        { bbox: { x0: 100, y0: 192, x1: 180, y1: 214 }, text: '55x52x34' },
+      ],
+    });
+    const { data, info } = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (let y = 60; y < 120; y += 1) {
+      for (let x = 90; x < 260; x += 1) {
+        if (data[(y * info.width + x) * info.channels] < 100) {
+          top = Math.min(top, y);
+          bottom = Math.max(bottom, y);
+        }
+      }
+    }
+
+    expect(bottom - top + 1).toBeGreaterThanOrEqual(10);
+    expect(bottom - top + 1).toBeLessThanOrEqual(20);
+  });
+
+  it('matches bold box-value ink without enlarging the weight text', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="1000" height="150" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="1000" height="150" fill="white" />' +
+          '<text x="40" y="65" font-family="Arial" font-size="20" fill="rgb(150,150,150)">40.00</text>' +
+          '<text x="40" y="125" font-family="Arial" font-size="20" font-weight="700" fill="rgb(65,65,65)">64x42x27</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+    const replacement = {
+      bbox: { x0: 40, y0: 47, x1: 105, y1: 69 },
+      clearBbox: { x0: 36, y0: 43, x1: 120, y1: 73 },
+      originalText: '40.00',
+      replacementText: '55.00',
+      forceInteriorErase: true,
+    };
+    const options = {
+      validationStyleReferences: [
+        { bbox: { x0: 40, y0: 107, x1: 145, y1: 129 }, text: '64x42x27' },
+      ],
+      matchValidationInk: true,
+    };
+    const [regular, bold] = await Promise.all([
+      replaceWeightRegions(input, [replacement], { ...options, fontWeightOverride: 400 }),
+      replaceWeightRegions(input, [replacement], { ...options, fontWeightOverride: 700 }),
+    ]);
+    const darkPixelCount = async (buffer) => {
+      const { data, info } = await sharp(buffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+      let count = 0;
+      let darkest = 255;
+      for (let y = 43; y < 74; y += 1) {
+        for (let x = 36; x < 125; x += 1) {
+          const red = data[(y * info.width + x) * info.channels];
+          if (red < 170) count += 1;
+          darkest = Math.min(darkest, red);
+        }
+      }
+      return { count, darkest };
+    };
+    const regularInk = await darkPixelCount(regular);
+    const boldInk = await darkPixelCount(bold);
+
+    // Bold must remain visibly heavier, but should not require the excessive
+    // fixed ink expansion that made medium-weight scans look over-bold.
+    expect(boldInk.count).toBeGreaterThan(regularInk.count * 1.12);
+    expect(boldInk.darkest).toBeLessThan(100);
+  });
+
+  it('applies final print gain and specimen sizing after dynamic calibration', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="2000" height="170" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="2000" height="170" fill="white" />' +
+          '<text x="50" y="65" font-family="Arial" font-size="20" fill="rgb(90,90,90)">40.00</text>' +
+          '<text x="50" y="135" font-family="Arial" font-size="9" font-weight="700" ' +
+          'fill="rgb(70,70,70)">45x32x20</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+    const replacement = {
+      bbox: { x0: 50, y0: 47, x1: 105, y1: 69 },
+      clearBbox: { x0: 46, y0: 43, x1: 120, y1: 73 },
+      originalText: '40.00',
+      replacementText: '77.70',
+      forceInteriorErase: true,
+    };
+    const options = {
+      validationStyleReferences: [
+        { bbox: { x0: 48, y0: 123, x1: 105, y1: 138 }, text: '45x32x20' },
+      ],
+      matchValidationInk: true,
+      lockBodyTypography: true,
+    };
+    const [dynamic, noDynamicStroke] = await Promise.all([
+      replaceWeightRegions(input, [replacement], options),
+      replaceWeightRegions(input, [replacement], { ...options, fontWeightOverride: 700 }),
+    ]);
+    const inkMetrics = async (buffer, x0, x1, y0, y1) => {
+      const { data, info } = await sharp(buffer).greyscale().raw()
+        .toBuffer({ resolveWithObject: true });
+      let count = 0;
+      let top = Infinity;
+      let bottom = -Infinity;
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          if (data[y * info.width + x] >= 180) continue;
+          count += 1;
+          top = Math.min(top, y);
+          bottom = Math.max(bottom, y);
+        }
+      }
+      return { count, height: bottom - top + 1 };
+    };
+    const [dynamicInk, plainInk, referenceInk] = await Promise.all([
+      inkMetrics(dynamic, 46, 125, 43, 75),
+      inkMetrics(noDynamicStroke, 46, 125, 43, 75),
+      inkMetrics(input, 48, 115, 120, 142),
+    ]);
+
+    expect(dynamicInk.count).toBeGreaterThan(plainInk.count);
+    expect(dynamicInk.height).toBeLessThanOrEqual(referenceInk.height + 2);
+  });
+
+  it('does not collapse locked bold text to a tiny OCR value box', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="1000" height="130" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="1000" height="130" fill="white" />' +
+          '<text x="50" y="58" font-family="Arial" font-size="7" fill="rgb(150,150,150)">20.00</text>' +
+          '<text x="50" y="108" font-family="Arial" font-size="18" font-weight="700">45x32x20</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+    const edited = await replaceWeightRegions(input, [{
+      bbox: { x0: 50, y0: 52, x1: 70, y1: 59 },
+      clearBbox: { x0: 47, y0: 49, x1: 90, y1: 62 },
+      originalText: '20.00',
+      replacementText: '55.00',
+      forceInteriorErase: true,
+      fontScale: 1,
+    }], {
+      validationStyleReferences: [
+        { bbox: { x0: 50, y0: 91, x1: 150, y1: 112 }, text: '45x32x20' },
+      ],
+      matchValidationInk: true,
+      fontWeightOverride: 700,
+    });
+    const { data, info } = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (let y = 42; y < 62; y += 1) {
+      for (let x = 45; x < 105; x += 1) {
+        if (data[(y * info.width + x) * info.channels] < 150) {
+          top = Math.min(top, y);
+          bottom = Math.max(bottom, y);
+        }
+      }
+    }
+
+    expect(bottom - top + 1).toBeGreaterThanOrEqual(7);
   });
 
   it('removes faint residual ink fragments after the primary erase pass', async () => {
