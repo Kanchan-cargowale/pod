@@ -28,11 +28,17 @@ function getWorker() {
  * paragraph/line structure.
  *
  * @param {string|Buffer} image path or buffer
+ * @param {{psm?: number, whitelist?: string}} [options] scoped to this recognition
  * @returns {Promise<{text: string, words: Array<{text:string, confidence:number, bbox:{x0:number,y0:number,x1:number,y1:number}}>}>}
  */
-async function recognize(image) {
+async function recognize(image, options = {}) {
   const worker = await getWorker();
-  const { data } = await worker.recognize(image, {}, { blocks: true, text: true });
+  // Per-recognition parameters are restored by Tesseract after the call;
+  // a digits-only header probe must never affect the next full-page pass.
+  const parameters = {};
+  if (options.psm !== undefined) parameters.tessedit_pageseg_mode = String(options.psm);
+  if (options.whitelist !== undefined) parameters.tessedit_char_whitelist = options.whitelist;
+  const { data } = await worker.recognize(image, parameters, { blocks: true, text: true });
 
   const words = [];
   for (const block of data.blocks || []) {

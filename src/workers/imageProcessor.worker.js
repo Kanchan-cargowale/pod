@@ -6,19 +6,21 @@ const { parentPort } = require('worker_threads');
 
 const ocrService = require('../services/ocr.service');
 const imageEditor = require('../services/imageEditor.service');
-const { shouldTryQuarterTurns } = require('../services/imageOrientation.service');
+const { getAlternativeRotations, orientationEvidence } = require('../services/imageOrientation.service');
 const {
   inferActualSiblingRegion,
   inferSiblingFromTableRules,
   inferSingleWeightRegionFromAnchor,
   isRegionWithinWeightValueBand,
   reconcileHeaderOwnedWeightRegions,
+  findWeightHeaderQualifiers,
   inferWeightRegionsFromAnchors,
   inferWeightRegionsFromTable,
   localizeWeightInkInCells,
 } = require('../services/weightRegionFallback.service');
 const {
   findShipmentId,
+  findHeaderShipmentId,
   findWeightAnchors,
   findWeightValueRegions,
   formatSharedReplacementWeight,
@@ -76,54 +78,6 @@ function extractCandidateIds(words, minConfidence) {
     .filter((t) => !seen.has(t));
 
   return [...candidates, ...merged];
-}
-
-function detectImageShipmentId(words, meta, matchedId = null) {
-  const candidates = [];
-  for (const word of words) {
-    const digits = String(word.text || '').replace(NON_DIGIT, '');
-    if (digits.length < 7 || digits.length > 12) continue;
-    const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
-    const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
-    if (centerY > meta.height * 0.25) continue;
-    candidates.push({
-      id: digits,
-      confidence: word.confidence || 0,
-      bbox: word.bbox,
-      source: 'image_header_ocr',
-      centerX,
-      centerY,
-    });
-  }
-  for (const candidate of buildMergedNumericCandidates(words)) {
-    if (candidate.text.length < 7 || candidate.text.length > 12 || !candidate.words?.length) continue;
-    const x0 = Math.min(...candidate.words.map((word) => word.bbox.x0));
-    const x1 = Math.max(...candidate.words.map((word) => word.bbox.x1));
-    const y0 = Math.min(...candidate.words.map((word) => word.bbox.y0));
-    const y1 = Math.max(...candidate.words.map((word) => word.bbox.y1));
-    const centerX = (x0 + x1) / 2;
-    const centerY = (y0 + y1) / 2;
-    if (centerY > meta.height * 0.25) continue;
-    candidates.push({
-      id: candidate.text,
-      confidence: candidate.confidence || 0,
-      bbox: { x0, y0, x1, y1 },
-      source: 'image_header_fragments',
-      centerX,
-      centerY,
-    });
-  }
-  const unique = [...new Map(candidates.map((candidate) => [candidate.id, candidate])).values()];
-  unique.forEach((candidate) => {
-    const height = candidate.bbox.y1 - candidate.bbox.y0;
-    candidate.score = candidate.confidence +
-      (candidate.centerX >= meta.width * 0.38 ? 35 : 0) +
-      (candidate.centerY <= meta.height * 0.16 ? 20 : 0) +
-      (candidate.id.length >= 8 && candidate.id.length <= 10 ? 18 : 0) +
-      Math.min(15, height) +
-      (matchedId && candidate.id === matchedId ? 45 : 0);
-  });
-  return unique.sort((a, b) => b.score - a.score)[0] || null;
 }
 
 function buildWeightClearBbox(region, meta, anchors) {
@@ -186,7 +140,7 @@ async function writeOutputNamedByShipmentId(outputPath, shipmentId, editedBuffer
 
 function isActualQualifierToken(text) {
   const normalized = String(text || '').replace(/[^a-z]/gi, '').toLowerCase();
-  if (/^(?:actual|ctual)$/.test(normalized)) return true;
+  if (/^(?:actual|ctual|acrual|actuai)$/.test(normalized)) return true;
 
   // Tesseract sometimes merges the dimensions heading and ACTUAL into one
   // token, for example `(L×W×H)[ACTUAL`. Accept only short header-like
@@ -196,33 +150,12 @@ function isActualQualifierToken(text) {
     normalized.endsWith('actual');
 }
 
-function isChargedQualifierToken(text) {
-  const normalized = String(text || '').replace(/[^a-z]/gi, '').toLowerCase();
-  // Do not accept product words such as "Charges", "Charger" or
-  // "charging" from SAID TO CONTAIN as a business-column heading.
-  return /^(?:charged|chargeable|chargd|chargeq|charget|cherged)$/.test(normalized);
-}
-
 function hasChargedHeaderEvidence(words, anchors, meta) {
-  return anchors.some((anchor) =>
-    anchor.words.some((word) => isChargedQualifierToken(word.text))
-  ) || words.some((word) => {
-    const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
-    const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
-    return isChargedQualifierToken(word.text) &&
-      centerX < meta.width * 0.62 && centerY > meta.height * 0.2 && centerY < meta.height * 0.72;
-  });
+  return Boolean(findWeightHeaderQualifiers(words, meta).charged);
 }
 
 function hasActualHeaderEvidence(words, anchors, meta) {
-  return anchors.some((anchor) =>
-    anchor.words.some((word) => isActualQualifierToken(word.text))
-  ) || words.some((word) => {
-    const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
-    const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
-    return isActualQualifierToken(word.text) &&
-      centerX < meta.width * 0.62 && centerY > meta.height * 0.2 && centerY < meta.height * 0.72;
-  });
+  return Boolean(findWeightHeaderQualifiers(words, meta).actual);
 }
 
 function findSaidToContainLeft(words, meta) {
@@ -276,7 +209,14 @@ async function writeReviewOutput(outputPath, imageId, imageInput) {
  *   4. Overwrite just those pixels with the new weight, byte-for-byte
  *      preserving everything else, and write the result to disk.
  */
-async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = false, preserveReason = null }) {
+async function processImage({
+  filePath,
+  outputPath,
+  idWeightMap,
+  filenameHint = null,
+  preserveOnly = false,
+  preserveReason = null,
+}) {
   const startedAtMs = Date.now();
   const elapsedMs = () => Date.now() - startedAtMs;
   const idSet = new Set(idWeightMap.keys());
@@ -285,7 +225,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   // uploaded sheet. This rescues scans whose header OCR is blank/noisy while
   // making it impossible for timestamps, row numbers or address digits to
   // become a fabricated match.
-  const filenameDigits = path.basename(filePath).match(/\d{7,12}/g) || [];
+  const filenameDigits = path.basename(filenameHint || filePath).match(/\d{7,12}/g) || [];
   const filenameId = filenameDigits
     .filter((digits) => idSet.has(digits))
     .sort((a, b) => b.length - a.length)[0] || null;
@@ -333,17 +273,41 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     });
     // A clean exact OCR read remains first choice. Otherwise an exact
     // filename+sheet agreement outranks fuzzy/noisy OCR.
-    const match = ocrMatch?.distance === 0 ? ocrMatch : (filenameMatch || ocrMatch);
+    let match = ocrMatch?.distance === 0 ? ocrMatch : (filenameMatch || ocrMatch);
+    const headerId = findHeaderShipmentId(words, meta);
+    const exactHeaderMatch = headerId ? findShipmentId(headerId.words, idSet, {
+      minConfidence: 20,
+      fuzzyMaxDistance: 0,
+      imageWidth: meta.width,
+      imageHeight: meta.height,
+    }) : null;
+    const headerDiffersByOneDigit = headerId && filenameMatch &&
+      headerId.id.length === filenameMatch.id.length &&
+      [...headerId.id].filter((digit, index) => digit !== filenameMatch.id[index]).length === 1;
+    if (exactHeaderMatch) {
+      match = exactHeaderMatch;
+    } else if (headerId?.confidence >= 80 && headerDiffersByOneDigit) {
+      // The filename and sheet jointly disambiguate one damaged header digit.
+      // Never apply this to a different-length or multi-digit conflict.
+      match = { ...filenameMatch, source: 'header_filename_repair' };
+    } else if (headerId?.confidence >= 80) {
+      // A clearly printed ID that is absent from the sheet must not borrow a
+      // phone/reference number or a conflicting filename's weight.
+      match = null;
+    }
     const anchors = findWeightAnchors(words);
     const regions = findWeightValueRegions(words, anchors, {
       imageHeight: meta.height,
       verticalWindowRatio: config.matching.verticalSearchWindowRatio,
       horizontalTolerancePx: config.matching.horizontalTolerancePx,
     });
-    return { input, meta, rotation, words, match, anchors, regions };
+    return { input, meta, rotation, words, match, headerId, anchors, regions };
   }
 
   function isBetterAnalysis(candidate, current) {
+    if (candidate.rotation !== current.rotation) {
+      return orientationEvidence(candidate) > orientationEvidence(current);
+    }
     const candidateDistance = candidate.match?.distance ?? Infinity;
     const currentDistance = current.match?.distance ?? Infinity;
     return (
@@ -371,6 +335,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
 
   async function readShipmentIdZones(input, meta) {
     const zones = [
+      { left: 0.48, top: 0, width: 0.30, height: 0.16, scale: 3, psm: 11 },
       { left: 0, top: 0, width: 1, height: 0.22, scale: 3 },
       { left: 0.42, top: 0, width: 0.58, height: 0.22, scale: 4 },
       { left: 0.32, top: 0, width: 0.38, height: 0.18, scale: 4 },
@@ -402,8 +367,9 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
         .png()
         .toBuffer();
       // eslint-disable-next-line no-await-in-loop
-      const zoneOcr = await ocrService.recognize(zoneInput);
+      const zoneOcr = await ocrService.recognize(zoneInput, { psm: zone.psm });
       words.push(...mapOcrWords(zoneOcr.words, scale, crop.left, crop.top));
+      if (findHeaderShipmentId(words, meta)?.confidence >= 80) break;
     }
 
     return words;
@@ -433,6 +399,23 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     let result = buildAnalysis(input, meta, rotation, words);
     let shipmentIdZoneWords = null;
 
+    if (orientationEvidence(result) < 35) {
+      // Bed/background pixels and the printed grid can defeat whole-page
+      // segmentation. A small interior table probe avoids those distractions
+      // and supplies content evidence for choosing the correct quarter-turn.
+      const crop = {
+        left: Math.floor(meta.width * 0.22), top: Math.floor(meta.height * 0.32),
+        width: Math.floor(meta.width * 0.35), height: Math.floor(meta.height * 0.30),
+      };
+      const scale = boundedOcrScale(crop.width, crop.height, Math.min(5, 1800 / crop.width));
+      const probe = await sharp(input).extract(crop)
+        .resize({ width: Math.round(crop.width * scale), height: Math.round(crop.height * scale) })
+        .greyscale().normalize().sharpen().png().toBuffer();
+      const probeOcr = await ocrService.recognize(probe, { psm: 11 });
+      result = buildAnalysis(input, meta, rotation,
+        mergeWords(words, mapOcrWords(probeOcr.words, scale, crop.left, crop.top)));
+    }
+
     async function getShipmentIdZoneWords() {
       if (!shipmentIdZoneWords) {
         shipmentIdZoneWords = await readShipmentIdZones(input, meta);
@@ -440,7 +423,8 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       return shipmentIdZoneWords;
     }
 
-    if (!result.match || result.match.distance > 0) {
+    if ((!result.headerId || !result.match || result.match.distance > 0) &&
+        (allowFallbackOcr || orientationEvidence(result) >= 35)) {
       const idZoneWords = await getShipmentIdZoneWords();
       if (idZoneWords.length) {
         const idZoneResult = buildAnalysis(
@@ -449,11 +433,18 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
           rotation,
           mergeWords(result.words, idZoneWords)
         );
-        if (isBetterAnalysis(idZoneResult, result)) result = idZoneResult;
+        result = idZoneResult;
       }
     }
 
-    if (allowFallbackOcr && result.regions.length < 2) {
+    const resultQualifiers = findWeightHeaderQualifiers(result.words, result.meta);
+    const resultHasUnsafeValue = result.regions.some((region) =>
+      region.bbox.y1 - region.bbox.y0 > Math.max(16, result.meta.height * 0.03)
+    );
+    const resultHasUnqualifiedPair = result.regions.length >= 2 &&
+      !(resultQualifiers.actual && resultQualifiers.charged);
+    if (allowFallbackOcr &&
+        (result.regions.length < 2 || resultHasUnsafeValue || resultHasUnqualifiedPair)) {
       // Faint scans can preserve readable values while Tesseract drops the
       // light-gray header or one of two adjacent weight columns. Enlarge a
       // temporary OCR-only copy, then map every detected coordinate back to
@@ -496,6 +487,8 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
           ...result,
           words: mergedEnhancedWords,
           anchors: enhancedResult.anchors,
+          match: enhancedResult.match,
+          headerId: enhancedResult.headerId,
         };
       }
     }
@@ -562,7 +555,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
         .toBuffer();
       const tile = await ocrService.recognize(tileInput);
       const tileWords = mapOcrWords(tile.words, tileScale, crop.left, crop.top);
-      const tileResult = buildAnalysis(input, meta, rotation, tileWords);
+      const tileResult = buildAnalysis(input, meta, rotation, mergeWords(result.words, tileWords));
       if (isBetterAnalysis(tileResult, result)) result = tileResult;
     }
 
@@ -570,33 +563,55 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     return result;
   }
 
-  const mayNeedQuarterTurn = shouldTryQuarterTurns(initialMeta);
+  // Start with one inexpensive OCR pass in the uploaded orientation. Running
+  // all enhanced fallbacks before checking rotation made a sideways landscape
+  // scan both slow and impossible to recover because canvas dimensions alone
+  // do not reveal text direction.
   let analysis = await inspectOrientation(initialInput, initialMeta, 0, {
-    allowFallbackOcr: !mayNeedQuarterTurn,
+    allowFallbackOcr: false,
   });
 
-  // A tall image may be an upright portrait scan or a sideways landscape
-  // label. Never reject it from dimensions alone. If the uploaded orientation
-  // cannot locate a weight, let OCR decide whether either quarter-turn is
-  // materially better and use that orientation for both editing and output.
-  if (mayNeedQuarterTurn && !analysis.regions.length) {
-    for (const rotation of [90, 270]) {
-      // eslint-disable-next-line no-await-in-loop
-      const rotatedInput = await sharp(initialInput).rotate(rotation).toBuffer();
-      // eslint-disable-next-line no-await-in-loop
-      const rotatedMeta = await sharp(rotatedInput).metadata();
-      // eslint-disable-next-line no-await-in-loop
-      const candidate = await inspectOrientation(rotatedInput, rotatedMeta, rotation, {
-        allowFallbackOcr: false,
-      });
+  // Let OCR content select orientation whenever the normal pass is weak.
+  // Checking every non-zero right-angle also recovers upside-down (180 degree)
+  // scans and sideways images whose stored dimensions happen to be landscape.
+  for (const rotation of getAlternativeRotations(analysis)) {
+    // eslint-disable-next-line no-await-in-loop
+    const rotatedInput = await sharp(initialInput).rotate(rotation).toBuffer();
+    // eslint-disable-next-line no-await-in-loop
+    const rotatedMeta = await sharp(rotatedInput).metadata();
+    // eslint-disable-next-line no-await-in-loop
+    const candidate = await inspectOrientation(rotatedInput, rotatedMeta, rotation, {
+      allowFallbackOcr: false,
+    });
 
-      if (isBetterAnalysis(candidate, analysis)) analysis = candidate;
+    if (isBetterAnalysis(candidate, analysis)) {
+      analysis = candidate;
+
+      // An exact mapped ID together with a real WEIGHT header/value pair is
+      // conclusive orientation evidence. Avoid another full-page OCR pass
+      // after the page is already known to be upright.
+      if (
+        candidate.match?.distance === 0 &&
+        orientationEvidence(candidate) >= 35
+      ) {
+        break;
+      }
     }
   }
 
-  if (analysis.fallbackOcrSkipped && analysis.regions.length < 2) {
+  const preliminaryQualifiers = findWeightHeaderQualifiers(analysis.words, analysis.meta);
+  const preliminaryUnsafeValue = analysis.regions.some((region) =>
+    region.bbox.y1 - region.bbox.y0 > Math.max(16, analysis.meta.height * 0.03)
+  );
+  const preliminaryUnqualifiedPair = analysis.regions.length >= 2 &&
+    !(preliminaryQualifiers.actual && preliminaryQualifiers.charged);
+  if (analysis.fallbackOcrSkipped &&
+      (analysis.regions.length < 2 || preliminaryUnsafeValue || preliminaryUnqualifiedPair)) {
     const fullAnalysis = await inspectOrientation(analysis.input, analysis.meta, analysis.rotation);
-    if (isBetterAnalysis(fullAnalysis, analysis)) analysis = fullAnalysis;
+    // These passes enrich the same oriented pixels. Retain their extra words
+    // even when the raw region count is unchanged; final cell recovery needs
+    // damaged header variants and values found only by the enlarged pass.
+    analysis = fullAnalysis;
   }
 
   const { input: processingInput, words, match, anchors } = analysis;
@@ -608,7 +623,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   // postal-number fragment and incorrectly rename an otherwise correct file.
   const detectedImageId = match
     ? { id: match.id, source: match.source || 'mapping_match' }
-    : detectImageShipmentId(words, analysis.meta, null);
+    : findHeaderShipmentId(words, analysis.meta);
 
   async function reviewResult(details) {
     const artifact = await writeReviewOutput(
@@ -1783,12 +1798,8 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   // sufficient. Keep exactly one region per proven business field and never
   // let a guessed sibling turn a single-ACTUAL label into two edits.
   const regionCenterX = (region) => (region.bbox.x0 + region.bbox.x1) / 2;
-  const canonicalQualifierForKind = (kind) => words
-    .filter((word) => kind === 'charged'
-      ? isChargedQualifierToken(word.text)
-      : isActualQualifierToken(word.text))
-    .filter((word) => word.bbox.x0 < analysis.meta.width * 0.68)
-    .sort((a, b) => b.confidence - a.confidence)[0];
+  const finalHeaderQualifiers = findWeightHeaderQualifiers(words, analysis.meta);
+  const canonicalQualifierForKind = (kind) => finalHeaderQualifiers[kind];
   const regionEvidenceScore = (region, kind) => {
     const text = String(region.anchorText || '').toLowerCase();
     const original = String(region.originalText || '').trim();
@@ -1953,6 +1964,12 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
     expectedRegionCount = 2;
   }
 
+  // Reconcile before geometry rejection as well as before painting. A stale
+  // structural fallback may point at the footnote even though the enhanced
+  // pass has now read the two exact header-owned numeric boxes.
+  regions = reconcileHeaderOwnedWeightRegions(regions, words, analysis.meta);
+  if (regions.length === 2) expectedRegionCount = 2;
+
   // Reject a pair that still resolves to the same physical cell. This catches
   // duplicated base/enhanced OCR tokens and prevents rendering the same value
   // two or three times in one box.
@@ -1981,7 +1998,9 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   if (!match) {
     return reviewResult({
       status: 'unmatched',
-      reason: 'No shipment ID from the mapping sheet was found in the scanned label text',
+      reason: detectedImageId?.id
+        ? `Printed shipment ID ${detectedImageId.id} was detected, but no exact row exists in the uploaded mapping sheet`
+        : 'No shipment ID from the mapping sheet was found in the scanned label text',
       detectedNumbers: extractCandidateIds(words, config.ocrMinConfidence),
       processingMs: elapsedMs(),
     });
@@ -2065,12 +2084,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   // CONTAIN even though the qualifier heading itself is clear. Before any
   // erase/render operation, snap an outlying box back to the left-aligned
   // value position directly beneath its own ACTUAL/CHARGED heading.
-  const qualifierForKind = (kind) => words
-    .filter((word) => kind === 'charged'
-      ? isChargedQualifierToken(word.text)
-      : isActualQualifierToken(word.text))
-    .filter((word) => word.bbox.x0 < analysis.meta.width * 0.68)
-    .sort((a, b) => b.confidence - a.confidence)[0];
+  const qualifierForKind = canonicalQualifierForKind;
   regions = regions.map((region) => {
     const qualifier = qualifierForKind(region.kind);
     if (!qualifier) return region;
@@ -2340,6 +2354,13 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       headerBottom,
     };
   });
+  // Lock business-cell ownership before pixel scanning. This is especially
+  // important on dark scans where OCR retains CHARGED + WEIGHT + CONTAIN but
+  // loses ACTUAL: those headers prove two adjacent cells even when the first
+  // pass found only one damaged value token.
+  regions = reconcileHeaderOwnedWeightRegions(regions, words, analysis.meta);
+  if (regions.length === 2) expectedRegionCount = 2;
+
   regions = await localizeWeightInkInCells(
     processingInput,
     regions.map((region) => ({
@@ -2355,6 +2376,7 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   // final boundary so a faint sibling cannot disappear or drift into SAID TO
   // CONTAIN after the earlier schema checks succeeded.
   regions = reconcileHeaderOwnedWeightRegions(regions, words, analysis.meta);
+  if (regions.length === 2) expectedRegionCount = 2;
   // This is the final region-producing step. Enforce the value-row band here
   // so no OCR/table fallback can place replacement text in signatures or the
   // footer after an earlier geometry check has already run.
@@ -2370,6 +2392,21 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
   });
 
   const newWeight = idWeightMap.get(match.id);
+
+  // No later localization/filter may turn a proven pair into a successful
+  // one-field edit. Preserve the original for review rather than publishing
+  // a half-updated label if either owned cell is still unsafe.
+  if (expectedRegionCount === 2 &&
+      (regions.length !== 2 || !regions.some((region) => region.kind === 'actual') ||
+        !regions.some((region) => region.kind === 'charged'))) {
+    return reviewResult({
+      status: 'partial_weight_detection',
+      shipmentId: match.id,
+      newWeight,
+      reason: 'Both weight columns were identified but could not both be safely localized; original image preserved',
+      processingMs: elapsedMs(),
+    });
+  }
 
   if (!regions.length) {
     return reviewResult({
@@ -2524,11 +2561,11 @@ async function processImage({ filePath, outputPath, idWeightMap, preserveOnly = 
       );
       clearBbox.y0 = Math.max(
         0,
-        editBbox.y0 - Math.max(1, Math.min(3, regionHeight * 0.18))
+        editBbox.y0 - Math.max(2, Math.min(4, regionHeight * 0.3))
       );
       clearBbox.y1 = Math.min(
         analysis.meta.height,
-        editBbox.y1 + Math.max(2, Math.min(5, regionHeight * 0.3))
+        editBbox.y1 + Math.max(3, Math.min(7, regionHeight * 0.5))
       );
     } else if (originalTextIsReliable) {
       // Clean OCR values should be fully removed, including antialiasing, but

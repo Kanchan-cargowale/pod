@@ -181,6 +181,39 @@ function candidatePositionScore(candidate, opts, medianWordHeight) {
   return score;
 }
 
+function findHeaderShipmentId(words, meta = {}) {
+  if (!meta.width || !meta.height) return null;
+  const numericHeaderToken = (word) => /^[0-9OQDILSZGB|]+$/i.test(String(word.text || '').trim());
+  const deliveredTop = words.filter((word) => /delivered/i.test(word.text) && word.bbox.x0 >= meta.width * 0.42 &&
+    word.bbox.y0 < meta.height * 0.3).map((word) => word.bbox.y0);
+  const headerBottom = Math.min(meta.height * 0.20, ...deliveredTop);
+  const eligible = words.filter((word) => numericHeaderToken(word) &&
+    word.bbox.x0 >= meta.width * 0.42 && word.bbox.y1 <= headerBottom + 2);
+  const candidates = [
+    // Keep repaired digits, not the shorter number obtained by deleting an
+    // OCR-confused glyph from the middle of the printed identifier.
+    ...eligible.map((word) => ({
+      text: numericTokenVariants(word.text).at(-1),
+      confidence: word.confidence,
+      words: [word],
+    })),
+    ...buildMergedNumericCandidates(eligible).filter((candidate) => candidate.words.length > 1),
+  ].filter((candidate) => /^\d{8,12}$/.test(candidate.text) && candidate.confidence >= 20)
+    .map((candidate) => {
+      const bbox = {
+        x0: Math.min(...candidate.words.map((word) => word.bbox.x0)),
+        x1: Math.max(...candidate.words.map((word) => word.bbox.x1)),
+        y0: Math.min(...candidate.words.map((word) => word.bbox.y0)),
+        y1: Math.max(...candidate.words.map((word) => word.bbox.y1)),
+      };
+      const height = bbox.y1 - bbox.y0;
+      const score = candidate.confidence + Math.min(25, height) +
+        (bbox.x0 < meta.width * 0.8 ? 30 : 0) + (candidate.text.length === 9 ? 10 : 0);
+      return { id: candidate.text, confidence: candidate.confidence, words: candidate.words, bbox, score, source: 'image_header_ocr' };
+    }).filter((candidate) => candidate.bbox.x1 - candidate.bbox.x0 >= (candidate.bbox.y1 - candidate.bbox.y0) * 1.8);
+  return candidates.sort((a, b) => b.score - a.score)[0] || null;
+}
+
 /**
  * Finds the shipment ID present on a label out of a known set of IDs
  * (the keys of the uploaded Excel mapping). Matching order:
@@ -630,6 +663,7 @@ function formatSharedReplacementWeight(newWeight, regions) {
 }
 
 module.exports = {
+  findHeaderShipmentId,
   findShipmentId,
   findWeightAnchors,
   findWeightValueRegions,

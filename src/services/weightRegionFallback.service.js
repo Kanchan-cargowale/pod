@@ -1,6 +1,7 @@
 'use strict';
 
 const sharp = require('sharp');
+const { levenshtein } = require('../utils/levenshtein');
 
 function groupAdjacentXs(xs) {
   const groups = [];
@@ -154,6 +155,34 @@ function findInkClusters(data, info, cell, headerBottom) {
     .sort((a, b) => a.top - b.top);
 }
 
+function expandFaintInkRows(data, info, cluster, minimumTop) {
+  const radius = Math.max(6, Math.ceil(info.height * 0.012), Math.ceil(cluster.height * 0.8));
+  const top = Math.max(minimumTop, cluster.top - radius);
+  const bottom = Math.min(info.height, cluster.bottom + radius);
+  const thresholds = new Map();
+  for (let x = cluster.left; x < cluster.right; x += 1) {
+    const samples = [];
+    for (let y = top; y < bottom; y += 1) samples.push(data[y * info.width + x]);
+    const paper = percentileNumber(samples, 0.8);
+    thresholds.set(x, paper - Math.max(7, paper * 0.055));
+  }
+  const rowHasInk = (y) => {
+    let ink = 0;
+    for (let x = cluster.left; x < cluster.right; x += 1) {
+      if (data[y * info.width + x] < thresholds.get(x)) ink += 1;
+    }
+    // Column-local contrast excludes a persistent vertical rule, while the
+    // upper occupancy bound rejects horizontal rules and broad shadows.
+    const width = cluster.right - cluster.left;
+    return ink >= Math.max(3, width * 0.025) && ink < width * 0.65;
+  };
+  let expandedTop = cluster.top;
+  let expandedBottom = cluster.bottom;
+  for (let y = cluster.top - 1; y >= top && rowHasInk(y); y -= 1) expandedTop = y;
+  for (let y = cluster.bottom; y < bottom && rowHasInk(y); y += 1) expandedBottom = y + 1;
+  return { ...cluster, top: expandedTop, bottom: expandedBottom, height: expandedBottom - expandedTop };
+}
+
 function bboxForInkCluster(data, info, cluster) {
   const inkByX = new Map();
   const rowHeight = Math.max(1, cluster.bottom - cluster.top);
@@ -259,7 +288,11 @@ async function localizeWeightInkInCells(imageInput, regions, meta = {}) {
   // glyph is normally sized. The cell boundary and rule-row rejection remain
   // the hard safety constraints; do not discard that complete slanted row.
   const maxSafeHeight = Math.max(18, (meta.height || info.height) * 0.045);
-  const minimumHeaderGap = Math.max(5, info.height * 0.007);
+  // Faint Delhivery labels can print the value only 3-4 pixels below the
+  // second header line at source resolution. Rule rejection below remains
+  // the safety boundary, so accepting that small gap recovers the real value
+  // without widening the search into the header itself.
+  const minimumHeaderGap = Math.max(3, info.height * 0.004);
   const rowTolerance = Math.max(8, info.height * 0.018);
 
   const searches = regions.map((region) => {
@@ -281,6 +314,11 @@ async function localizeWeightInkInCells(imageInput, regions, meta = {}) {
     );
     const candidates = findInkClusters(data, info, cell, headerBottom)
       .filter((cluster) => cluster.top - headerBottom >= minimumHeaderGap)
+      // A strong seed can contain only the bottoms of faint digits. Extend
+      // through connected lighter strokes before measuring the full number.
+      .map((cluster) => expandFaintInkRows(
+        data, info, cluster, Math.ceil(headerBottom + minimumHeaderGap)
+      ))
       .map((cluster) => ({ cluster, bbox: bboxForInkCluster(data, info, cluster) }))
       .filter(({ bbox }) => {
         if (!bbox) return false;
@@ -1074,26 +1112,138 @@ function isRegionWithinWeightValueBand(region, anchors, meta) {
 }
 
 /**
- * Reassert ACTUAL/CHARGED ownership after pixel localization. A faint value
+ * Reassert ACTUAL/CHARGED ownership around pixel localization. A faint value
  * row can make the first ink cluster in CHARGED look like product text in the
  * following SAID TO CONTAIN cell. Explicit qualifiers are authoritative: they
  * define both cell boundaries and can recover a sibling that a later scan
  * refinement accidentally dropped.
+ *
+ * Some dark scans lose only the ACTUAL qualifier while retaining CHARGED,
+ * WEIGHT and CONTAIN. That combination also proves two business fields: the
+ * charged cell is the ruled cell immediately before CONTAIN and ACTUAL is the
+ * equal-width ruled cell immediately to its left. Requiring all three tokens
+ * prevents a single-ACTUAL label followed by SAID TO CONTAIN from gaining a
+ * fabricated CHARGED edit.
  */
+function findWeightHeaderQualifiers(words, meta) {
+  if (!Array.isArray(words) || !meta?.width || !meta?.height) return {};
+  const normalized = (text) => String(text || '').replace(/[^a-z]/gi, '').toLowerCase();
+  const inHeaderBand = (word) => word?.bbox &&
+    word.bbox.x0 < meta.width * 0.62 &&
+    word.bbox.y0 >= meta.height * 0.18 && word.bbox.y0 <= meta.height * 0.62;
+  const actual = words
+    .filter(inHeaderBand)
+    .filter((word) => {
+      const text = normalized(word.text);
+      return /^(?:actual|ctual|acrual|actuai)$/.test(text) ||
+        (text.length <= 14 && text.endsWith('actual'));
+    })
+    .sort((a, b) => b.confidence - a.confidence)[0];
+  const chargedCandidates = words
+    .filter(inHeaderBand)
+    .filter((word) => {
+      const text = normalized(word.text);
+      if (/^charg(?:er|ers|es|ing)$/.test(text)) return false;
+      return /^(?:charged|chargeable|chargd|chargeq|charget|cherged|crarged|crargd)$/.test(text) ||
+        (text.length >= 6 && text.length <= 8 && levenshtein(text, 'charged') <= 1);
+    });
+  const rowTolerance = Math.max(10, meta.height * 0.035);
+  const containFor = (qualifier) => words
+    .filter((word) => /^(?:said|sain|contain|contam|contan|contai|comtain)$/.test(normalized(word.text)))
+    .filter((word) => word.bbox.x0 > qualifier.bbox.x0 + meta.width * 0.045 &&
+      word.bbox.x0 < qualifier.bbox.x0 + meta.width * 0.22 &&
+      Math.abs(word.bbox.y0 - qualifier.bbox.y0) <= meta.height * 0.075)
+    .sort((a, b) => a.bbox.x0 - b.bbox.x0)[0];
+  const charged = chargedCandidates
+    .filter((word) => {
+      if (actual) {
+        const separation = word.bbox.x0 - actual.bbox.x0;
+        return separation >= meta.width * 0.055 && separation <= meta.width * 0.18 &&
+          Math.abs(word.bbox.y0 - actual.bbox.y0) <= rowTolerance;
+      }
+      // A lone "charged" in the bottom footnote is not a column heading.
+      // Without ACTUAL, require the adjacent CONTAIN header to establish the
+      // table row before it can authorize sibling recovery.
+      return Boolean(containFor(word));
+    })
+    .sort((a, b) => b.confidence - a.confidence)[0];
+  return { actual, charged, contain: charged ? containFor(charged) : undefined };
+}
+
 function reconcileHeaderOwnedWeightRegions(regions, words, meta) {
   if (!Array.isArray(regions) || !Array.isArray(words) || !meta?.width || !meta?.height) {
     return regions || [];
   }
   const normalized = (text) => String(text || '').replace(/[^a-z]/gi, '').toLowerCase();
-  const actualWords = words.filter((word) => /^(?:actual|ctual)$/.test(normalized(word.text)));
-  const chargedWords = words.filter((word) =>
-    /^(?:charged|chargeable|chargd|chargeq|charget|cherged)$/.test(normalized(word.text))
-  );
-  const actual = [...actualWords].sort((a, b) => b.confidence - a.confidence)[0];
-  const charged = chargedWords
-    .filter((word) => !actual || word.bbox.x0 > actual.bbox.x0)
-    .sort((a, b) => b.confidence - a.confidence)[0];
-  if (!actual || !charged) return regions;
+  const { actual, charged, contain: adjacentContain } = findWeightHeaderQualifiers(words, meta);
+  if (!charged) {
+    // Single-column structural fallbacks can drift into the wider BOXES cell.
+    // A compact ACTUAL qualifier is a safer left-rule hint than that estimate.
+    if (!actual || regions.length !== 1 || regions[0].kind !== 'actual' ||
+        !regions[0].cellBounds || actual.bbox.x1 - actual.bbox.x0 > meta.width * 0.16) {
+      return regions;
+    }
+    const region = regions[0];
+    const left = Math.max(0, actual.bbox.x0 - Math.max(3, Math.min(12, meta.width * 0.004)));
+    if (left >= region.cellBounds.x1 || region.bbox.x1 <= left) return regions;
+    return [{ ...region, cellBounds: { ...region.cellBounds, x0: left } }];
+  }
+
+  if (!actual) {
+    const chargedCenterX = (charged.bbox.x0 + charged.bbox.x1) / 2;
+    const chargedWeight = words
+      .filter((word) => /^(?:weight|weigh|weightkg|weighkg|wt|kg)$/.test(normalized(word.text)))
+      .filter((word) => {
+        const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
+        return Math.abs(centerX - chargedCenterX) <= meta.width * 0.075 &&
+          Math.abs(word.bbox.y0 - charged.bbox.y0) <= meta.height * 0.065;
+      })
+      .sort((a, b) => Math.abs(a.bbox.x0 - charged.bbox.x0) - Math.abs(b.bbox.x0 - charged.bbox.x0))[0];
+    const contain = adjacentContain;
+    if (!chargedWeight || !contain) return regions;
+
+    const guard = Math.max(2, meta.width * 0.003);
+    const chargedLeft = charged.bbox.x0 - guard;
+    const chargedRight = contain.bbox.x0 - guard;
+    const columnWidth = chargedRight - chargedLeft;
+    const actualLeft = chargedLeft - columnWidth;
+    if (columnWidth < meta.width * 0.055 || columnWidth > meta.width * 0.18 ||
+        actualLeft < meta.width * 0.12 || chargedRight > meta.width * 0.62) {
+      return regions;
+    }
+
+    const headerBottom = Math.max(charged.bbox.y1, chargedWeight.bbox.y1);
+    const valueY0 = Math.min(
+      meta.height - 4,
+      Math.round(headerBottom + Math.max(3, meta.height * 0.006))
+    );
+    const valueHeight = Math.max(10, Math.round(meta.height * 0.022));
+    const makeRegion = (kind, left, right) => {
+      const source = regions.find((region) => region.kind === kind && region.cellBounds &&
+        region.bbox.x0 >= left && region.bbox.x1 <= right &&
+        region.bbox.y0 >= headerBottom - 2 &&
+        region.bbox.y1 <= headerBottom + meta.height * 0.12);
+      return {
+        ...(source || {}),
+        bbox: source ? { ...source.bbox } : {
+          x0: Math.round(left + Math.max(3, columnWidth * 0.045)),
+          y0: valueY0,
+          x1: Math.round(Math.min(right - 3, left + columnWidth * 0.58)),
+          y1: Math.min(meta.height, valueY0 + valueHeight),
+        },
+        cellBounds: { x0: left, x1: right },
+        originalText: source?.originalText || '',
+        anchorText: `header-geometry ${kind.toUpperCase()} WEIGHT value`,
+        kind,
+        anchorBbox: kind === 'charged' ? { ...charged.bbox } : undefined,
+        headerBottom,
+      };
+    };
+    return [
+      makeRegion('actual', actualLeft, chargedLeft),
+      makeRegion('charged', chargedLeft, chargedRight),
+    ];
+  }
 
   const columnStep = charged.bbox.x0 - actual.bbox.x0;
   if (columnStep < meta.width * 0.055 || columnStep > meta.width * 0.18) return regions;
@@ -1103,7 +1253,15 @@ function reconcileHeaderOwnedWeightRegions(regions, words, meta) {
     .filter((word) => /^(?:said|sain|contain|comtain)$/.test(normalized(word.text)))
     .filter((word) => word.bbox.x0 > charged.bbox.x0)
     .sort((a, b) => a.bbox.x0 - b.bbox.x0)[0]?.bbox.x0;
-  const actualLeft = Math.max(0, actual.bbox.x0 - Math.max(3, meta.width * 0.008));
+  // Header text is only slightly inset from the physical rule. A broad 0.8%
+  // page subtraction could put the ownership hint across the previous BOXES
+  // divider on high-resolution PDFs, which in turn let erasure touch that
+  // line. Keep the estimate within a small bounded inset; the renderer's rule
+  // tracer resolves the exact skewed path from there.
+  const actualLeft = Math.max(
+    0,
+    actual.bbox.x0 - Math.max(3, Math.min(12, meta.width * 0.004))
+  );
   const chargedRight = Number.isFinite(saidLeft) && saidLeft > separator
     ? saidLeft - Math.max(2, meta.width * 0.003)
     : separator + columnStep;
@@ -1136,11 +1294,18 @@ function reconcileHeaderOwnedWeightRegions(regions, words, meta) {
         const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
         return centerX > left && centerX < right;
       })
-      .sort((a, b) =>
-        Math.abs(a.word.bbox.x0 - qualifier.bbox.x0) -
-        Math.abs(b.word.bbox.x0 - qualifier.bbox.x0) ||
-        a.word.bbox.y0 - b.word.bbox.y0
-      )[0];
+      .sort((a, b) => {
+        const aHeight = a.word.bbox.y1 - a.word.bbox.y0;
+        const bHeight = b.word.bbox.y1 - b.word.bbox.y0;
+        const maxValueHeight = Math.max(16, meta.height * 0.03);
+        const aMergedPenalty = aHeight > maxValueHeight ? 1 : 0;
+        const bMergedPenalty = bHeight > maxValueHeight ? 1 : 0;
+        return aMergedPenalty - bMergedPenalty ||
+          Math.abs(a.word.bbox.x0 - qualifier.bbox.x0) -
+          Math.abs(b.word.bbox.x0 - qualifier.bbox.x0) ||
+          (Number(b.word.confidence) || 0) - (Number(a.word.confidence) || 0) ||
+          a.word.bbox.y0 - b.word.bbox.y0;
+      })[0];
     const sourceIsInside = source && regionCenterX(source) > left && regionCenterX(source) < right;
     const sourceNearQualifier = sourceIsInside &&
       Math.abs(source.bbox.x0 - qualifier.bbox.x0) <= Math.max(8, meta.width * 0.035);
@@ -1344,6 +1509,7 @@ module.exports = {
   inferSingleWeightRegionFromAnchor,
   isRegionWithinWeightValueBand,
   reconcileHeaderOwnedWeightRegions,
+  findWeightHeaderQualifiers,
   inferWeightRegionsFromTable,
   localizeWeightInkInCells,
 };

@@ -170,7 +170,7 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
     const outputPath = path.join(outputsDir, filename);
 
     const result = await pool
-      .run({ filePath, outputPath, idWeightMap })
+      .run({ filePath, outputPath, idWeightMap, filenameHint: sourceFilename })
       .then((result) => ({
         originalFilename: sourceFilename,
         sourceType: pageNumber ? 'pdf' : 'image',
@@ -202,6 +202,7 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
             filePath,
             outputPath,
             idWeightMap,
+            filenameHint: sourceFilename,
             preserveOnly: true,
             preserveReason: err.message,
           });

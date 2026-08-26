@@ -96,7 +96,7 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
       .expect(400);
   });
 
-  it('preserves an unmatched review image and renames it from the scanned header ID', async () => {
+  it('preserves an unmapped printed ID even when its filename matches another mapping row', async () => {
     const ExcelJS = require('exceljs');
     const fs = require('fs');
     const os = require('os');
@@ -110,7 +110,7 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     try {
       const createRes = await request(app)
         .post('/api/jobs')
-        .attach('images', IMAGE_FIXTURE)
+        .attach('images', IMAGE_FIXTURE, { filename: 'LM_POD_999999999.jpeg' })
         .attach('mapping', reviewMapping)
         .expect(202);
       let job;
@@ -123,6 +123,9 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
       }
       expect(job.status).toBe('completed');
       expect(job.results[0].status).toBe('unmatched');
+      expect(job.results[0].detectedImageId).toBe('307775718');
+      expect(job.results[0].replacedRegions).toBeUndefined();
+      expect(job.results[0].reason).toContain('no exact row exists in the uploaded mapping sheet');
       expect(job.results[0].downloadable).toBe(true);
       expect(job.results[0].outputFilename).toBe('307775718.jpeg');
       expect(fs.existsSync(path.join(jobService.getOutputsDir(job.jobId), '307775718.jpeg'))).toBe(true);
@@ -234,6 +237,50 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     });
     expect(job.results[0].replacedRegions.length).toBeGreaterThan(0);
     expect(job.results[0].errorCode).not.toBe('image_rotation');
+  });
+
+  it('detects and edits a physically upside-down landscape label', async () => {
+    const fs = require('fs');
+    const os = require('os');
+    const sharp = require('sharp');
+    const rotatedImage = path.join(os.tmpdir(), `pod-upside-down-${Date.now()}.jpeg`);
+
+    await sharp(IMAGE_FIXTURE).rotate(180).jpeg({ quality: 95 }).toFile(rotatedImage);
+
+    let createRes;
+    try {
+      createRes = await request(app)
+        .post('/api/jobs')
+        .attach('images', rotatedImage, {
+          filename: 'LM_POD_307775718_upside_down.jpeg',
+          contentType: 'image/jpeg',
+        })
+        .attach('mapping', MAPPING_FIXTURE)
+        .expect(202);
+    } finally {
+      fs.rmSync(rotatedImage, { force: true });
+    }
+
+    let job;
+    for (let i = 0; i < 120; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      job = (await request(app).get(`/api/jobs/${createRes.body.jobId}`).expect(200)).body;
+      if (job.status === 'completed' || job.status === 'failed') break;
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(1000);
+    }
+
+    expect(job.status).toBe('completed');
+    expect(job.results).toHaveLength(1);
+    expect(job.results[0]).toMatchObject({
+      status: 'ok',
+      shipmentId: '307775718',
+      appliedRotation: 180,
+      newWeight: 900,
+    });
+    expect(job.results[0].replacedRegions).toHaveLength(2);
+    expect(job.results[0].replacedRegions.map((region) => region.newText))
+      .toEqual(['900.00', '900.00']);
   });
 
   it('rejects a job with no mapping workbook', async () => {

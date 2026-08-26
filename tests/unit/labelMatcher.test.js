@@ -2,6 +2,7 @@
 
 const {
   findShipmentId,
+  findHeaderShipmentId,
   findWeightAnchors,
   findWeightValueRegions,
   formatReplacementWeight,
@@ -30,6 +31,46 @@ const SAMPLE_WORDS = [
 const IMAGE_HEIGHT = 3024;
 
 describe('labelMatcher.service', () => {
+  describe('findHeaderShipmentId', () => {
+    const meta = { width: 1100, height: 780 };
+    const word = (text, x0, y0, x1, y1, confidence = 95) =>
+      ({ text, confidence, bbox: { x0, y0, x1, y1 } });
+
+    it('identifies the printed header instead of a phone number in the address', () => {
+      const header = word('312703193', 580, 40, 686, 60, 88);
+      const words = [
+        word('9315308329', 300, 115, 389, 132, 99),
+        word('MOB-9315308329', 610, 123, 720, 137),
+        word('DELIVERED', 640, 83, 718, 95),
+        word('2260431076469', 295, 267, 414, 281),
+        header,
+      ];
+      expect(findHeaderShipmentId(words, meta)?.id).toBe('312703193');
+      expect(findHeaderShipmentId(words.filter((item) => item !== header), meta)).toBeNull();
+    });
+
+    it('reassembles adjacent fragments of the upper shipment number', () => {
+      const words = [
+        word('312', 580, 40, 615, 60),
+        word('703', 617, 41, 650, 61),
+        word('193', 652, 42, 687, 62),
+      ];
+      expect(findHeaderShipmentId(words, meta)?.id).toBe('312703193');
+    });
+
+    it('repairs a confused glyph without shortening the ID', () => {
+      expect(findHeaderShipmentId([
+        word('3127O31934', 580, 40, 701, 60),
+      ], meta)?.id).toBe('3127031934');
+    });
+
+    it('does not treat dates, weak OCR or unpositioned numbers as shipment IDs', () => {
+      expect(findHeaderShipmentId([word('08/08/2026', 600, 40, 700, 60)], meta)).toBeNull();
+      expect(findHeaderShipmentId([word('312703193', 580, 40, 686, 60, 10)], meta)).toBeNull();
+      expect(findHeaderShipmentId([word('312703193', 580, 40, 686, 60)])).toBeNull();
+    });
+  });
+
   describe('findShipmentId', () => {
     it('finds an exact match against the mapping key set', () => {
       const idSet = new Set(['307775718', '307479457']);

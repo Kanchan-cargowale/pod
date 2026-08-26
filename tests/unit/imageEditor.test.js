@@ -324,6 +324,155 @@ describe('imageEditor.service', () => {
     }
   });
 
+  it('never paints over a traced faint divider when the old value begins beside it', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="150" height="90" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="150" height="90" fill="rgb(238,241,245)" />' +
+          '<path d="M20 0 L21 90" stroke="rgb(105,108,112)" stroke-width="2" />' +
+          '<text x="23" y="51" font-family="Arial" font-size="17" ' +
+          'fill="rgb(92,95,100)">236.0</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+    const before = await sharp(input).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const edited = await replaceWeightRegions(input, [{
+      bbox: { x0: 22, y0: 34, x1: 70, y1: 53 },
+      clearBbox: { x0: 18, y0: 30, x1: 82, y1: 58 },
+      textBounds: { x0: 26, x1: 105 },
+      leftRuleHint: 20,
+      originalText: '236.0',
+      replacementText: '',
+      forceInteriorErase: true,
+    }]);
+    const after = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+
+    // The entire original divider strip remains byte-for-byte unchanged.
+    for (let y = 0; y < before.info.height; y += 1) {
+      for (const x of [19, 20, 21, 22]) {
+        const offset = (y * before.info.width + x) * before.info.channels;
+        expect(after.data.subarray(offset, offset + 3)).toEqual(
+          before.data.subarray(offset, offset + 3)
+        );
+      }
+    }
+
+    // Old glyph ink immediately to the right is still removed completely.
+    for (let y = 35; y < 54; y += 1) {
+      for (let x = 24; x < 72; x += 1) {
+        const offset = (y * after.info.width + x) * after.info.channels;
+        expect(after.data[offset]).toBeGreaterThan(200);
+      }
+    }
+  });
+
+  it('overrides a distant OCR boundary hint with the physical divider', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="2400" height="150" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="2400" height="150" fill="rgb(239,242,246)" />' +
+          '<line x1="570" y1="0" x2="570" y2="150" ' +
+          'stroke="rgb(82,86,92)" stroke-width="2" />' +
+          '<text x="578" y="92" font-family="Arial" font-size="25" ' +
+          'fill="rgb(72,76,82)">114.78</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+    const edited = await replaceWeightRegions(input, [{
+      // Reproduce 306601407: OCR and header geometry both begin well left of
+      // the actual ruled cell, beyond the old 28px divider-search ceiling.
+      bbox: { x0: 542, y0: 68, x1: 674, y1: 95 },
+      clearBbox: { x0: 532, y0: 64, x1: 700, y1: 100 },
+      textBounds: { x0: 536, x1: 720 },
+      leftRuleHint: 530,
+      originalText: '114.78',
+      replacementText: '300.00',
+      forceInteriorErase: true,
+    }]);
+    const { data, info } = await sharp(edited).removeAlpha().raw()
+      .toBuffer({ resolveWithObject: true });
+
+    // No replacement ink may appear on the estimated-hint side of the real
+    // divider. The divider itself remains dark and continuous.
+    for (let y = 64; y < 102; y += 1) {
+      for (let x = 535; x < 568; x += 1) {
+        const offset = (y * info.width + x) * info.channels;
+        expect(data[offset]).toBeGreaterThan(205);
+      }
+      const lineOffset = (y * info.width + 570) * info.channels;
+      expect(data[lineOffset]).toBeLessThan(140);
+    }
+  });
+
+  it('finds a pale divider beyond a low-resolution hint without following darker dimension digits', async () => {
+    const input = await sharp(Buffer.from(
+      '<svg width="1024" height="757" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect width="1024" height="757" fill="#fafafa" />' +
+        '<path d="M256 240V460" stroke="#b0b0b0" stroke-width="1.5" />' +
+        [270, 283, 296, 309, 322, 335, 348].map((y) =>
+          `<text x="215" y="${y}" font-family="Arial" font-size="12" fill="#444">38x32</text>`
+        ).join('') +
+        '<text x="260" y="302" font-family="Arial" font-size="12" fill="#666">1274.25</text>' +
+        '</svg>'
+    )).png().toBuffer();
+    const before = await sharp(input).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    const edited = await replaceWeightRegions(input, [{
+      bbox: { x0: 260, y0: 291, x1: 302, y1: 304 },
+      clearBbox: { x0: 216, y0: 287, x1: 310, y1: 315 },
+      textBounds: { x0: 222, x1: 390 },
+      leftRuleHint: 214.55,
+      originalText: '1274.25',
+      replacementText: '',
+      forceInteriorErase: true,
+    }]);
+    const after = await sharp(edited).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+
+    for (let y = 287; y < 316; y += 1) {
+      for (let x = 214; x <= 256; x += 1) {
+        const offset = (y * before.info.width + x) * before.info.channels;
+        expect(after.data.subarray(offset, offset + 3)).toEqual(before.data.subarray(offset, offset + 3));
+      }
+    }
+    for (let y = 291; y < 304; y += 1) {
+      for (let x = 260; x < 303; x += 1) {
+        expect(after.data[(y * after.info.width + x) * after.info.channels]).toBeGreaterThan(220);
+      }
+    }
+  });
+
+  it('clears the full page-scaled glyph height when charged-weight OCR is truncated', async () => {
+    const input = await sharp(
+      Buffer.from(
+        '<svg width="2400" height="140" xmlns="http://www.w3.org/2000/svg">' +
+          '<rect width="2400" height="140" fill="rgb(238,241,245)" />' +
+          '<line x1="400" y1="0" x2="400" y2="140" ' +
+          'stroke="rgb(90,94,100)" stroke-width="2" />' +
+          '<text x="405" y="82" font-family="Arial" font-size="26" ' +
+          'fill="rgb(80,84,90)">211.1</text>' +
+          '</svg>'
+      )
+    ).png().toBuffer();
+    const edited = await replaceWeightRegions(input, [{
+      // Deliberately model OCR seeing only the top 8px of a 26px value.
+      bbox: { x0: 405, y0: 56, x1: 468, y1: 64 },
+      clearBbox: { x0: 397, y0: 53, x1: 490, y1: 68 },
+      textBounds: { x0: 410, x1: 540 },
+      leftRuleHint: 400,
+      originalText: '211.1',
+      replacementText: '',
+      forceInteriorErase: true,
+    }]);
+    const { data, info } = await sharp(edited).removeAlpha().raw()
+      .toBuffer({ resolveWithObject: true });
+
+    for (let y = 65; y < 84; y += 1) {
+      for (let x = 405; x < 475; x += 1) {
+        const offset = (y * info.width + x) * info.channels;
+        expect(data[offset]).toBeGreaterThan(210);
+      }
+    }
+  });
+
   it('clears old glyph pixels beyond a truncated OCR style box', async () => {
     const input = await sharp({
       create: {

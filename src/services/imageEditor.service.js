@@ -7,6 +7,7 @@ const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advan
 const TEXT_LEFT_PADDING_RATIO = 0.08; // inset replacement text inside the cleared value area
 const BORDER_GUARD_PX = 12; // how far inside the clear box a table rule may sit
 const BORDER_OUTSIDE_PX = 6; // how far outside the clear box we look for rules
+const RULE_CLEAR_GAP_PX = 1; // untouched paper between a traced rule and cleanup
 const MIN_RULE_RUN_RATIO = 1.8; // rule lines run much longer than glyph strokes
 const MAX_PAGE_STYLE_REFERENCES = 40; // sibling numbers sampled per value
 const PAGE_STYLE_HEIGHT_RATIO_MIN = 0.45; // ignore much smaller page text
@@ -819,7 +820,12 @@ async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, req
   const verticalMargin = Math.max(12, Math.min(48, Math.round(valueHeight * 2)));
   const scanTop = Math.max(0, Math.floor(valueTop - verticalMargin));
   const scanBottom = Math.min(grayInfo.height, Math.ceil(valueBottom + verticalMargin));
-  const searchRadius = Math.max(10, Math.min(28, Math.round(meta.width * 0.018)));
+  // Header OCR can place a cell's estimated left edge 30-50px away from the
+  // physical rule on 200-DPI PDF renders. The former 28px ceiling excluded
+  // that rule entirely, so replacement text followed the bad estimate and
+  // appeared on the rule's left side. Search broadly for a *continuous* path;
+  // the row-support validation below still rejects short digit strokes.
+  const searchRadius = Math.max(24, Math.min(96, Math.round(meta.width * 0.055)));
   const scanLeft = Math.max(0, Math.floor(hintX - searchRadius));
   const scanRight = Math.min(grayInfo.width - 1, Math.ceil(hintX + searchRadius));
   const candidateWidth = scanRight - scanLeft + 1;
@@ -845,7 +851,14 @@ async function createVerticalRuleRestoreOverlay(image, meta, gray, grayInfo, req
 
     for (let xIndex = 0; xIndex < candidateWidth; xIndex += 1) {
       const imageX = scanLeft + xIndex;
-      const emission = gray[imageY * grayInfo.width + imageX] +
+      // Once a pixel has clear rule contrast, darker ink is not better proof.
+      // Otherwise stacked dimension digits can beat a continuous pale rule
+      // and pull the entire clearing boundary into the BOXES column.
+      const cappedLuma = Math.max(
+        gray[imageY * grayInfo.width + imageX],
+        rowPapers[rowIndex] - Math.max(24, rowPapers[rowIndex] * 0.14)
+      );
+      const emission = cappedLuma +
         Math.abs(imageX - hintX) * 0.12;
       if (rowIndex === 0) {
         current[xIndex] = emission;
@@ -1557,7 +1570,6 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
   const meta = await image.metadata();
 
   const eraseOverlays = [];
-  const ruleRestoreOverlays = [];
   const textOps = [];
 
   // Single-channel copy for table-rule detection; decoded at most once and
@@ -1628,14 +1640,35 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     let rectRight = Math.min(meta.width, Math.ceil(clearBbox.x1));
     let rectBottom = Math.min(meta.height, Math.ceil(clearBbox.y1));
 
+    // Some degraded charged-weight values are recognized from only the top
+    // half of their glyphs (for example an 8px OCR box around 22px text). A
+    // clear rectangle derived only from that box leaves the lower halves of
+    // the old digits visible below the replacement. Structured cells carry a
+    // physical left-rule hint, so use the established page-scaled body size
+    // as a minimum cleanup height while rule shrinking still protects any
+    // horizontal separator encountered below it.
+    if (Number.isFinite(Number(leftRuleHint))) {
+      const minimumBodyHeight = Math.max(
+        height,
+        meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO
+      );
+      rectY = Math.max(
+        0,
+        Math.min(rectY, Math.floor(bbox.y0 - Math.min(5, minimumBodyHeight * 0.16)))
+      );
+      rectBottom = Math.min(
+        meta.height,
+        Math.max(rectBottom, Math.ceil(bbox.y0 + minimumBodyHeight * 1.12))
+      );
+    }
+
     // eslint-disable-next-line no-await-in-loop
     const bg = await samplePaperInsideBbox(image, meta, bbox);
 
     // Resolve the physical divider before constructing the erase overlay. The
     // worker's hint may come from header geometry, but this traced path follows
-    // the real (possibly slanted) rule at the value row. The same source-pixel
-    // overlay is restored last, making this one measurement authoritative for
-    // both where cleanup starts and which divider pixels must survive.
+    // the real (possibly slanted) rule at the value row. Cleanup is clipped to
+    // the paper side of that path, so divider pixels never enter an overlay.
     // eslint-disable-next-line no-await-in-loop
     const { data: gray, info: grayInfo } = await grayPixels();
     let detectedLeftRuleX = null;
@@ -1652,12 +1685,17 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         { x: Number(leftRuleHint), y0: rectY, y1: rectBottom }
       );
       if (restoredRule) {
-        ruleRestoreOverlays.push(restoredRule.overlay);
         detectedLeftRuleX = restoredRule.ruleXAtValue;
-        // Clear through the narrow traced band itself. The final continuity-
-        // checked source overlay restores only genuine divider columns, while
-        // adjacent old digit pixels are intentionally not restored.
-        rectX = Math.min(rectX, Math.floor(detectedLeftRuleX));
+        // Never erase the divider in the first place. Earlier code cleared
+        // through the traced band and relied on a later overlay to rebuild it;
+        // pale or interrupted scan rules could fail that reconstruction and
+        // remain visibly broken. `ruleXAtValue` is already the traced stroke's
+        // outer (paper-side) edge, so one additional pixel creates a permanent
+        // safety gap without preserving the first digit of the old value.
+        rectX = Math.max(
+          rectX,
+          Math.ceil(detectedLeftRuleX) + RULE_CLEAR_GAP_PX
+        );
       }
     }
 
@@ -1680,9 +1718,10 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // Never cross back over the measured divider. If tracing was unavailable,
     // retain a conservative two-pixel paper-side floor from the supplied hint.
     if (Number.isFinite(detectedLeftRuleX)) {
-      // The generic rule shrink sees the same divider and would recreate a
-      // 2px dead strip. The traced/restored path is authoritative here.
-      rectX = Math.max(0, Math.floor(detectedLeftRuleX));
+      rectX = Math.max(
+        rectX,
+        Math.ceil(detectedLeftRuleX) + RULE_CLEAR_GAP_PX
+      );
     } else if (Number.isFinite(Number(leftRuleHint))) {
       rectX = Math.max(rectX, Math.floor(Number(leftRuleHint)) + 2);
     }
@@ -1708,9 +1747,9 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         true,
         true,
         forceInteriorErase,
-        // A successfully traced divider lies outside this rectangle and is
-        // restored from source pixels later. Do not let the old value's first
-        // connected stroke masquerade as a second rule at the left edge.
+        // A successfully traced divider lies outside this rectangle. Do not
+        // let the old value's first connected stroke masquerade as a second
+        // rule at the left edge.
         !Number.isFinite(detectedLeftRuleX)
       );
       if (eraseOverlay) eraseOverlays.push(eraseOverlay);
@@ -2066,9 +2105,6 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     .composite([
       ...eraseOverlays,
       { input: renderedTextOverlay, top: 0, left: 0 },
-      // Source rule pixels are authoritative and are restored last so neither
-      // inpainting nor text antialiasing can break or cover the cell border.
-      ...ruleRestoreOverlays,
     ])
     .toBuffer();
 }
