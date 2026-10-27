@@ -67,4 +67,9 @@ const uploadFields = upload.fields([
   { name: 'mapping', maxCount: 1 },
 ]);
 
-module.exports = { assignBatchId, uploadFields };
+// Remarks check accepts the same image/PDF formats without a workbook.
+const uploadImages = upload.fields([
+  { name: 'images', maxCount: config.maxConcurrentUploads },
+]);
+
+module.exports = { assignBatchId, uploadFields, uploadImages };

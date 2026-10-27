@@ -1,0 +1,16 @@
+{
+  "jobId": "da586ac7-f4c8-46ac-996e-2afcbff6f173",
+  "status": "processing",
+  "totalFiles": 1,
+  "processedFiles": 0,
+  "matchedFiles": 0,
+  "unmatchedFiles": 0,
+  "createdAt": "2026-09-25T05:07:38.114Z",
+  "startedAt": "2026-09-25T05:07:38.133Z",
+  "completedAt": null,
+  "durationMs": null,
+  "updatedAt": "2026-09-25T05:07:38.116Z",
+  "results": [],
+  "error": null,
+  "zipReady": false
+}

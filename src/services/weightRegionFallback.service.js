@@ -1144,7 +1144,7 @@ function findWeightHeaderQualifiers(words, meta) {
     .filter((word) => {
       const text = normalized(word.text);
       if (/^charg(?:er|ers|es|ing)$/.test(text)) return false;
-      return /^(?:charged|chargeable|chargd|chargeq|charget|cherged|crarged|crargd)$/.test(text) ||
+      return /^(?:charged|chargeable|chargd|carged|chargeq|charget|cherged|crarged|crargd)$/.test(text) ||
         (text.length >= 6 && text.length <= 8 && levenshtein(text, 'charged') <= 1);
     });
   const rowTolerance = Math.max(10, meta.height * 0.035);

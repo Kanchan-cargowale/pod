@@ -1,0 +1,189 @@
+{
+  "288497369": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\ac43b5de-e7f2-4c1b-a4ba-ea02abaa778e\\288497369.jpg.original.png",
+    "replacementText": "36.00",
+    "originalText": "7.32",
+    "primaryRasterReferences": [
+      {
+        "text": "34x30x19",
+        "bbox": {
+          "x0": 43.333333333333336,
+          "y0": 306.6666666666667,
+          "x1": 95.66666666666667,
+          "y1": 316.3333333333333
+        }
+      },
+      {
+        "text": "34x30x18",
+        "bbox": {
+          "x0": 43,
+          "y0": 307,
+          "x1": 95,
+          "y1": 316
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "34x30x19",
+        "bbox": {
+          "x0": 43.333333333333336,
+          "y0": 306.6666666666667,
+          "x1": 95.66666666666667,
+          "y1": 316.3333333333333
+        }
+      }
+    ]
+  },
+  "288497376": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\ac43b5de-e7f2-4c1b-a4ba-ea02abaa778e\\288497376.jpg.original.png",
+    "replacementText": "36.00",
+    "originalText": "11.78",
+    "primaryRasterReferences": [
+      {
+        "text": "40x35x20",
+        "bbox": {
+          "x0": 77.66666666666667,
+          "y0": 343,
+          "x1": 128.33333333333334,
+          "y1": 351.6666666666667
+        }
+      },
+      {
+        "text": "40x35x20",
+        "bbox": {
+          "x0": 78,
+          "y0": 343,
+          "x1": 128,
+          "y1": 351
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "40x35x20",
+        "bbox": {
+          "x0": 77.66666666666667,
+          "y0": 343,
+          "x1": 128.33333333333334,
+          "y1": 351.6666666666667
+        }
+      }
+    ]
+  },
+  "320391417": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\ac43b5de-e7f2-4c1b-a4ba-ea02abaa778e\\320391417.jpg.original.png",
+    "replacementText": null,
+    "originalText": null,
+    "primaryRasterReferences": [],
+    "preferredStyleReferences": []
+  },
+  "320391451": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\ac43b5de-e7f2-4c1b-a4ba-ea02abaa778e\\320391451.jpg.original.png",
+    "replacementText": "455.3",
+    "originalText": "455.2",
+    "primaryRasterReferences": [
+      {
+        "text": "50x39x33",
+        "bbox": {
+          "x0": 71.33333333333333,
+          "y0": 300,
+          "x1": 122,
+          "y1": 311.3333333333333
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "50x39x33",
+        "bbox": {
+          "x0": 71.33333333333333,
+          "y0": 300,
+          "x1": 122,
+          "y1": 311.3333333333333
+        }
+      }
+    ]
+  },
+  "320391662": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\ac43b5de-e7f2-4c1b-a4ba-ea02abaa778e\\320391662.jpg.original.png",
+    "replacementText": "60.0",
+    "originalText": "14.5",
+    "primaryRasterReferences": [
+      {
+        "text": "101x80x8",
+        "bbox": {
+          "x0": 77,
+          "y0": 279.3333333333333,
+          "x1": 124.66666666666667,
+          "y1": 289
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "101x80x8",
+        "bbox": {
+          "x0": 77,
+          "y0": 279.3333333333333,
+          "x1": 124.66666666666667,
+          "y1": 289
+        }
+      }
+    ]
+  },
+  "320452681": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\ac43b5de-e7f2-4c1b-a4ba-ea02abaa778e\\320452681.jpg.original.png",
+    "replacementText": "630.00",
+    "originalText": "1607.05",
+    "primaryRasterReferences": [
+      {
+        "text": "70x38x26",
+        "bbox": {
+          "x0": 40,
+          "y0": 327,
+          "x1": 92.33333333333333,
+          "y1": 337.6666666666667
+        }
+      },
+      {
+        "text": "0x38x26",
+        "bbox": {
+          "x0": 44.225,
+          "y0": 327,
+          "x1": 92,
+          "y1": 337
+        }
+      },
+      {
+        "text": "66x30x26",
+        "bbox": {
+          "x0": 39.666666666666664,
+          "y0": 341.3333333333333,
+          "x1": 92.33333333333333,
+          "y1": 351.6666666666667
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "70x38x26",
+        "bbox": {
+          "x0": 40,
+          "y0": 327,
+          "x1": 92.33333333333333,
+          "y1": 337.6666666666667
+        }
+      },
+      {
+        "text": "66x30x26",
+        "bbox": {
+          "x0": 39.666666666666664,
+          "y0": 341.3333333333333,
+          "x1": 92.33333333333333,
+          "y1": 351.6666666666667
+        }
+      }
+    ]
+  }
+}

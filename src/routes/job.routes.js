@@ -2,10 +2,14 @@
 
 const express = require('express');
 const asyncHandler = require('../utils/asyncHandler');
-const { assignBatchId, uploadFields } = require('../middleware/upload.middleware');
+const { assignBatchId, uploadFields, uploadImages } = require('../middleware/upload.middleware');
 const controller = require('../controllers/job.controller');
 
 const router = express.Router();
+
+// POST /api/jobs/remarks-check
+// multipart/form-data: images - one or more .jpg/.png/.pdf POD files
+router.post('/remarks-check', assignBatchId, uploadImages, asyncHandler(controller.createRemarksJob));
 
 // POST /api/jobs
 // multipart/form-data:

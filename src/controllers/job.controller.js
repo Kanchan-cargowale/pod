@@ -6,6 +6,25 @@ const { randomUUID } = require('crypto');
 const excelParser = require('../services/excelParser.service');
 const jobService = require('../services/job.service');
 
+async function createRemarksJob(req, res) {
+  const images = req.files?.images || [];
+  if (!images.length) {
+    return res.status(400).json({ error: 'At least one POD image or PDF (field "images") is required' });
+  }
+  const imagePaths = images.map((file) => file.path);
+  const jobId = await jobService.createRemarksJob({
+    imagePaths,
+    tempUploadsDir: req.uploadBatchDir,
+  });
+  return res.status(202).json({
+    jobId,
+    jobType: 'remarks-check',
+    totalFiles: imagePaths.length,
+    statusUrl: `/api/jobs/${jobId}`,
+    downloadUrl: `/api/jobs/${jobId}/download`,
+  });
+}
+
 async function createJob(req, res) {
   const images = req.files?.images || [];
   const mappingFile = req.files?.mapping?.[0];
@@ -86,8 +105,11 @@ async function downloadSelectedZip(req, res, next) {
 
   const safeFilenames = filenames.map((name) => path.basename(name));
   const selectedPaths = [];
+  const allowed = new Set(job.results.filter((result) => result.downloadable !== false)
+    .map((result) => result.outputFilename).filter(Boolean));
   const outputsDir = jobService.getOutputsDir(req.params.id);
   for (const name of safeFilenames) {
+    if (!allowed.has(name)) continue;
     const candidate = path.join(outputsDir, name);
     if (fs.existsSync(candidate)) selectedPaths.push(candidate);
   }
@@ -103,7 +125,11 @@ async function downloadSelectedZip(req, res, next) {
   const { ensureJobDirs } = require('../services/storage.service');
 
   await ensureJobDirs(req.params.id);
-  await zipDirectory(outputsDir, zipPath, selectedPaths);
+  const archivePaths = [...selectedPaths];
+  for (const selected of selectedPaths) {
+    if (fs.existsSync(`${selected}.correction.json`)) archivePaths.push(`${selected}.correction.json`);
+  }
+  await zipDirectory(outputsDir, zipPath, archivePaths);
 
   res.setHeader('X-Selected-Ready-Count', String(selectedPaths.length));
   res.setHeader('X-Selected-Requested-Count', String(safeFilenames.length));
@@ -124,16 +150,25 @@ async function previewImage(req, res) {
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
   const safeName = path.basename(req.params.filename);
-  const filePath = path.join(jobService.getOutputsDir(req.params.id), safeName);
+  const result = job.results.find((entry) => entry.outputFilename === safeName && entry.downloadable !== false);
+  if (!result) return res.status(404).json({ error: 'Image not found' });
+  const original = req.query.original === '1';
+  if (original && !result.originalPreviewFilename) return res.status(404).json({ error: 'Original preview unavailable' });
+  const storage = require('../services/storage.service');
+  const filePath = original
+    ? path.join(storage.jobUploadsDir(req.params.id), path.basename(result.originalPreviewFilename))
+    : path.join(jobService.getOutputsDir(req.params.id), safeName);
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Image not found (job may still be processing)' });
   }
 
   const ext = path.extname(safeName).toLowerCase();
-  res.setHeader('Content-Type', MIME_BY_EXT[ext] || 'application/octet-stream');
+  res.setHeader('Content-Type', original ? 'image/png' : (MIME_BY_EXT[ext] || 'application/octet-stream'));
   res.setHeader('Cache-Control', 'no-store');
   return fs.createReadStream(filePath).pipe(res);
 }
 
-module.exports = { createJob, getJobStatus, downloadJobZip, downloadSelectedZip, previewImage };
+module.exports = {
+  createJob, createRemarksJob, getJobStatus, downloadJobZip, downloadSelectedZip, previewImage,
+};

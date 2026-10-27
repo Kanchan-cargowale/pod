@@ -64,6 +64,12 @@ describe('POST /api/jobs (end-to-end with real files)', () => {
     expect(result.outputFilename).toBe('307775718.jpeg');
     expect(result.newWeight).toBe(900);
     expect(result.replacedRegions).toHaveLength(2);
+    expect(result.correctedCopy).toBe(true);
+    expect(result.correctionRecord.changes).toEqual(result.replacedRegions);
+    await request(app).get(`/api/jobs/${jobId}/preview/${result.outputFilename}?original=1`)
+      .expect('Content-Type', /image\/png/).expect(200);
+    await request(app).get(`/api/jobs/${jobId}/preview/${result.outputFilename}`)
+      .expect(200);
     for (const region of result.replacedRegions) {
       // A confirmed sibling cell can be inferred from table/header geometry
       // even when OCR reads only one of the two identical printed values.

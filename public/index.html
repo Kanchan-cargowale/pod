@@ -8,6 +8,16 @@
 </head>
 <body>
   <main class="app-shell">
+    <nav class="page-nav" aria-label="Tools">
+      <div>
+        <span class="page-nav-brand">POD Operations</span>
+        <span class="page-nav-current">Weight Update</span>
+      </div>
+      <a class="btn btn-secondary page-nav-link" href="/pod-remarks.html">
+        <span class="btn-icon" aria-hidden="true">CHK</span>
+        <span>Check POD Remarks</span>
+      </a>
+    </nav>
     <section class="setup-panel" aria-labelledby="setup-title">
       <form id="upload-form" class="upload-form">
         <div class="upload-stage">
@@ -137,6 +147,21 @@
           <button type="button" class="filter-tab" data-filter="review">Review</button>
           <button type="button" class="filter-tab" data-filter="error">Errors</button>
         </div>
+        <div class="order-search" role="search">
+          <label for="result-id-search" class="sr-only">Search by one or multiple order IDs</label>
+          <span class="order-search-prefix" aria-hidden="true">ID</span>
+          <textarea
+            id="result-id-search"
+            rows="1"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            placeholder="Search order ID(s)"
+            aria-describedby="result-id-search-hint"
+          ></textarea>
+          <button type="button" id="clear-id-search" class="order-search-clear" aria-label="Clear order ID search" hidden>&times;</button>
+        </div>
+        <span id="result-id-search-hint" class="sr-only">Separate multiple order IDs with commas, spaces, or new lines.</span>
         <span id="result-count" class="result-count">0 results</span>
       </div>
 
@@ -146,7 +171,7 @@
           <span></span>
           <span></span>
         </div>
-        <p>Upload a batch to see live matches, replacements, previews, and review notes.</p>
+        <p id="empty-state-message">Upload a batch to see live matches, replacements, previews, and review notes.</p>
       </div>
 
       <div id="results-grid" class="results-grid" aria-live="polite"></div>
@@ -176,7 +201,17 @@
         <dl class="result-details">
           <div class="detail-row shipment-row">
             <dt>ID</dt>
-            <dd class="card-id-value">-</dd>
+            <dd class="card-id-value">
+              <span class="card-id-text">-</span>
+              <button type="button" class="copy-id-button" aria-label="Copy order ID" title="Copy order ID">
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <rect x="5" y="5" width="8" height="8" rx="1"></rect>
+                  <path d="M3 11H2.5A1.5 1.5 0 0 1 1 9.5v-7A1.5 1.5 0 0 1 2.5 1h7A1.5 1.5 0 0 1 11 2.5V3"></path>
+                </svg>
+                <span class="copy-id-label">Copy</span>
+              </button>
+              <span class="copy-id-status sr-only" role="status" aria-live="polite"></span>
+            </dd>
           </div>
           <div class="detail-row weight-row">
             <dt>Weight</dt>
@@ -198,7 +233,13 @@
       <strong id="preview-title">Preview</strong>
       <button type="button" class="icon-button" id="preview-close" aria-label="Close preview">X</button>
     </div>
-    <img id="preview-image" alt="" />
+    <div class="correction-preview">
+      <figure>
+        <figcaption id="corrected-preview-label">Preview</figcaption>
+        <img id="preview-image" alt="" />
+      </figure>
+    </div>
+    <div id="correction-history" class="correction-history" hidden></div>
   </dialog>
 
   <script src="/app.js"></script>

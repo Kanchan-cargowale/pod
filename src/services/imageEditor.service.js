@@ -1,6 +1,11 @@
 'use strict';
 
 const sharp = require('sharp');
+const { matchSourceAppearance, renderMatchedText, measureTextWidth } = require('./textAppearance.service');
+const { ensureBundledFonts } = require('../config/fonts');
+const {
+  buildGlyphLibrary, renderGlyphTransplant, missingCharacters, previewForOcr, variantCount,
+} = require('./glyphTransplant.service');
 
 const FONT_SIZE_RATIO = 0.7; // font-size relative to bbox height
 const FONT_WIDTH_PER_CHARACTER_RATIO = 0.5; // average Arial numeric glyph advance
@@ -39,7 +44,9 @@ function escapeXml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 /**
@@ -362,6 +369,9 @@ function mergeUniformTextStyle(styles) {
       selected.map((style) => style.opticalStrokeRatio).filter(Number.isFinite)
     ),
     rasterInkCoverage: rasterInkCoverages.length ? medianNumber(rasterInkCoverages) : null,
+    edgeSoftness: medianNumber(
+      selected.map((style) => style.edgeSoftness).filter(Number.isFinite)
+    ),
     fillRgb,
     fillLuma: luminance(fillRgb),
     fill: rgbToCss(fillRgb),
@@ -1198,8 +1208,10 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
 
     const xs = inkPixels.map((pixel) => pixel.x);
     const ys = inkPixels.map((pixel) => pixel.y);
-    const inkWidth = Math.max(...xs) - Math.min(...xs) + 1;
-    const inkHeight = Math.max(...ys) - Math.min(...ys) + 1;
+    const inkLeft = Math.min(...xs), inkRight = Math.max(...xs);
+    const inkTop = Math.min(...ys), inkBottom = Math.max(...ys);
+    const inkWidth = inkRight - inkLeft + 1;
+    const inkHeight = inkBottom - inkTop + 1;
 
     // Use the darkest quarter of the ink for the fill color. A plain median
     // of the "core" pixels lands on gray anti-aliased edge pixels for blurred
@@ -1210,6 +1222,11 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
     const coreCutoff = percentile(inkLumas, 0.25);
     const corePixels = inkPixels.filter((pixel) => pixel.luma <= coreCutoff);
     const colorPixels = corePixels.length >= 3 ? corePixels : inkPixels;
+    const measuredBoundsPixels = corePixels.length >= 3 ? corePixels : inkPixels;
+    const measuredInkLeft = Math.min(...measuredBoundsPixels.map((pixel) => pixel.x));
+    const measuredInkTop = Math.min(...measuredBoundsPixels.map((pixel) => pixel.y));
+    const measuredInkRight = Math.max(...measuredBoundsPixels.map((pixel) => pixel.x));
+    const measuredInkBottom = Math.max(...measuredBoundsPixels.map((pixel) => pixel.y));
     const fillRgb = {
       r: medianChannel(colorPixels, 'r'),
       g: medianChannel(colorPixels, 'g'),
@@ -1227,6 +1244,18 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
     const normalizedStrokeThickness = strokeThickness / Math.max(1, inkHeight);
     const characterAspect = inkWidth /
       Math.max(1, inkHeight * Math.max(1, String(originalText).replace(/\s/g, '').length));
+    const transitionPixels = pixels.filter((pixel) => {
+      if (pixel.x < inkLeft || pixel.x > inkRight ||
+        pixel.y < inkTop || pixel.y > inkBottom) return false;
+      const darkness = (localBackground - pixel.luma) / Math.max(1, contrastRange);
+      return darkness >= 0.03 && darkness < 0.7;
+    }).length;
+    const solidPixels = pixels.filter((pixel) => {
+      if (pixel.x < inkLeft || pixel.x > inkRight ||
+        pixel.y < inkTop || pixel.y > inkBottom) return false;
+      return (localBackground - pixel.luma) / Math.max(1, contrastRange) >= 0.7;
+    }).length;
+    const edgeSoftness = transitionPixels / Math.max(1, transitionPixels + solidPixels);
     // Bold requires both broad coverage and thick strokes. The previous OR
     // condition classified nearly every blurred 9-12px body value as bold.
     const densityThreshold = 0.42 + Math.max(0, 14 - inkHeight) * 0.1;
@@ -1253,9 +1282,19 @@ async function sampleTextStyle(image, meta, bbox, originalText) {
       normalizedStrokeThickness,
       inkWidth,
       inkHeight,
+      // Half-open bounds in the sampled OCR crop's local coordinates. The
+      // matcher expands these slightly to retain antialiasing while excluding
+      // unrelated photograph gradients and shadows elsewhere in the box.
+      inkBounds: {
+        left: measuredInkLeft,
+        top: measuredInkTop,
+        right: measuredInkRight + 1,
+        bottom: measuredInkBottom + 1,
+      },
       characterAspect,
       densityThreshold,
       contrastRange,
+      edgeSoftness,
     };
   } catch (err) {
     return {
@@ -1278,7 +1317,7 @@ function relativeDifference(actual, expected, floor) {
  * resemble a native numeric specimen from this exact image. Matching rendered
  * candidates avoids treating CSS font-weight as a reliable visual thickness.
  */
-async function calibrateTextRendering(referenceStyle, referenceText) {
+async function calibrateTextRendering(referenceStyle, referenceText, { separateInkTone = false } = {}) {
   if (!referenceStyle?.measured || !referenceText) {
     return {
       fontWeight: referenceStyle?.fontWeight || 400,
@@ -1329,7 +1368,8 @@ async function calibrateTextRendering(referenceStyle, referenceText) {
           0.06
         ) * 0.2 +
         relativeDifference(candidate.characterAspect, referenceStyle.characterAspect, 0.15) * 0.1 +
-        relativeDifference(candidate.inkCoverage, referenceStyle.inkCoverage, 0.2) * 0.3;
+        // Faded ink is a color measurement, not evidence for a thinner face.
+        (separateInkTone ? 0 : relativeDifference(candidate.inkCoverage, referenceStyle.inkCoverage, 0.2) * 0.3);
       if (!best || score < best.score) {
         best = {
           fontWeight,
@@ -1348,7 +1388,17 @@ async function calibrateTextRendering(referenceStyle, referenceText) {
   };
 }
 
-async function buildCalibratedConsensus(styleReferences) {
+async function buildCalibratedConsensus(styleReferences, { separateInkTone = false, matchNeighborTypography = false } = {}) {
+  // Calibrate at the visible glyph height, not the conservative OCR-box
+  // estimate. Otherwise a small regular face can win against larger bold ink.
+  if (matchNeighborTypography) {
+    styleReferences = styleReferences.map(({ style, ref }) => ({ ref, style: {
+      ...style,
+      fontFamily: DEFAULT_TEXT_STYLE.fontFamily,
+      fontSize: style.measured && style.inkHeight >= 4
+        ? Math.max(6, style.inkHeight / 0.75) : style.fontSize,
+    } }));
+  }
   const measured = styleReferences.filter(({ style }) => style?.measured);
   const merged = mergeUniformTextStyle(measured.map(({ style }) => style));
   if (!merged || !measured.length) return merged;
@@ -1361,14 +1411,14 @@ async function buildCalibratedConsensus(styleReferences) {
   const calibrated = [];
   for (const { style, ref } of candidates) {
     // eslint-disable-next-line no-await-in-loop
-    calibrated.push(await calibrateTextRendering(style, ref.text));
+    calibrated.push(await calibrateTextRendering(style, ref.text, { separateInkTone }));
   }
   calibrated.sort((a, b) =>
     (a.fontWeight + a.opticalStrokeRatio * 1000) -
     (b.fontWeight + b.opticalStrokeRatio * 1000)
   );
   const representative = calibrated[Math.floor(calibrated.length / 2)];
-  const opticalStrokeRatio = resolveBodyOpticalStrokeRatio(
+  const opticalStrokeRatio = separateInkTone ? representative.opticalStrokeRatio : resolveBodyOpticalStrokeRatio(
     representative.fontWeight,
     representative.opticalStrokeRatio
   );
@@ -1546,14 +1596,19 @@ function calculateFontSize(width, height, replacementText) {
  *
  * @param {string|Buffer} filePath source image path or normalized image buffer
  * @param {Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, clearBbox?:{x0:number,y0:number,x1:number,y1:number}, replacementText:string}>} replacements
- * @param {{styleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, validationStyleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, matchValidationInk?: boolean, preferSourceInk?: boolean, lockBodyTypography?: boolean, fontFamilyOverride?: string|null, fontWeightOverride?: number|null, fixedFontSizeRatio?: number|null}} [options]
+ * @param {{styleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, preferredStyleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, primaryRasterReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, validationStyleReferences?: Array<{bbox:{x0:number,y0:number,x1:number,y1:number}, text:string}>, matchValidationInk?: boolean, preferSourceInk?: boolean, lockBodyTypography?: boolean, fontFamilyOverride?: string|null, fontWeightOverride?: number|null, fixedFontSizeRatio?: number|null}} [options]
  *        styleReferences are other numeric words on the same page used for
- *        per-image typography (size + ink color), e.g. box dimension values.
+ *        fallback typography; primaryRasterReferences are dimension values
+ *        eligible to drive the exact raster rendering path.
  */
 async function replaceWeightRegions(filePath, replacements, options = {}) {
+  // Bundled label fonts must be registered before any text is rasterized,
+  // including the SVG fallback path below.
+  await ensureBundledFonts();
   const {
     styleReferences = [],
     preferredStyleReferences = [],
+    primaryRasterReferences = [],
     validationStyleReferences = [],
     matchValidationInk = false,
     preferSourceInk = false,
@@ -1562,7 +1617,19 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     fontWeightOverride = null,
     fixedFontSizeRatio = null,
     uniformTextStyle = true,
+    matchSourceText = true,
+    separateInkTone = false,
+    matchNeighborTypography = false,
+    diagnostics = null,
+    // Compose replacements from glyphs printed on this label (see
+    // glyphTransplant.service). `verifyTransplantText(png)` must return the
+    // OCR text of a candidate composite; it is accepted only on exact match.
+    glyphTransplant = false,
+    verifyTransplantText = null,
   } = options;
+  const trace = (event) => {
+    if (diagnostics && Array.isArray(diagnostics.events)) diagnostics.events.push(event);
+  };
   const hasFontWeightOverride = hasNumericFontWeightOverride(fontWeightOverride);
   const hasFixedFontSize = Number.isFinite(Number(fixedFontSizeRatio)) &&
     Number(fixedFontSizeRatio) > 0;
@@ -1571,6 +1638,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
 
   const eraseOverlays = [];
   const textOps = [];
+  const matchedOverlays = [];
 
   // Single-channel copy for table-rule detection; decoded at most once and
   // only when there is actually something to clear.
@@ -1588,6 +1656,33 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     return grayCache;
   };
   const pageStyleCache = new Map();
+  // Built lazily from the unedited pixels, once per image.
+  let glyphLibraryPromise = null;
+  const glyphLibraryFor = () => {
+    if (!glyphLibraryPromise) {
+      glyphLibraryPromise = buildGlyphLibrary(image, meta, {
+        dimension: [...primaryRasterReferences, ...preferredStyleReferences],
+        oldValues: replacements
+          .filter((r) => !r.eraseOnly && r.bbox && /^[0-9.]+$/.test(String(r.originalText || '')))
+          .map((r) => ({ bbox: r.bbox, text: String(r.originalText), key: r.bbox })),
+        page: styleReferences,
+      }).catch(() => null);
+    }
+    return glyphLibraryPromise;
+  };
+  // The worker passes the same dimension specimens as both preferred and
+  // primary references. A raster appearance fit costs roughly 1-4 s, so each
+  // specimen is fitted once per image and shared by both consumers.
+  const appearanceFitCache = new Map();
+  const cachedAppearanceFit = (ref, text, style, options = {}) => {
+    const key = [ref.bbox.x0, ref.bbox.y0, ref.bbox.x1, ref.bbox.y1, text,
+      Boolean(options.dimensionReference)].join('|');
+    if (!appearanceFitCache.has(key)) {
+      appearanceFitCache.set(key,
+        matchSourceAppearance(image, meta, ref.bbox, text, style, options));
+    }
+    return appearanceFitCache.get(key);
+  };
   let preferredTextStyle = null;
   if (preferredStyleReferences.length) {
     const preferredStyles = [];
@@ -1596,17 +1691,183 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       const style = await sampleTextStyle(image, meta, ref.bbox, ref.text);
       if (style.measured) preferredStyles.push({ style, ref });
     }
-    preferredTextStyle = await buildCalibratedConsensus(preferredStyles);
+    preferredTextStyle = await buildCalibratedConsensus(preferredStyles, { separateInkTone, matchNeighborTypography });
+    if (matchNeighborTypography && preferredTextStyle && !fontFamilyOverride && !hasFontWeightOverride) {
+      const fits = [];
+      for (const { style, ref } of preferredStyles.slice(0, 3)) {
+        const text = String(ref.text).replace(/\s/g, '');
+        // eslint-disable-next-line no-await-in-loop
+        const fit = await cachedAppearanceFit(ref, text, style, { dimensionReference: true });
+        if (!fit || fit.score > 0.16) continue;
+        const scaleY = fit.height / fit.candidate.bounds.height;
+        const fontSize = fit.size * scaleY;
+        // Accept only a compact single body row. Rendering still obeys the
+        // existing cell bounds; a noisy OCR token cannot enlarge the field.
+        if (fontSize > calculateBodyFontLimits(meta.width).cap * 2 || Math.abs(fit.angle) > 4) continue;
+        fits.push({ fit, fontSize, scaleY });
+        // References arrive nearest-row first; one accepted fit is enough.
+        break;
+      }
+      fits.sort((a, b) => a.fit.score - b.fit.score);
+      if (fits.length) {
+        const { fit, fontSize, scaleY } = fits[0];
+        preferredTextStyle = {
+          ...preferredTextStyle,
+          fontFamily: fit.family, fontWeight: fit.weight, fontSize,
+          opticalStrokeRatio: 0,
+          // The fitted raster establishes coverage, independently of scan ink.
+          rasterInkCoverage: fit.candidate.coreAlpha,
+          fittedScaleX: Math.max(0.8, Math.min(1.25,
+            fit.width / fit.candidate.bounds.width / scaleY)),
+          fittedLetterSpacing: fit.letterSpacing * scaleY,
+        };
+      }
+    }
   }
   let validationTextStyle = null;
-  if (validationStyleReferences.length) {
+  if (validationStyleReferences === preferredStyleReferences) {
+    validationTextStyle = preferredTextStyle;
+  } else if (validationStyleReferences.length) {
     const validationStyles = [];
     for (const ref of validationStyleReferences.slice(0, 6)) {
       // eslint-disable-next-line no-await-in-loop
       const style = await sampleTextStyle(image, meta, ref.bbox, ref.text);
       if (style.measured) validationStyles.push({ style, ref });
     }
-    validationTextStyle = await buildCalibratedConsensus(validationStyles);
+    validationTextStyle = await buildCalibratedConsensus(validationStyles, { separateInkTone, matchNeighborTypography });
+  }
+
+  // A complete dimension value immediately beside the destination row is the
+  // authoritative production typography specimen. Keep the winning raster fit
+  // intact: its runtime family, weight, size, spacing, angle, blur, native
+  // dimensions, color, and candidate profile are all consumed directly by
+  // renderMatchedText below.
+  let primaryRasterFit = null;
+  const primaryRasterVisibleHeights = [];
+  const strictDimensionReferences = primaryRasterReferences
+    .map((ref) => ({ ...ref, compactText: String(ref.text || '').replace(/\s/g, '') }))
+    .filter(({ compactText }) =>
+      /^\d{1,4}(?:[.,]\d+)?[xX×]\d{1,4}(?:[.,]\d+)?[xX×]\d{1,4}(?:[.,]\d+)?$/.test(compactText)
+    )
+    .slice(0, 3);
+  // Ink color of the nearest measured dimension row. Used to color a fallback
+  // render when no dimension raster fit is accepted, so the replacement still
+  // takes the dimension text's color rather than the old weight's.
+  let primaryRasterInk = null;
+  for (const ref of strictDimensionReferences) {
+    // eslint-disable-next-line no-await-in-loop
+    const style = await sampleTextStyle(image, meta, ref.bbox, ref.compactText);
+    if (!style.measured) continue;
+    if (!primaryRasterInk && style.fillRgb) {
+      primaryRasterInk = { fill: style.fill, fillRgb: style.fillRgb };
+    }
+    // Shape scoring may prefer a tighter OCR crop, but type size must come
+    // from the visible height shared by the dimension rows themselves. Keep
+    // every sane specimen height and use their median after matching.
+    if (Number.isFinite(style.inkHeight) && style.inkHeight >= 4 &&
+      style.inkHeight <= Math.max(30, meta.height * 0.05)) {
+      primaryRasterVisibleHeights.push(style.inkHeight);
+    }
+    // Backup rows exist for when OCR mangles the nearest one. Once a confident
+    // fit is in hand, later rows still contribute their measured height but
+    // are not re-fitted - that search was most of the per-image edit time.
+    if (primaryRasterFit && primaryRasterFit.score <= 0.17) continue;
+    // eslint-disable-next-line no-await-in-loop
+    const fit = await cachedAppearanceFit(ref, ref.compactText, style, { dimensionReference: true });
+    trace({
+      stage: 'primaryRasterReference',
+      text: ref.compactText,
+      specimenInkHeight: style.inkHeight,
+      specimenFontSize: style.fontSize,
+      fitted: Boolean(fit),
+      score: fit ? Number(fit.score.toFixed(4)) : null,
+      family: fit?.family || null,
+      weight: fit?.weight || null,
+      size: fit ? Number(fit.size.toFixed(2)) : null,
+    });
+    if (!fit) continue;
+    if (!primaryRasterFit || fit.score < primaryRasterFit.score) primaryRasterFit = fit;
+  }
+  const primaryRasterMedianHeight = primaryRasterVisibleHeights.length
+    ? medianNumber(primaryRasterVisibleHeights)
+    : null;
+  // Never invent an in-between pixel height. Duplicate OCR passes can measure
+  // the same printed row one pixel above and below its true edge; averaging an
+  // even pair (for example 18 and 16) produced 17px text that matched neither
+  // specimen. Snap the robust median to a height actually observed on the
+  // image. Stable tie-breaking keeps the nearest same-row reference first.
+  const primaryRasterVisibleHeight = Number.isFinite(primaryRasterMedianHeight)
+    ? primaryRasterVisibleHeights.reduce((closest, height) =>
+      Math.abs(height - primaryRasterMedianHeight) <
+        Math.abs(closest - primaryRasterMedianHeight)
+        ? height
+        : closest
+    )
+    : null;
+  trace({
+    stage: 'primaryRasterFit',
+    candidates: strictDimensionReferences.length,
+    supplied: primaryRasterReferences.length,
+    selected: Boolean(primaryRasterFit),
+    measuredVisibleHeights: primaryRasterVisibleHeights,
+    targetVisibleHeight: primaryRasterVisibleHeight,
+  });
+
+  // If no primary dimension raster can be used, a readable old value remains
+  // the strongest fallback specimen. Fit sibling weight cells before rendering
+  // so the best clean fallback can serve the whole row.
+  let sharedSourceFit = null;
+  const sourceFits = new Map();
+  // Old-value fits only render when no dimension fit exists, so they are not
+  // computed at all when one does.
+  if (!primaryRasterFit && matchSourceText && !fontFamilyOverride &&
+    !hasFontWeightOverride && !hasFixedFontSize) {
+    for (const replacement of replacements.slice(0, 6)) {
+      // The old value's own glyphs are the single best specimen for its own
+      // field: same printer, same font, same cell. Attempt the raster fit for
+      // any plain numeric original whose ink is measurable, not only the ones
+      // the worker pre-flagged as "clean". The score/height gates below still
+      // reject a genuinely unusable fit, so this only *adds* perfect matches
+      // on faint values that previously fell back to the dimension consensus.
+      if (replacement.eraseOnly || replacement.preferPageStyle ||
+        !/^\d+(?:[.,]\d+)?$/.test(String(replacement.originalText || ''))) continue;
+      const sourceBbox = { ...replacement.bbox };
+      const boxHeight = sourceBbox.y1 - sourceBbox.y0;
+      const bodyHeightLimit = calculateBodyFontLimits(meta.width).cap * 1.3;
+      if (matchNeighborTypography && boxHeight > bodyHeightLimit) {
+        // Tall OCR boxes on photographed labels often include the left rule.
+        // The numeric ink sits in the upper, inset part of the value cell.
+        sourceBbox.x0 += Math.min(4, Math.max(2, boxHeight * 0.15));
+        sourceBbox.x1 = Math.min(sourceBbox.x1, replacement.bbox.x0 + Math.max(
+          30, String(replacement.originalText).length * bodyHeightLimit * 0.56 + 5
+        ));
+        sourceBbox.y1 = Math.min(sourceBbox.y1,
+          sourceBbox.y0 + Math.max(11, bodyHeightLimit));
+      }
+      const sourceStyle = await sampleTextStyle(image, meta, sourceBbox, replacement.originalText);
+      if (!sourceStyle.measured) continue;
+      const fit = await matchSourceAppearance(image, meta, sourceBbox,
+        String(replacement.originalText), sourceStyle);
+      const referenceHeight = sourceStyle.inkHeight;
+      trace({
+        stage: 'sourceRasterReference',
+        text: String(replacement.originalText),
+        referenceInkHeight: sourceStyle.inkHeight,
+        fitted: Boolean(fit),
+        score: fit ? Number(fit.score.toFixed(4)) : null,
+        family: fit?.family || null,
+        weight: fit?.weight || null,
+        height: fit?.height ?? null,
+      });
+      if (!fit || fit.score > (matchNeighborTypography ? 0.16 : 0.19) ||
+        (matchNeighborTypography && Math.abs(fit.angle) > 3) ||
+        fit.height > Math.max(15, referenceHeight * 1.3) ||
+        fit.height < Math.max(5, referenceHeight * 0.65)) continue;
+      sourceFits.set(replacement.bbox, fit);
+      if (!sharedSourceFit || fit.score < sharedSourceFit.fit.score) {
+        sharedSourceFit = { bbox: replacement.bbox, fit };
+      }
+    }
   }
 
   for (const {
@@ -1627,9 +1888,14 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     preferTextBoundsStart = false,
     skipRuleShrink = false,
   } of replacements) {
+    if (![bbox, clearBbox].every((box) => box &&
+      ['x0', 'y0', 'x1', 'y1'].every((key) => Number.isFinite(box[key])))) continue;
     const width = bbox.x1 - bbox.x0;
     const height = bbox.y1 - bbox.y0;
-    if (width <= 0 || height <= 0) continue;
+    if (width <= 0 || height <= 0 || bbox.x1 <= 0 || bbox.y1 <= 0 ||
+      bbox.x0 >= meta.width || bbox.y0 >= meta.height) continue;
+    const hasLeftRuleHint = leftRuleHint !== null && leftRuleHint !== undefined &&
+      Number.isFinite(Number(leftRuleHint));
 
     // Clear only the OCR word box. Expanding this rectangle can erase nearby
     // table borders, especially the vertical line immediately left of a
@@ -1647,7 +1913,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // physical left-rule hint, so use the established page-scaled body size
     // as a minimum cleanup height while rule shrinking still protects any
     // horizontal separator encountered below it.
-    if (Number.isFinite(Number(leftRuleHint))) {
+    if (hasLeftRuleHint) {
       const minimumBodyHeight = Math.max(
         height,
         meta.width * MAX_WEIGHT_FONT_WIDTH_RATIO
@@ -1672,7 +1938,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // eslint-disable-next-line no-await-in-loop
     const { data: gray, info: grayInfo } = await grayPixels();
     let detectedLeftRuleX = null;
-    if (Number.isFinite(Number(leftRuleHint))) {
+    if (hasLeftRuleHint) {
       // eslint-disable-next-line no-await-in-loop
       const restoredRule = await createVerticalRuleRestoreOverlay(
         image,
@@ -1722,7 +1988,7 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         rectX,
         Math.ceil(detectedLeftRuleX) + RULE_CLEAR_GAP_PX
       );
-    } else if (Number.isFinite(Number(leftRuleHint))) {
+    } else if (hasLeftRuleHint) {
       rectX = Math.max(rectX, Math.floor(Number(leftRuleHint)) + 2);
     }
     const rectW = rectRight - rectX;
@@ -1762,6 +2028,257 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // eslint-disable-next-line no-await-in-loop
     let textStyle = await sampleTextStyle(image, meta, bbox, styleReferenceText);
     const originalValueStyleMeasured = textStyle.measured;
+    const originalValueStyle = { ...textStyle };
+    // SVG Arial digits occupy roughly 75% of CSS font-size vertically. Use
+    // measured ink height to reproduce the visible source height; the generic
+    // style estimator is intentionally more conservative for noisy boxes.
+    const localRenderedFontSize = originalValueStyleMeasured
+      ? originalValueStyle.inkHeight / 0.75
+      : null;
+    // The measured ink height of the value's own glyphs is the most faithful
+    // size for its own field. Use it whenever the measurement is sane (the ink
+    // sits inside the OCR box and the derived size is within the page body
+    // cap), regardless of matchNeighborTypography. This was previously gated
+    // off in production, which forced every value to the dimension-row size and
+    // caused the visible size mismatches. preferPageStyle (unreadable/damaged
+    // values) still defers to the page/dimension consensus.
+    const localGeometryUsable = Boolean(
+      separateInkTone && !preferPageStyle &&
+      originalValueStyleMeasured &&
+      originalValueStyle.inkHeight >= height * 0.35 &&
+      originalValueStyle.inkHeight <= height * 1.05 &&
+      Number.isFinite(localRenderedFontSize) &&
+      localRenderedFontSize <= calculateBodyFontLimits(meta.width).cap * 2
+    );
+
+    // Use the old weight's own raster only when no reliable dimension specimen
+    // exists. BOXES/DIMENSION is the requested visual authority; allowing a
+    // readable but differently styled ACTUAL WEIGHT value to win here is what
+    // made some replacements larger/bolder than the text immediately left of
+    // them.
+    // Highest fidelity: assemble the new value from this label's own printed
+    // digits (old value first, then BOXES x DIMENSION rows, then matching body
+    // numbers). Family, size, weight, color and scan softness are then the
+    // print's own. Only used when every character is available, it fits the
+    // cell, and OCR reads the composite back as exactly the new value.
+    if (glyphTransplant && !fontFamilyOverride && !hasFontWeightOverride && !hasFixedFontSize) {
+      // eslint-disable-next-line no-await-in-loop
+      const library = await glyphLibraryFor();
+      const geometry = library?.oldValueGeometry.get(bbox);
+      const value = String(replacementText);
+      let transplantPath = 'glyphTransplant-unavailable';
+      let transplant = null;
+      if (library && geometry && Math.abs(geometry.digitHeight - library.digitHeight) <= 1) {
+        const missing = missingCharacters(library, value);
+        if (missing.length) {
+          transplantPath = `glyphTransplant-missing:${missing.join('')}`;
+        } else {
+          // Try the best-ranked glyphs first; if OCR does not read the
+          // composite back exactly, try the next candidates (a specimen digit
+          // OCR misread can otherwise be filed under the wrong character).
+          const attempts = Math.min(3, variantCount(library, value));
+          const reads = [];
+          for (let variant = 0; variant < attempts; variant += 1) {
+            // eslint-disable-next-line no-await-in-loop
+            const candidate = await renderGlyphTransplant(library, value, {
+              inkLeft: Math.max(rectX + 1, geometry.left),
+              baseline: geometry.baseline,
+              maxRight: Math.min(meta.width, textBounds?.x1 ?? rectRight) - 1,
+              minTop: rectY - 3,
+              maxBottom: rectBottom + 3,
+            }, { variant });
+            if (!candidate) { transplantPath = 'glyphTransplant-nofit'; break; }
+            if (typeof verifyTransplantText !== 'function') { transplant = candidate; break; }
+            // eslint-disable-next-line no-await-in-loop
+            const read = String(await verifyTransplantText(await previewForOcr(candidate)) || '')
+              .replace(/[^0-9.]/g, '');
+            reads.push(read);
+            if (read === value) { transplant = candidate; break; }
+          }
+          if (transplant) transplantPath = 'glyphTransplant';
+          else if (reads.length) transplantPath = `glyphTransplant-unverified:${reads.join('|')}`;
+        }
+      }
+      trace({
+        stage: 'render',
+        path: transplantPath,
+        text: value,
+        family: 'printed-glyphs',
+        weight: null,
+        visibleHeight: library?.digitHeight ?? null,
+        sources: transplant?.sources || null,
+      });
+      if (transplant) {
+        matchedOverlays.push({
+          input: transplant.input, left: transplant.left, top: transplant.top, blend: 'multiply',
+        });
+        continue;
+      }
+    }
+
+    const ownSourceFit = sourceFits.get(bbox);
+    if (!primaryRasterFit && ownSourceFit && !preferPageStyle &&
+      !fontFamilyOverride && !hasFontWeightOverride && !hasFixedFontSize) {
+      // Preserve the working face, stroke, slant and ink from this exact field,
+      // but size it to the authoritative dimension-row height. Anchoring the
+      // lower ink edge keeps the original baseline while the glyph height is
+      // corrected by the small amount measured from the left-hand rows.
+      const targetVisibleHeight = primaryRasterVisibleHeight || ownSourceFit.height;
+      const sourceSizedMatch = {
+        ...ownSourceFit,
+        ...(primaryRasterInk || {}),
+        y: ownSourceFit.y + ownSourceFit.height - targetVisibleHeight,
+        targetVisibleHeight,
+      };
+      // eslint-disable-next-line no-await-in-loop
+      const matched = await renderMatchedText(sourceSizedMatch, String(replacementText), {
+        // rectX already excludes the traced border. Generic cell padding must
+        // not shift a reliably measured original ink origin.
+        x0: rectX,
+        y0: Math.max(0, Math.min(rectY, Math.floor(sourceSizedMatch.y) - 1)),
+        x1: Math.min(meta.width, textBounds?.x1 ?? rectRight),
+        y1: Math.min(meta.height, Math.max(rectBottom,
+          Math.ceil(sourceSizedMatch.y + targetVisibleHeight) + 1)),
+      });
+      trace({
+        stage: 'render',
+        path: matched ? 'ownSourceRaster' : 'ownSourceRaster-rejected',
+        text: String(replacementText),
+        family: ownSourceFit.family,
+        weight: ownSourceFit.weight,
+        size: Number(ownSourceFit.size.toFixed(2)),
+        visibleHeight: targetVisibleHeight,
+        sourceVisibleHeight: ownSourceFit.height,
+        score: Number(ownSourceFit.score.toFixed(4)),
+      });
+      if (matched) {
+        matchedOverlays.push(matched);
+        continue;
+      }
+    }
+
+    // Render the strict neighbouring dimension fit before any generic SVG or
+    // source-field fallback. Destination placement comes only from the weight
+    // cell: its safe left edge, row center, and already-protected rect limits.
+    // Reference geometry controls glyph scale only and can never expand the
+    // erase or destination bounds.
+    if (primaryRasterFit) {
+      const detectedRuleEdge = Number.isFinite(detectedLeftRuleX)
+        ? detectedLeftRuleX
+        : rectX;
+      const ruleSafeTextX = Math.max(rectX, detectedRuleEdge) +
+        Math.max(3, Math.min(8, meta.width * 0.004));
+      const safeTextX = textBounds
+        ? Math.max(textBounds.x0, ruleSafeTextX)
+        : Math.max(
+            ruleSafeTextX,
+            rectX + Math.max(1, rectW * textLeftPaddingRatio)
+          );
+      const targetVisibleHeight = primaryRasterVisibleHeight || primaryRasterFit.height;
+      const rowCenterY = (bbox.y0 + bbox.y1) / 2;
+      const dimensionMatch = {
+        ...primaryRasterFit,
+        x: safeTextX,
+        y: rowCenterY - targetVisibleHeight / 2,
+        // Different digit strings can produce slightly different raster bounds
+        // at the same CSS size. Lock final visible height to the robust median
+        // of the measured BOXES/DIMENSION rows, not to whichever OCR crop won
+        // the family/shape score.
+        targetVisibleHeight,
+        normalizeToVisibleInk: true,
+        // Scale = specimen visible height / fitted specimen raster height, so
+        // the replacement gets the printed type size rather than the tilted
+        // specimen's taller bounding box. Centred on the value row.
+        useFitScale: true,
+        centerY: rowCenterY,
+        // Calibrate painted stroke width to the dimension digits' measured
+        // stroke width (see renderMatchedText).
+        matchStrokeWeight: true,
+      };
+      const dimensionTop = rowCenterY - targetVisibleHeight / 2;
+      // eslint-disable-next-line no-await-in-loop
+      const matched = await renderMatchedText(dimensionMatch, String(replacementText), {
+        x0: safeTextX,
+        // Erasing remains confined to rectY/rectBottom, but rendering may use
+        // the dimension specimen's complete visible height around the proven
+        // value-row centre. Blank/truncated old values otherwise make the
+        // exact fit fail and incorrectly fall back to generic SVG text.
+        // Room for the anti-aliased fringe on both sides; clipping it would
+        // squeeze the glyphs vertically.
+        y0: Math.max(0, Math.floor(dimensionTop) - 4),
+        x1: Math.min(meta.width, textBounds?.x1 ?? rectRight),
+        y1: Math.min(meta.height,
+          Math.ceil(dimensionTop + targetVisibleHeight) + 4),
+        // Preserve the specimen height. If a longer replacement approaches the
+        // right border, renderMatchedText may compress only x rather than
+        // abandoning the matched family/weight/blur/color altogether.
+        requireExactFit: false,
+      });
+      trace({
+        stage: 'render',
+        path: matched ? 'dimensionRaster' : 'dimensionRaster-rejected',
+        text: String(replacementText),
+        family: primaryRasterFit.family,
+        weight: primaryRasterFit.weight,
+        size: Number(primaryRasterFit.size.toFixed(2)),
+        visibleHeight: targetVisibleHeight,
+        matchedSpecimenHeight: primaryRasterFit.height,
+        fitScale: primaryRasterFit.candidate?.visibleHeight
+          ? Number((primaryRasterFit.visibleHeight / primaryRasterFit.candidate.visibleHeight).toFixed(3))
+          : null,
+        overlay: matched ? { left: matched.left, top: matched.top,
+          width: matched.width, height: matched.height } : null,
+        strokeAdjustment: matched?.strokeAdjustment ?? null,
+        renderedStrokeMass: matched?.renderedStrokeMass ?? null,
+        targetStrokeMass: matched?.targetStrokeMass ?? null,
+        imageSize: `${meta.width}x${meta.height}`,
+        score: Number(primaryRasterFit.score.toFixed(4)),
+      });
+      if (matched) {
+        matchedOverlays.push(matched);
+        continue;
+      }
+    }
+
+    // A sibling weight cell's fit is the last raster specimen worth borrowing:
+    // ACTUAL and CHARGED are one printed row, so an exemplar from one cell
+    // reproduces the other's face, size, stroke and slant. Only its geometry
+    // is borrowed; this cell's own fit was already handled above.
+    if (sharedSourceFit && !preferPageStyle &&
+      !fontFamilyOverride && !hasFontWeightOverride && !hasFixedFontSize) {
+      const exemplar = sharedSourceFit.fit;
+      const relativeX = exemplar.x - sharedSourceFit.bbox.x0;
+      const relativeY = exemplar.y - sharedSourceFit.bbox.y0;
+      const match = {
+        ...exemplar,
+        x: bbox.x0 + relativeX,
+        y: bbox.y0 + relativeY,
+      };
+      if (match) {
+        trace({
+          stage: 'render',
+          path: 'sharedSourceRaster',
+          text: String(replacementText),
+          family: match.family,
+          weight: match.weight,
+          size: Number(match.size.toFixed(2)),
+          visibleHeight: match.height,
+          score: Number(match.score.toFixed(4)),
+        });
+        const matched = await renderMatchedText(match, String(replacementText), {
+          // rectX already excludes the traced border. Generic cell padding
+          // must not shift a reliably measured original ink origin.
+          x0: rectX,
+          y0: rectY,
+          x1: Math.min(meta.width, textBounds?.x1 ?? rectRight),
+          y1: rectBottom,
+        });
+        if (matched) {
+          matchedOverlays.push(matched);
+          continue;
+        }
+      }
+    }
 
     // Prefer the original weight pixels whenever they are measurable. Nearby
     // dimensions are only a fallback specimen; overriding a faint but valid
@@ -1816,7 +2333,11 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         fontWeight: preferredTextStyle
           ? textStyle.fontWeight
           : (validationTextStyle.fontWeight || textStyle.fontWeight),
-        fontSize: validationTextStyle.fontSize,
+        // A clean word in the exact field is the strongest size reference.
+        // Dimension rows remain the fallback for damaged or oversized OCR.
+        fontSize: localGeometryUsable
+          ? localRenderedFontSize
+          : validationTextStyle.fontSize,
         opticalStrokeRatio: preferredTextStyle
           ? (textStyle.opticalStrokeRatio || 0)
           : (validationTextStyle.opticalStrokeRatio || 0),
@@ -1864,7 +2385,67 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // exact value. This prevents a blank/shadowed fallback box from producing
     // pale or white replacement text.
     const paperLuma = luminance(bg);
-    const maximumInkLuma = Math.max(0, paperLuma - Math.max(24, paperLuma * 0.18));
+    // Never amplify a measurable faded value merely to meet a generic dark
+    // ink floor. Blank/unreadable fields still use the established fallback.
+    //
+    // The value's own measured ink is the most faithful colour for its own
+    // field. Earlier this was switched off whenever matchNeighborTypography
+    // was on, which forced the dimension-row colour onto every weight value
+    // and caused the visible colour mismatches. Keep using the value's own
+    // ink whenever we actually measured it and it is a real (dark) stroke.
+    const localInkUsable = separateInkTone && preferSourceInk &&
+      originalValueStyleMeasured &&
+      originalValueStyle.fillLuma < paperLuma - 10;
+    if (localGeometryUsable) {
+      textStyle.fontSize = localRenderedFontSize;
+      // At ten or more vertical ink pixels, stroke-density classification is
+      // stable enough to preserve this field's own regular/bold distinction.
+      // Tiny words retain the multi-specimen consensus because antialiasing
+      // makes their weight classification unreliable.
+      if (originalValueStyle.inkHeight >= 10) {
+        textStyle.fontWeight = originalValueStyle.fontWeight;
+      }
+    }
+    if (localInkUsable) {
+      textStyle.fillRgb = originalValueStyle.fillRgb;
+      textStyle.fillLuma = originalValueStyle.fillLuma;
+      textStyle.fill = originalValueStyle.fill;
+    }
+    if (matchNeighborTypography && preferredTextStyle) {
+      // The surrounding printed body text (BOXES/DIMENSION rows) is a good
+      // specimen for face/stroke, but it is NOT authoritative for this value's
+      // size, weight or ink when the value's own glyphs were measurable. Using
+      // the dimension consensus wholesale is what made the replacement visibly
+      // larger/smaller or a different weight than the original on some labels.
+      //
+      // So: take the neighbour consensus only for the attributes that are hard
+      // to recover from a faint value (family, stroke outline, raster coverage),
+      // and keep this cell's own measured height, weight and ink whenever we
+      // actually measured them.
+      const keepLocalSize = localGeometryUsable ||
+        (originalValueStyleMeasured && Number.isFinite(localRenderedFontSize));
+      textStyle = {
+        ...textStyle,
+        ...preferredTextStyle,
+        measured: true,
+        ...(keepLocalSize ? { fontSize: localRenderedFontSize } : {}),
+        ...(originalValueStyleMeasured && originalValueStyle.inkHeight >= 9
+          ? { fontWeight: originalValueStyle.fontWeight }
+          : {}),
+        ...(localInkUsable
+          ? {
+              fill: originalValueStyle.fill,
+              fillRgb: originalValueStyle.fillRgb,
+              fillLuma: originalValueStyle.fillLuma,
+            }
+          : {}),
+      };
+    }
+    // Keep weight based on the multi-specimen printed-body consensus. A
+    // single tiny source word can provide a useful color but underestimate
+    // its own boldness because only antialiased edges survive the scan.
+    const maximumInkLuma = localInkUsable ? paperLuma - 10
+      : Math.max(0, paperLuma - Math.max(24, paperLuma * 0.18));
     const sampledFill = textStyle.fillRgb || { r: 0, g: 0, b: 0 };
     const sampledFillLuma = luminance(sampledFill);
     let visibleFill = sampledFill;
@@ -1879,11 +2460,12 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     // The minimum prevents tiny low-resolution OCR boxes from collapsing the
     // text, but must not scale without bound on 250-300 DPI scans. Their real
     // dimension specimen remains free to select a larger size.
-    const { floor: templateFontFloor, cap: templateFontCap } =
-      calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize);
+    const { floor: templateFontFloor, cap: templateFontCap } = localGeometryUsable
+      ? { floor: Math.max(6, localRenderedFontSize * 0.95), cap: localRenderedFontSize * 1.05 }
+      : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize, matchNeighborTypography && Boolean(preferredTextStyle));
     textStyle = {
       ...textStyle,
-      fontFamily: fontFamilyOverride || textStyle.fontFamily,
+      fontFamily: fontFamilyOverride || (separateInkTone && !matchNeighborTypography ? DEFAULT_TEXT_STYLE.fontFamily : textStyle.fontFamily),
       fontWeight: hasFontWeightOverride
         ? Number(fontWeightOverride)
         : textStyle.fontWeight,
@@ -1923,11 +2505,19 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       fontScale,
       textLeftPaddingRatio,
       preferTextBoundsStart,
+      localGeometryUsable,
+      localInkUsable,
+      sourceInkWidth: originalValueStyle.inkWidth,
+      sourceInkHeight: originalValueStyle.inkHeight,
+      sourceText: originalText,
     });
   }
 
   if (!textOps.length) {
-    // Nothing matched on this label - return the original bytes untouched.
+    if (eraseOverlays.length || matchedOverlays.length) {
+      return image.composite([...eraseOverlays, ...matchedOverlays]).toBuffer();
+    }
+    // Nothing matched on this label.
     return image.toBuffer();
   }
 
@@ -1956,7 +2546,9 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
       const templateFontCap = hasFixedFontSize
         ? Math.max(6, meta.width * Number(fixedFontSizeRatio))
-        : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize).cap;
+        : (op.localGeometryUsable
+            ? op.textStyle.fontSize * 1.05
+            : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize, matchNeighborTypography && Boolean(preferredTextStyle)).cap);
       const lockedBodyTypography = lockBodyTypography || hasFontWeightOverride;
       const heightLimit = lockedBodyTypography
         ? templateFontCap
@@ -1995,10 +2587,27 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     const medianBaseline = medianNumber(candidateBaselines);
     sharedBaselineY = commonMin <= commonMax
       ? Math.max(commonMin, Math.min(commonMax, medianBaseline))
-      : medianBaseline;
+      : null;
   }
 
-  const texts = textOps.map((op) => {
+  const measuredSoftness = medianNumber(
+    textOps.map((op) => op.textStyle.edgeSoftness).filter(Number.isFinite)
+  );
+  const useTextBlur = Boolean(
+    preferredTextStyle &&
+    (!lockBodyTypography || separateInkTone) &&
+    !hasFontWeightOverride &&
+    (!separateInkTone || textOps.some((op) => Number(op.textStyle.edgeSoftness) >= 0.55)) &&
+    Math.max(meta.width, meta.height) <= 2400
+  );
+  const textBlurSigma = useTextBlur
+    ? (separateInkTone
+        ? (matchNeighborTypography
+            ? Math.min(0.85, Math.max(0.3, 0.2 + measuredSoftness * 0.8))
+            : Math.min(0.48, Math.max(0.3, 0.2 + measuredSoftness * 0.42)))
+        : Math.min(0.55, Math.max(0.3, 700 / Math.max(meta.width, meta.height))))
+    : 0;
+  const texts = await Promise.all(textOps.map(async (op) => {
     // Size, family and weight are shared across sibling weight cells, while
     // ink color remains local to each cell to follow shadows and scan tint.
     const textStyle = sharedTextStyle
@@ -2007,6 +2616,15 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
           fill: op.textStyle.fill,
           fillRgb: op.textStyle.fillRgb,
           fillLuma: op.textStyle.fillLuma,
+          ...(separateInkTone ? {
+            fontFamily: op.textStyle.fontFamily,
+            fittedScaleX: op.textStyle.fittedScaleX,
+            fittedLetterSpacing: op.textStyle.fittedLetterSpacing,
+            fontWeight: op.textStyle.fontWeight,
+            opticalStrokeRatio: op.textStyle.opticalStrokeRatio,
+            rasterInkCoverage: op.textStyle.rasterInkCoverage,
+            edgeSoftness: op.textStyle.edgeSoftness,
+          } : {}),
         }
       : op.textStyle;
     const naturalTextX = op.bbox.x0 + op.width * op.textLeftPaddingRatio;
@@ -2024,7 +2642,9 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
     const textX = op.preferTextBoundsStart ? guardedTextX : Math.max(naturalTextX, guardedTextX);
     const templateFontCap = hasFixedFontSize
       ? Math.max(6, meta.width * Number(fixedFontSizeRatio))
-      : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize).cap;
+      : (op.localGeometryUsable
+          ? op.textStyle.fontSize * 1.05
+          : calculateBodyFontLimits(meta.width, validationTextStyle?.fontSize, matchNeighborTypography && Boolean(preferredTextStyle)).cap);
     const lockedBodyTypography = lockBodyTypography || hasFontWeightOverride;
     const maxFontSizeForHeight = lockedBodyTypography
       ? templateFontCap
@@ -2046,20 +2666,19 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
       op.bbox.y1 - 1,
       Math.max(op.bbox.y0 + renderedFontSize * 0.72, op.bbox.y0 + op.height / 2 + renderedFontSize * 0.28)
     );
-    const willBlur = Boolean(
-      preferredTextStyle &&
-      !lockedBodyTypography &&
-      Math.max(meta.width, meta.height) <= 2400
-    );
-    const renderedFill = compensateRasterizedInk(
-      textStyle.fillRgb,
-      op.bg,
-      renderedFontSize,
-      textStyle.fontWeight,
-      willBlur,
-      textStyle.rasterInkCoverage
-    );
-    const finalOpticalStrokeRatio = hasFontWeightOverride
+    const willBlur = useTextBlur &&
+      (!lockedBodyTypography || (separateInkTone && (op.localGeometryUsable || matchNeighborTypography)));
+    const renderedFill = op.localInkUsable
+      ? textStyle.fillRgb
+      : compensateRasterizedInk(
+          textStyle.fillRgb,
+          op.bg,
+          renderedFontSize,
+          textStyle.fontWeight,
+          willBlur,
+          textStyle.rasterInkCoverage
+        );
+    const finalOpticalStrokeRatio = hasFontWeightOverride || separateInkTone
       ? textStyle.opticalStrokeRatio
       : resolveBodyOpticalStrokeRatio(textStyle.fontWeight, textStyle.opticalStrokeRatio);
     const opticalStrokeWidth = calculateLockedStrokeWidth(
@@ -2073,38 +2692,73 @@ async function replaceWeightRegions(filePath, replacements, options = {}) {
         'paint-order="stroke fill" stroke-linejoin="round"'
       : '';
 
+    // Estimated digit advances cannot guarantee containment (font fallback,
+    // bold outlines and the minimum size all change the actual raster width).
+    // Compress only horizontal scale when needed, retaining the baseline.
+    const measuredWidth = await measureTextWidth(
+      op.replacementText, textStyle.fontFamily, textStyle.fontWeight, Number(renderedFontSize.toFixed(1))
+    );
+    const sourceAdvance = numericAdvanceUnits(op.sourceText || '', textStyle.fontFamily);
+    const replacementAdvance = numericAdvanceUnits(op.replacementText, textStyle.fontFamily);
+    const sourceMatchedWidth = op.localGeometryUsable && Number.isFinite(op.sourceInkWidth)
+      ? op.sourceInkWidth * replacementAdvance / Math.max(0.1, sourceAdvance)
+      : null;
+    const desiredScaleX = textStyle.fittedScaleX ?? (measuredWidth && sourceMatchedWidth
+      ? Math.max(0.8, Math.min(1.25, sourceMatchedWidth / measuredWidth))
+      : 1);
+    const scaleX = measuredWidth
+      ? Math.min(desiredScaleX, maxTextWidth / (measuredWidth + opticalStrokeWidth + 1))
+      : 1;
+    const transform = Math.abs(scaleX - 1) > 0.005
+      ? `translate(${textX} 0) scale(${scaleX} 1) translate(${-textX} 0)`
+      : '';
+
+    trace({
+      stage: 'render',
+      path: 'svgCascade',
+      text: String(op.replacementText),
+      family: textStyle.fontFamily,
+      weight: textStyle.fontWeight,
+      size: Number(renderedFontSize.toFixed(2)),
+      styleFontSize: Number((textStyle.fontSize || 0).toFixed(2)),
+      templateFontCap: Number(templateFontCap.toFixed(2)),
+      maxFontSizeForHeight: Number(maxFontSizeForHeight.toFixed(2)),
+      maxFontSizeForWidth: Number(maxFontSizeForWidth.toFixed(2)),
+      localGeometryUsable: op.localGeometryUsable,
+      sourceInkHeight: op.sourceInkHeight ?? null,
+      specimenFontSize: validationTextStyle?.fontSize
+        ? Number(validationTextStyle.fontSize.toFixed(2))
+        : null,
+      specimenFamily: preferredTextStyle?.fontFamily || null,
+      specimenWeight: preferredTextStyle?.fontWeight || null,
+      opticalStrokeRatio: Number((finalOpticalStrokeRatio || 0).toFixed(4)),
+      blurSigma: willBlur ? Number(textBlurSigma.toFixed(2)) : 0,
+      fill: rgbToCss(renderedFill),
+    });
+
     return (
-      `<text x="${textX}" y="${baselineY}" font-family="${textStyle.fontFamily}" ` +
+      `<text transform="${transform}"${willBlur ? ' filter="url(#scanBlur)"' : ''} ` +
+      `x="${textX}" y="${baselineY}" font-family="${escapeXml(textStyle.fontFamily)}" ` +
       `font-size="${renderedFontSize.toFixed(1)}" font-weight="${textStyle.fontWeight}" ` +
+      `letter-spacing="${Number(textStyle.fittedLetterSpacing || 0).toFixed(2)}" ` +
       `fill="${rgbToCss(renderedFill)}"${opticalStroke}>` +
       `${escapeXml(op.replacementText)}</text>`
     );
-  });
+  }));
 
   const overlaySvg = Buffer.from(
     `<svg width="${meta.width}" height="${meta.height}" xmlns="http://www.w3.org/2000/svg">` +
+      (useTextBlur ? `<defs><filter id="scanBlur" x="-20%" y="-20%" width="140%" height="140%">` +
+        `<feGaussianBlur stdDeviation="${textBlurSigma.toFixed(2)}"/></filter></defs>` : '') +
       texts.join('') +
       `</svg>`
   );
 
-  let renderedTextOverlay = overlaySvg;
-  if (
-    preferredTextStyle &&
-    !lockBodyTypography &&
-    !hasFontWeightOverride &&
-    Math.max(meta.width, meta.height) <= 2400
-  ) {
-    // Native label text in low-resolution scans has a small optical/scan blur;
-    // raw SVG edges look conspicuously digital beside it. Apply only a subtle
-    // resolution-aware blur and keep high-resolution source text untouched.
-    const sigma = Math.min(0.55, Math.max(0.3, 700 / Math.max(meta.width, meta.height)));
-    renderedTextOverlay = await sharp(overlaySvg).png().blur(sigma).toBuffer();
-  }
-
   return image
     .composite([
       ...eraseOverlays,
-      { input: renderedTextOverlay, top: 0, left: 0 },
+      { input: overlaySvg, top: 0, left: 0 },
+      ...matchedOverlays,
     ])
     .toBuffer();
 }

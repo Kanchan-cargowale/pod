@@ -127,8 +127,50 @@ async function rasterizePdf(filePath, outputDirectory, options = {}) {
   return [{ filePath: outputPath, pageNumber: 1, pageCount: 1 }];
 }
 
+async function rasterizePdfPages(filePath, outputDirectory, options = {}) {
+  const execute = options.runCommand || runCommand;
+  const pdftoppmPath = options.pdftoppmPath || config.pdftoppmPath;
+  const density = Math.max(100, Math.min(400, Number(options.density || config.pdfRasterDensity)));
+  const jpegQuality = Math.max(85, Math.min(100, Number(
+    options.jpegQuality || config.pdfRasterJpegQuality
+  )));
+
+  await assertPdfSignature(filePath);
+  await fs.mkdir(outputDirectory, { recursive: true });
+  const outputPrefix = path.join(outputDirectory, 'page');
+  await execute(pdftoppmPath, [
+    '-jpeg',
+    '-jpegopt', `quality=${jpegQuality}`,
+    '-r', String(density),
+    filePath,
+    outputPrefix,
+  ], config.pdfRasterTimeoutMs);
+
+  const names = (await fs.readdir(outputDirectory))
+    .filter((name) => /^page-\d+\.jpg$/i.test(name))
+    .sort((a, b) => Number(a.match(/(\d+)/)[1]) - Number(b.match(/(\d+)/)[1]));
+  if (!names.length) {
+    const error = new Error('PDF renderer did not produce any page images');
+    error.code = 'PDF_RASTER_INCOMPLETE';
+    throw error;
+  }
+  const pages = names.map((name, index) => ({
+    filePath: path.join(outputDirectory, name),
+    pageNumber: index + 1,
+    pageCount: names.length,
+  }));
+  if (options.normalizeOrientation !== false) {
+    for (const page of pages) {
+      // eslint-disable-next-line no-await-in-loop
+      await normalizePdfLabelOrientation(page.filePath, jpegQuality);
+    }
+  }
+  return pages;
+}
+
 module.exports = {
   rasterizePdf,
+  rasterizePdfPages,
   assertPdfSignature,
   normalizePdfLabelOrientation,
   runCommand,

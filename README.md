@@ -231,6 +231,45 @@ this repo, waits for the background job to finish, and asserts:
   weight (`900`, formatted as `900.00` to match the original precision),
 - a valid ZIP is produced and downloadable.
 
+## Text appearance matching
+
+The production renderer first fits readable original weight text to rasterized
+font candidates and shares the best reliable fit across sibling weight cells.
+It rejects noisy, oversized, or inconsistent fits. Where the old value is too
+faint to measure, nearby BOXES/DIMENSION text supplies visible glyph size,
+boldness, ink tone, and edge softness. Sizing stays bounded and text remains
+inside its existing cell.
+
+New successful jobs produce a visibly marked **CORRECTED COPY**, with the notice
+appended below the page so existing document coordinates are preserved. Preview
+shows only the corrected image and lists the old/new
+values with the correction time. Each corrected image has a `.correction.json`
+record containing the changes and SHA-256 checksums; full and selected ZIPs
+include these records. Original previews follow the job's retention lifecycle.
+Existing historical job exports are not retroactively changed. The original
+is retained for the correction record but is not shown in the preview dialog.
+
+Reliable single-line numeric OCR values marked `preferSourceStyle` are compared
+with rasterized sans-serif, serif, and monospace font candidates. The matcher
+estimates weight, letter spacing, small rotations (up to 6 degrees), and blur,
+then preserves the measured ink origin, apparent color, and glyph scale inside
+the existing cell boundaries. Longer values are compressed horizontally only
+when needed to fit. Source matching does not change shipment matching, decimal
+formatting, the UI, or the dimension panels.
+
+Border-contaminated, low-contrast, or otherwise uncertain specimens retain the
+existing page-reference renderer. Explicit typography overrides also retain
+precedence; `matchSourceText: false` disables source matching. Both rendering
+paths use raster measurements to avoid horizontal overflow. Tests cover font
+families, weights, blur, rotation, spacing, faint color, varying lengths, separate
+rows, fractional coordinates, and a photographed divider-contamination case.
+
+A flattened scan cannot uniquely reveal the original font file or separate
+paint opacity from ink color and paper tone. Matching is an estimate of the
+visible result using installed fonts, not a guarantee of pixel-identical output.
+This enhancement remains scoped to the existing numeric, single-line workflow;
+it does not introduce arbitrary multiline document editing.
+
 ## Known limitations / next steps for a larger deployment
 
 - Job state is in-memory + a JSON file per job on local disk. For a

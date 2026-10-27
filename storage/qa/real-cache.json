@@ -1,0 +1,272 @@
+{
+  "288497368": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\288497368.jpg.original.png",
+    "replacementText": "46.0",
+    "originalText": "12.7",
+    "primaryRasterReferences": [
+      {
+        "text": "43x43x32",
+        "bbox": {
+          "x0": 58,
+          "y0": 333,
+          "x1": 113.33333333333333,
+          "y1": 346.3333333333333
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "43x43x32",
+        "bbox": {
+          "x0": 58,
+          "y0": 333,
+          "x1": 113.33333333333333,
+          "y1": 346.3333333333333
+        }
+      }
+    ]
+  },
+  "288497375": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\288497375.jpg.original.png",
+    "replacementText": "72.00",
+    "originalText": "36.14",
+    "primaryRasterReferences": [
+      {
+        "text": "49x44x25",
+        "bbox": {
+          "x0": 129,
+          "y0": 314.6666666666667,
+          "x1": 174.66666666666666,
+          "y1": 323.3333333333333
+        }
+      },
+      {
+        "text": "43x27x20",
+        "bbox": {
+          "x0": 130,
+          "y0": 326.3333333333333,
+          "x1": 175.33333333333334,
+          "y1": 334.6666666666667
+        }
+      },
+      {
+        "text": "43x27x20",
+        "bbox": {
+          "x0": 131,
+          "y0": 321,
+          "x1": 175,
+          "y1": 341
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "49x44x25",
+        "bbox": {
+          "x0": 129,
+          "y0": 314.6666666666667,
+          "x1": 174.66666666666666,
+          "y1": 323.3333333333333
+        }
+      },
+      {
+        "text": "43x27x20",
+        "bbox": {
+          "x0": 130,
+          "y0": 326.3333333333333,
+          "x1": 175.33333333333334,
+          "y1": 334.6666666666667
+        }
+      },
+      {
+        "text": "39x25x15",
+        "bbox": {
+          "x0": 131,
+          "y0": 338,
+          "x1": 176.33333333333334,
+          "y1": 346.3333333333333
+        }
+      }
+    ]
+  },
+  "288497376": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\288497376.jpg.original.png",
+    "replacementText": "36.00",
+    "originalText": "11.78",
+    "primaryRasterReferences": [
+      {
+        "text": "40x35x20",
+        "bbox": {
+          "x0": 77.66666666666667,
+          "y0": 343,
+          "x1": 128.33333333333334,
+          "y1": 351.6666666666667
+        }
+      },
+      {
+        "text": "40x35x20",
+        "bbox": {
+          "x0": 78,
+          "y0": 343,
+          "x1": 128,
+          "y1": 351
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "40x35x20",
+        "bbox": {
+          "x0": 77.66666666666667,
+          "y0": 343,
+          "x1": 128.33333333333334,
+          "y1": 351.6666666666667
+        }
+      }
+    ]
+  },
+  "297989451": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\297989451.jpg.original.png",
+    "replacementText": "36.00",
+    "originalText": "22.87",
+    "primaryRasterReferences": [
+      {
+        "text": "56x46x27",
+        "bbox": {
+          "x0": 250.2348520904912,
+          "y0": 724.6486679398507,
+          "x1": 351.5086822096291,
+          "y1": 741.3637661148541
+        }
+      },
+      {
+        "text": "56x46x27",
+        "bbox": {
+          "x0": 250,
+          "y0": 725,
+          "x1": 351,
+          "y1": 741
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "56x46x27",
+        "bbox": {
+          "x0": 250.2348520904912,
+          "y0": 724.6486679398507,
+          "x1": 351.5086822096291,
+          "y1": 741.3637661148541
+        }
+      }
+    ]
+  },
+  "320391451": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\320391451.jpg.original.png",
+    "replacementText": "455.3",
+    "originalText": "455.2",
+    "primaryRasterReferences": [
+      {
+        "text": "50x39x33",
+        "bbox": {
+          "x0": 71.33333333333333,
+          "y0": 300,
+          "x1": 122,
+          "y1": 311.3333333333333
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "50x39x33",
+        "bbox": {
+          "x0": 71.33333333333333,
+          "y0": 300,
+          "x1": 122,
+          "y1": 311.3333333333333
+        }
+      }
+    ]
+  },
+  "320391662": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\320391662.jpg.original.png",
+    "replacementText": "60.0",
+    "originalText": "14.5",
+    "primaryRasterReferences": [
+      {
+        "text": "101x80x8",
+        "bbox": {
+          "x0": 77,
+          "y0": 279.3333333333333,
+          "x1": 124.66666666666667,
+          "y1": 289
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "101x80x8",
+        "bbox": {
+          "x0": 77,
+          "y0": 279.3333333333333,
+          "x1": 124.66666666666667,
+          "y1": 289
+        }
+      }
+    ]
+  },
+  "320452681": {
+    "sourcePath": "C:\\Users\\Uttkarsh Singh\\Downloads\\pod\\storage\\uploads\\65f7aa70-aca8-472a-b22a-c75ab0cf43b3\\320452681.jpg.original.png",
+    "replacementText": "630.00",
+    "originalText": "1607.05",
+    "primaryRasterReferences": [
+      {
+        "text": "70x38x26",
+        "bbox": {
+          "x0": 40,
+          "y0": 327,
+          "x1": 92.33333333333333,
+          "y1": 337.6666666666667
+        }
+      },
+      {
+        "text": "0x38x26",
+        "bbox": {
+          "x0": 44.225,
+          "y0": 327,
+          "x1": 92,
+          "y1": 337
+        }
+      },
+      {
+        "text": "66x30x26",
+        "bbox": {
+          "x0": 39.666666666666664,
+          "y0": 341.3333333333333,
+          "x1": 92.33333333333333,
+          "y1": 351.6666666666667
+        }
+      }
+    ],
+    "preferredStyleReferences": [
+      {
+        "text": "70x38x26",
+        "bbox": {
+          "x0": 40,
+          "y0": 327,
+          "x1": 92.33333333333333,
+          "y1": 337.6666666666667
+        }
+      },
+      {
+        "text": "66x30x26",
+        "bbox": {
+          "x0": 39.666666666666664,
+          "y0": 341.3333333333333,
+          "x1": 92.33333333333333,
+          "y1": 351.6666666666667
+        }
+      }
+    ]
+  }
+}

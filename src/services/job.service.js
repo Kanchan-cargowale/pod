@@ -9,7 +9,8 @@ const logger = require('../utils/logger');
 const storage = require('./storage.service');
 const { zipDirectory } = require('./zip.service');
 const { WorkerPool } = require('./workerPool.service');
-const { rasterizePdf } = require('./pdfRasterizer.service');
+const { rasterizePdf, rasterizePdfPages } = require('./pdfRasterizer.service');
+const { recordCorrection } = require('./correctionRecord.service');
 
 // A single shared pool serves every job; the pool itself bounds how many
 // images are OCR'd/edited in parallel regardless of how many jobs are
@@ -77,14 +78,18 @@ async function runWithConcurrency(items, concurrency, worker) {
   await Promise.all(runners);
 }
 
-function newJobState(jobId, totalFiles) {
+function newJobState(jobId, totalFiles, jobType = 'weight-update') {
   return {
     jobId,
+    jobType,
     status: 'queued', // queued | processing | completed | failed
     totalFiles,
     processedFiles: 0,
     matchedFiles: 0,
     unmatchedFiles: 0,
+    withRemarksFiles: 0,
+    withoutRemarksFiles: 0,
+    errorFiles: 0,
     createdAt: new Date().toISOString(),
     startedAt: null, // set when OCR/editing actually begins
     completedAt: null,
@@ -112,7 +117,7 @@ async function createJob({ imagePaths, idWeightMap, tempUploadsDir }) {
   const jobId = randomUUID();
   await storage.ensureJobDirs(jobId);
 
-  const state = newJobState(jobId, imagePaths.length);
+  const state = newJobState(jobId, imagePaths.length, 'weight-update');
   await persist(state);
 
   // Fire-and-forget: the HTTP handler does not await this.
@@ -230,6 +235,23 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
         }
       });
 
+    if (result.status === 'ok' && result.outputFilename) {
+      const correctedPath = path.join(outputsDir, path.basename(result.outputFilename));
+      try {
+        Object.assign(result, await recordCorrection({
+          originalPath: filePath, outputPath: correctedPath,
+          originalsDir: storage.jobUploadsDir(jobId), result,
+        }));
+      } catch (error) {
+        // Never publish an unmarked correction when recording fails.
+        await fs.rm(correctedPath, { force: true });
+        await fs.rm(`${correctedPath}.correction.json`, { force: true });
+        result.status = 'error';
+        result.reason = `Correction export failed: ${error.message}`;
+        result.downloadable = false;
+        delete result.outputFilename;
+      }
+    }
     state.processedFiles += 1;
     if (result.status === 'ok') state.matchedFiles += 1;
     else state.unmatchedFiles += 1;
@@ -251,6 +273,156 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
   state.durationMs = Date.now() - new Date(state.startedAt || state.createdAt).getTime();
   state.updatedAt = new Date().toISOString();
   await persist(state);
+}
+
+async function prepareRemarksInputs(imagePaths, tempUploadsDir) {
+  const prepared = [];
+  const failures = [];
+  for (let index = 0; index < imagePaths.length; index += 1) {
+    const inputPath = imagePaths[index];
+    const sourceFilename = path.basename(inputPath);
+    if (!isPdfPath(inputPath)) {
+      prepared.push({
+        filePath: inputPath,
+        sourceFilename,
+        sourceType: 'image',
+        pageNumber: null,
+        pageCount: null,
+        sourceIndex: index,
+      });
+      continue;
+    }
+    try {
+      const pageDirectory = path.join(tempUploadsDir || path.dirname(inputPath), 'remarks-pdf-pages', String(index + 1));
+      // eslint-disable-next-line no-await-in-loop
+      const pages = await rasterizePdfPages(inputPath, pageDirectory);
+      pages.forEach((page) => prepared.push({
+        ...page,
+        sourceFilename,
+        sourceType: 'pdf',
+        sourceIndex: index,
+      }));
+    } catch (error) {
+      failures.push({
+        originalFilename: sourceFilename,
+        filename: sourceFilename,
+        sourceType: 'pdf',
+        sourcePageNumber: null,
+        sourcePageCount: null,
+        status: 'error',
+        errorCode: error.code || 'pdf_rasterization_failed',
+        reason: error.message,
+        downloadable: false,
+      });
+    }
+  }
+  return { prepared, failures };
+}
+
+async function createRemarksJob({ imagePaths, tempUploadsDir }) {
+  const jobId = randomUUID();
+  await storage.ensureJobDirs(jobId);
+  const state = newJobState(jobId, imagePaths.length, 'remarks-check');
+  await persist(state);
+
+  runRemarksJob(jobId, imagePaths, tempUploadsDir).catch(async (error) => {
+    logger.error('Remarks check job failed', { jobId, error: error.message });
+    const current = jobs.get(jobId) || state;
+    current.status = 'failed';
+    current.error = error.message;
+    current.completedAt = new Date().toISOString();
+    current.durationMs = Date.now() - new Date(current.startedAt || current.createdAt).getTime();
+    current.updatedAt = new Date().toISOString();
+    await persist(current);
+  });
+  return jobId;
+}
+
+async function runRemarksJob(jobId, imagePaths, tempUploadsDir) {
+  pool.start();
+  const state = jobs.get(jobId);
+  state.status = 'processing';
+  state.startedAt = new Date().toISOString();
+  await persist(state);
+  const outputsDir = storage.jobOutputsDir(jobId);
+
+  try {
+    const { prepared, failures } = await prepareRemarksInputs(imagePaths, tempUploadsDir);
+    state.totalFiles = prepared.length + failures.length;
+    for (const failure of failures) {
+      state.processedFiles += 1;
+      state.errorFiles += 1;
+      state.results.push(failure);
+    }
+    await persist(state);
+
+    await runWithConcurrency(prepared, config.workerPoolSize, async (item, index) => {
+      const outputFilename = `pod-${String(index + 1).padStart(4, '0')}.jpg`;
+      const outputPath = path.join(outputsDir, outputFilename);
+      let result;
+      try {
+        result = await pool.run({
+          taskType: 'remarks-check',
+          filePath: item.filePath,
+          outputPath,
+          filenameHint: item.sourceFilename,
+        });
+      } catch (error) {
+        if (error.code === 'ETASKTIMEOUT') {
+          await preserveFailedInput(item.filePath, outputsDir, outputFilename);
+          result = {
+            status: 'error',
+            errorCode: 'processing_timeout',
+            reason: `${error.message}; source image preserved`,
+            processingMs: error.timeoutMs,
+            outputFilename,
+            downloadable: true,
+          };
+        } else {
+          await preserveFailedInput(item.filePath, outputsDir, outputFilename);
+          result = {
+            status: 'error',
+            reason: `${error.message}; source image preserved`,
+            outputFilename,
+            downloadable: true,
+          };
+        }
+      }
+      const complete = {
+        originalFilename: item.sourceFilename,
+        sourceType: item.sourceType,
+        sourcePageNumber: item.pageNumber,
+        sourcePageCount: item.pageCount,
+        filename: result.outputFilename || outputFilename,
+        ...result,
+      };
+      state.processedFiles += 1;
+      if (complete.status === 'with_remarks') {
+        state.withRemarksFiles += 1;
+        state.matchedFiles += 1;
+      } else if (complete.status === 'without_remarks') {
+        state.withoutRemarksFiles += 1;
+        state.unmatchedFiles += 1;
+      } else {
+        state.errorFiles += 1;
+      }
+      state.results.push(complete);
+      state.updatedAt = new Date().toISOString();
+      await persist(state);
+    });
+
+    await zipDirectory(outputsDir, storage.jobZipFile(jobId));
+    state.status = 'completed';
+    state.zipReady = true;
+    state.completedAt = new Date().toISOString();
+    state.durationMs = Date.now() - new Date(state.startedAt || state.createdAt).getTime();
+    state.updatedAt = new Date().toISOString();
+    await persist(state);
+  } finally {
+    if (tempUploadsDir) {
+      await fs.rm(tempUploadsDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 }
 
 async function getJob(jobId) {
@@ -279,6 +451,7 @@ async function shutdown() {
 
 module.exports = {
   createJob,
+  createRemarksJob,
   getJob,
   getZipPath,
   getSelectedZipPath,

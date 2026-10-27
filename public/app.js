@@ -13,6 +13,9 @@
   const mappingWarnings = document.getElementById('mapping-warnings');
   const workspaceTitle = document.getElementById('workspace-title');
   const emptyState = document.getElementById('empty-state');
+  const emptyStateMessage = document.getElementById('empty-state-message');
+  const resultIdSearch = document.getElementById('result-id-search');
+  const clearIdSearch = document.getElementById('clear-id-search');
   const progressFill = document.getElementById('progress-bar-fill');
   const progressPercent = document.getElementById('progress-percent');
   const jobIdLabel = document.getElementById('job-id');
@@ -42,6 +45,7 @@
     currentJobId: null,
     pollTimer: null,
     lastResults: [],
+    searchIds: new Set(),
     isDownloading: false,
     selectedFilenames: new Set(),
   };
@@ -50,6 +54,7 @@
   wireDropzone(imagesDrop, imagesInput, updateImageSelection);
   wireDropzone(mappingDrop, mappingInput, updateMappingSelection);
   wireFilters();
+  wireOrderSearch();
   wirePreviewDialog();
   wireSelectionControls();
 
@@ -57,11 +62,22 @@
   downloadSelectedBtn.addEventListener('click', downloadSelected);
   resetBtn.addEventListener('click', resetToEmptyState);
 
+  // Results in the active filter tab that can actually be downloaded.
+  function downloadableInCurrentFilter() {
+    return state.lastResults.filter(
+      (result) =>
+        matchesCurrentFilter(result) &&
+        result.downloadable !== false &&
+        result.outputFilename
+    );
+  }
+
   function wireSelectionControls() {
     selectAllBtn.addEventListener('click', () => {
-      state.lastResults
-        .filter((result) => result.downloadable !== false && result.outputFilename)
-        .forEach((result) => state.selectedFilenames.add(result.outputFilename));
+      // Select every downloadable label in the active filter tab only.
+      downloadableInCurrentFilter().forEach((result) =>
+        state.selectedFilenames.add(result.outputFilename)
+      );
       renderResults();
       updateSelectionCount();
     });
@@ -73,18 +89,28 @@
     });
   }
 
+  // Keep the selection scoped to the active filter. Called whenever the
+  // filter tab changes so Download Selected reflects exactly what's visible.
+  function selectAllInCurrentFilter() {
+    state.selectedFilenames.clear();
+    downloadableInCurrentFilter().forEach((result) =>
+      state.selectedFilenames.add(result.outputFilename)
+    );
+  }
+
   function updateSelectionCount() {
     const count = state.selectedFilenames.size;
-    const total = state.lastResults.length;
+    const filterTotal = downloadableInCurrentFilter().length;
+    const label = downloadSelectedBtn.querySelector('span:last-child');
     if (count === 0) {
       downloadSelectedBtn.disabled = true;
-      downloadSelectedBtn.querySelector('span:last-child').textContent = 'Download Selected';
-    } else if (count === total && total > 0) {
+      label.textContent = 'Download Selected';
+    } else if (count === filterTotal && filterTotal > 0) {
       downloadSelectedBtn.disabled = false;
-      downloadSelectedBtn.querySelector('span:last-child').textContent = `Download All (${count})`;
+      label.textContent = `Download All (${count})`;
     } else {
       downloadSelectedBtn.disabled = false;
-      downloadSelectedBtn.querySelector('span:last-child').textContent = `Download Selected (${count})`;
+      label.textContent = `Download Selected (${count})`;
     }
   }
 
@@ -164,9 +190,72 @@
       tab.addEventListener('click', () => {
         state.currentFilter = tab.dataset.filter;
         filterTabs.forEach((item) => item.classList.toggle('is-active', item === tab));
+        // Switching tabs re-scopes the download set to what the tab shows, so
+        // Download Selected always matches the visible results.
+        selectAllInCurrentFilter();
         renderResults();
+        updateSelectionCount();
       });
     });
+  }
+
+  function parseOrderIds(value) {
+    return new Set(
+      String(value || '')
+        .split(/[,;\s]+/)
+        .map((id) => id.trim().toLowerCase())
+        .filter(Boolean)
+    );
+  }
+
+  function wireOrderSearch() {
+    const applySearch = () => {
+      state.searchIds = parseOrderIds(resultIdSearch.value);
+      clearIdSearch.hidden = state.searchIds.size === 0;
+      // Search and status filters form one visible result set. Re-scope the
+      // selected ZIP contents at the same time so hidden orders are never
+      // downloaded accidentally.
+      selectAllInCurrentFilter();
+      renderResults();
+    };
+
+    resultIdSearch.addEventListener('input', applySearch);
+    clearIdSearch.addEventListener('click', () => {
+      resultIdSearch.value = '';
+      applySearch();
+      resultIdSearch.focus();
+    });
+  }
+
+  function resultOrderIds(result) {
+    return [result.shipmentId, result.detectedImageId, result.outputImageId]
+      .filter((id) => id !== null && id !== undefined && String(id).trim())
+      .map((id) => String(id).trim().toLowerCase());
+  }
+
+  function primaryResultOrderId(result) {
+    return result.shipmentId || result.detectedImageId || result.outputImageId || '';
+  }
+
+  async function copyText(value) {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+
+    // Fallback for browsers that disable Clipboard API outside a secure
+    // context. Keep the temporary input off-screen without hiding it from the
+    // selection API used by execCommand.
+    const input = document.createElement('textarea');
+    input.value = value;
+    input.setAttribute('readonly', '');
+    input.style.position = 'fixed';
+    input.style.left = '-9999px';
+    document.body.append(input);
+    input.select();
+    const copied = document.execCommand('copy');
+    input.remove();
+    if (!copied) throw new Error('Clipboard copy failed');
   }
 
   function wirePreviewDialog() {
@@ -306,10 +395,7 @@
             selectAllBtn.hidden = false;
             unselectAllBtn.hidden = false;
             resetBtn.hidden = false;
-            state.selectedFilenames.clear();
-            state.lastResults
-              .filter((result) => result.downloadable !== false && result.outputFilename)
-              .forEach((result) => state.selectedFilenames.add(result.outputFilename));
+            selectAllInCurrentFilter();
             updateSelectionCount();
           } else {
             workspaceTitle.textContent = 'Batch failed';
@@ -360,9 +446,22 @@
 
   function renderResults() {
     const filtered = state.lastResults.filter(matchesCurrentFilter);
+    const filterIsActive = state.currentFilter !== 'all' || state.searchIds.size > 0;
     resultsGrid.innerHTML = '';
-    resultCount.textContent = filtered.length === 1 ? '1 result' : `${filtered.length} results`;
-    emptyState.hidden = state.lastResults.length > 0 || Boolean(state.currentJobId);
+    resultCount.textContent = filterIsActive
+      ? `${filtered.length} of ${state.lastResults.length} ${state.lastResults.length === 1 ? 'result' : 'results'}`
+      : (filtered.length === 1 ? '1 result' : `${filtered.length} results`);
+
+    const hasFilteredEmptyState = state.lastResults.length > 0 && filtered.length === 0;
+    emptyState.hidden = !hasFilteredEmptyState &&
+      (state.lastResults.length > 0 || Boolean(state.currentJobId));
+    if (hasFilteredEmptyState) {
+      emptyStateMessage.textContent = state.searchIds.size > 0
+        ? 'No orders match the entered ID(s) in this result filter. Check the IDs or clear the search.'
+        : 'No orders are available in this result filter.';
+    } else if (!state.currentJobId && state.lastResults.length === 0) {
+      emptyStateMessage.textContent = 'Upload a batch to see live matches, replacements, previews, and review notes.';
+    }
 
     filtered.forEach((result) => {
       resultsGrid.append(buildCard(state.currentJobId, result));
@@ -379,10 +478,14 @@
   }
 
   function matchesCurrentFilter(result) {
-    if (state.currentFilter === 'all') return true;
-    if (state.currentFilter === 'ok') return result.status === 'ok';
-    if (state.currentFilter === 'error') return result.status === 'error';
-    return result.status !== 'ok' && result.status !== 'error';
+    let statusMatches = true;
+    if (state.currentFilter === 'ok') statusMatches = result.status === 'ok';
+    else if (state.currentFilter === 'error') statusMatches = result.status === 'error';
+    else if (state.currentFilter === 'review') {
+      statusMatches = result.status !== 'ok' && result.status !== 'error';
+    }
+    if (!statusMatches || state.searchIds.size === 0) return statusMatches;
+    return resultOrderIds(result).some((id) => state.searchIds.has(id));
   }
 
   function buildCard(jobId, result) {
@@ -394,7 +497,10 @@
     const placeholder = node.querySelector('.card-placeholder');
     const badge = node.querySelector('.status-badge');
     const filename = node.querySelector('.card-filename');
-    const idValue = node.querySelector('.card-id-value');
+    const idText = node.querySelector('.card-id-text');
+    const copyIdButton = node.querySelector('.copy-id-button');
+    const copyIdLabel = node.querySelector('.copy-id-label');
+    const copyIdStatus = node.querySelector('.copy-id-status');
     const shipmentRow = node.querySelector('.shipment-row');
     const weightRow = node.querySelector('.weight-row');
     const weightValues = node.querySelector('.weight-values');
@@ -420,15 +526,44 @@
     badge.textContent = formatStatus(status);
     badge.classList.add(status);
 
+    const orderId = String(primaryResultOrderId(result) || '').trim();
+    idText.textContent = orderId || '-';
+    if (orderId) {
+      copyIdButton.setAttribute('aria-label', `Copy order ID ${orderId}`);
+      copyIdButton.title = `Copy ${orderId}`;
+      let feedbackTimer = null;
+      copyIdButton.addEventListener('click', async () => {
+        window.clearTimeout(feedbackTimer);
+        copyIdButton.disabled = true;
+        try {
+          await copyText(orderId);
+          copyIdButton.classList.add('is-copied');
+          copyIdLabel.textContent = 'Copied';
+          copyIdStatus.textContent = `Order ID ${orderId} copied to clipboard.`;
+        } catch (error) {
+          copyIdButton.classList.add('has-error');
+          copyIdLabel.textContent = 'Failed';
+          copyIdStatus.textContent = `Could not copy order ID ${orderId}.`;
+        }
+        feedbackTimer = window.setTimeout(() => {
+          copyIdButton.disabled = false;
+          copyIdButton.classList.remove('is-copied', 'has-error');
+          copyIdLabel.textContent = 'Copy';
+          copyIdStatus.textContent = '';
+        }, 1600);
+      });
+    } else {
+      copyIdButton.remove();
+    }
+
     if (artifactFilename) {
       img.src = previewUrl;
       img.alt = `${status === 'ok' ? 'Edited' : 'Scanned'} label preview for ${artifactFilename}`;
       placeholder.remove();
-      thumbButton.addEventListener('click', () => openPreview(previewUrl, artifactFilename));
+      thumbButton.addEventListener('click', () => openPreview(previewUrl, artifactFilename, result));
     }
 
     if (status === 'ok') {
-      idValue.textContent = result.shipmentId || '-';
       renderWeightChanges(weightValues, result);
       reason.remove();
     } else {
@@ -440,8 +575,7 @@
         }
         thumbButton.disabled = true;
       }
-      idValue.textContent = result.shipmentId || '-';
-      if (!result.shipmentId) shipmentRow.remove();
+      if (!orderId) shipmentRow.remove();
       weightRow.remove();
       reason.textContent = buildReasonText(result);
     }
@@ -502,10 +636,24 @@
     return text;
   }
 
-  function openPreview(src, title) {
+  function openPreview(src, title, result = {}) {
     previewImage.src = src;
     previewImage.alt = `Edited label preview for ${title}`;
     previewTitle.textContent = title || 'Preview';
+    document.getElementById('corrected-preview-label').textContent = 'Preview';
+    const history = document.getElementById('correction-history');
+    history.replaceChildren();
+    history.hidden = !result.correctionRecord;
+    if (result.correctionRecord) {
+      const heading = document.createElement('strong');
+      heading.textContent = `Edit history — ${new Date(result.correctionRecord.correctedAt).toLocaleString()}`;
+      history.append(heading);
+      for (const change of result.correctionRecord.changes) {
+        const row = document.createElement('p');
+        row.textContent = `${change.originalText || '(unreadable)'} → ${change.newText}`;
+        history.append(row);
+      }
+    }
 
     if (typeof previewDialog.showModal === 'function') {
       previewDialog.showModal();
@@ -517,9 +665,14 @@
   function resetJobView() {
     if (state.pollTimer) clearInterval(state.pollTimer);
 
-    // Do not carry an Errors/Review filter from the previous batch into a new
-    // job; doing so makes valid live previews appear to be missing.
+    // Do not carry an Errors/Review filter or an order search from the
+    // previous batch into a new job; either would make valid live previews
+    // appear to be missing.
     state.currentFilter = 'all';
+    state.searchIds.clear();
+    state.selectedFilenames.clear();
+    resultIdSearch.value = '';
+    clearIdSearch.hidden = true;
     filterTabs.forEach((tab) =>
       tab.classList.toggle('is-active', tab.dataset.filter === 'all')
     );

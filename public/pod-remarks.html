@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>POD Remarks Check</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/pod-remarks.css" />
+</head>
+<body>
+  <main class="app-shell remarks-shell">
+    <nav class="page-nav" aria-label="Tools">
+      <div>
+        <span class="page-nav-brand">POD Operations</span>
+        <span class="page-nav-current">Remarks Check</span>
+      </div>
+      <a class="btn btn-ghost page-nav-link" href="/">
+        <span class="btn-icon remarks-back-icon" aria-hidden="true">&#8592;</span>
+        <span>Weight Update</span>
+      </a>
+    </nav>
+
+    <section class="setup-panel" aria-labelledby="remarks-setup-title">
+      <form id="remarks-form" class="upload-form">
+        <div class="upload-stage remarks-upload-stage">
+          <div class="upload-intro">
+            <span class="upload-mark remarks-mark" aria-hidden="true"><span></span></span>
+            <p class="eyebrow">POD remarks check</p>
+            <h1 id="remarks-setup-title">Find PODs with handwritten remarks</h1>
+            <p>Upload multiple POD images or PDFs. The system reads each LR ID and separates PODs with handwritten remarks from clean PODs, excluding signatures and stamps.</p>
+          </div>
+
+          <div class="field remarks-upload-field">
+            <div class="field-heading">
+              <label for="remarks-files">POD files</label>
+              <span id="remarks-files-count">0 selected</span>
+            </div>
+            <div class="dropzone" id="remarks-drop">
+              <input type="file" id="remarks-files" name="images" accept=".jpg,.jpeg,.png,.pdf" multiple required />
+              <div class="dropzone-body">
+                <span class="dropzone-icon" aria-hidden="true">+</span>
+                <span class="dropzone-title">Choose POD images or PDFs</span>
+                <span class="dropzone-meta">or drag and drop multiple files here</span>
+              </div>
+            </div>
+            <ul class="file-list" id="remarks-files-list" aria-live="polite"></ul>
+          </div>
+
+          <p class="upload-help remarks-help">
+            <span>JPG, PNG, and PDF</span>
+            <span>Every PDF page is checked</span>
+            <span>Stamps and signatures are excluded</span>
+          </p>
+
+          <button type="submit" id="remarks-submit" class="btn btn-primary">
+            <span class="btn-icon" aria-hidden="true">CHK</span>
+            <span>Check remarks</span>
+          </button>
+        </div>
+        <div id="remarks-error" class="message message-error" role="alert" hidden></div>
+      </form>
+    </section>
+
+    <section class="workspace remarks-workspace" aria-labelledby="remarks-workspace-title">
+      <div class="workspace-header">
+        <div>
+          <p class="eyebrow">Classification results</p>
+          <h2 id="remarks-workspace-title">Ready when you are</h2>
+        </div>
+        <div class="header-actions">
+          <button type="button" id="remarks-reset" class="btn btn-ghost" hidden>
+            <span class="btn-icon" aria-hidden="true">&#8635;</span>
+            <span>Reset</span>
+          </button>
+          <a id="remarks-download" class="btn btn-secondary" href="#" hidden>
+            <span class="btn-icon" aria-hidden="true">ZIP</span>
+            <span>Download all</span>
+          </a>
+        </div>
+      </div>
+
+      <div class="progress-panel">
+        <div class="meter-row">
+          <div class="progress-heading">
+            <span class="activity-pill is-idle" id="remarks-activity">
+              <span class="activity-dot" aria-hidden="true"></span>
+              <span id="remarks-activity-text">Ready</span>
+            </span>
+            <strong id="remarks-progress-percent">0%</strong>
+          </div>
+          <span class="progress-copy" id="remarks-progress-copy">Choose files to begin</span>
+        </div>
+        <div class="progress-track" aria-hidden="true">
+          <div class="progress-fill" id="remarks-progress-fill"></div>
+        </div>
+        <div class="stats-grid remarks-stats">
+          <div class="stat"><span class="stat-value" id="remarks-total">0</span><span class="stat-label">Total pages</span></div>
+          <div class="stat"><span class="stat-value" id="remarks-processed">0</span><span class="stat-label">Processed</span></div>
+          <div class="stat stat-warn"><span class="stat-value" id="remarks-with-count">0</span><span class="stat-label">With remarks</span></div>
+          <div class="stat stat-ok"><span class="stat-value" id="remarks-without-count">0</span><span class="stat-label">Without remarks</span></div>
+          <div class="stat"><span class="stat-value" id="remarks-error-count">0</span><span class="stat-label">Errors</span></div>
+        </div>
+      </div>
+
+      <div class="remarks-toolbar">
+        <div class="order-search" role="search">
+          <label for="remarks-id-search" class="sr-only">Search results by LR ID</label>
+          <span class="order-search-prefix" aria-hidden="true">LR</span>
+          <input id="remarks-id-search" type="search" autocomplete="off" placeholder="Search LR ID" />
+          <button type="button" id="remarks-search-clear" class="order-search-clear" aria-label="Clear LR ID search" hidden>&times;</button>
+        </div>
+        <span id="remarks-result-count" class="result-count">0 results</span>
+      </div>
+
+      <div id="remarks-empty" class="empty-state">
+        <div class="empty-preview" aria-hidden="true"><span></span><span></span><span></span></div>
+        <p>Upload POD files to classify handwritten remarks while ignoring stamp and signature areas.</p>
+      </div>
+
+      <div id="remarks-results" class="remarks-columns" hidden>
+        <section class="remarks-bucket remarks-found" aria-labelledby="with-remarks-title">
+          <div class="remarks-bucket-header">
+            <div><span class="bucket-dot" aria-hidden="true"></span><h3 id="with-remarks-title">POD with remarks</h3></div>
+            <span id="with-remarks-badge" class="bucket-count">0</span>
+          </div>
+          <p class="bucket-help">Adverse handwritten meaning—such as damage, shortage, missing goods, rejection, or quantity mismatch—was detected.</p>
+          <div id="with-remarks-grid" class="results-grid remarks-grid"></div>
+          <p id="with-remarks-empty" class="bucket-empty">No PODs with remarks yet.</p>
+        </section>
+
+        <section class="remarks-bucket remarks-clear" aria-labelledby="without-remarks-title">
+          <div class="remarks-bucket-header">
+            <div><span class="bucket-dot" aria-hidden="true"></span><h3 id="without-remarks-title">POD without remarks</h3></div>
+            <span id="without-remarks-badge" class="bucket-count">0</span>
+          </div>
+          <p class="bucket-help">No adverse remark meaning was found. Dates, signatures, stamps, phone numbers, and normal receipt confirmations are ignored.</p>
+          <div id="without-remarks-grid" class="results-grid remarks-grid"></div>
+          <p id="without-remarks-empty" class="bucket-empty">No clean PODs yet.</p>
+        </section>
+      </div>
+
+      <section id="remarks-errors" class="remarks-errors" aria-labelledby="remarks-errors-title" hidden>
+        <h3 id="remarks-errors-title">Files needing review</h3>
+        <div id="remarks-error-list"></div>
+      </section>
+    </section>
+  </main>
+
+  <template id="remarks-card-template">
+    <article class="result-card remarks-card">
+      <button type="button" class="thumb-button" aria-label="Open POD preview">
+        <img class="card-image" loading="lazy" alt="" />
+        <div class="card-placeholder"><span class="placeholder-icon">!</span><span class="placeholder-text">No preview</span></div>
+        <span class="remark-region-count" hidden></span>
+      </button>
+      <div class="result-card-body">
+        <div class="card-title-row">
+          <div class="card-filename"></div>
+          <span class="status-badge"></span>
+        </div>
+        <dl class="result-details">
+          <div class="detail-row shipment-row">
+            <dt>LR ID</dt>
+            <dd class="card-id-value">
+              <span class="card-id-text">Not read</span>
+              <button type="button" class="copy-id-button" aria-label="Copy LR ID">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1"></rect><path d="M3 11H2.5A1.5 1.5 0 0 1 1 9.5v-7A1.5 1.5 0 0 1 2.5 1h7A1.5 1.5 0 0 1 11 2.5V3"></path></svg>
+                <span class="copy-id-label">Copy</span>
+              </button>
+              <span class="copy-id-status sr-only" role="status" aria-live="polite"></span>
+            </dd>
+          </div>
+          <div class="detail-row"><dt>Source</dt><dd class="remarks-source"></dd></div>
+          <div class="detail-row"><dt>Result</dt><dd class="remarks-result"></dd></div>
+          <div class="detail-row"><dt>Confidence</dt><dd class="remarks-confidence"></dd></div>
+          <div class="detail-row"><dt>Time</dt><dd class="remarks-time"></dd></div>
+        </dl>
+      </div>
+    </article>
+  </template>
+
+  <dialog id="remarks-preview-dialog" class="preview-dialog remarks-preview-dialog">
+    <div class="dialog-header">
+      <div><strong id="remarks-preview-title">POD preview</strong><span id="remarks-preview-subtitle"></span></div>
+      <button type="button" class="icon-button" id="remarks-preview-close" aria-label="Close preview">X</button>
+    </div>
+    <div class="remarks-preview-stage">
+      <div id="remarks-preview-wrap" class="remarks-preview-wrap">
+        <img id="remarks-preview-image" alt="" />
+        <div id="remarks-preview-overlays" aria-hidden="true"></div>
+      </div>
+    </div>
+    <div class="remarks-preview-legend"><span><i class="legend-remark"></i>Adverse remark area</span><span><i class="legend-excluded"></i>Ignored signature, stamp, date, or routine receipt area</span></div>
+  </dialog>
+
+  <script src="/pod-remarks.js"></script>
+</body>
+</html>

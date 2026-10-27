@@ -6,6 +6,7 @@ const { parentPort } = require('worker_threads');
 
 const ocrService = require('../services/ocr.service');
 const imageEditor = require('../services/imageEditor.service');
+const { processRemarksImage } = require('../services/remarksAnalyzer.service');
 const { getAlternativeRotations, orientationEvidence } = require('../services/imageOrientation.service');
 const {
   inferActualSiblingRegion,
@@ -37,6 +38,110 @@ const { NON_DIGIT } = require('../constants/regex');
 
 const OCR_MAX_DIMENSION = Number(process.env.OCR_MAX_DIMENSION || 4800);
 const OCR_MAX_PIXELS = Number(process.env.OCR_MAX_PIXELS || 16000000);
+
+/** Plain edit distance; IDs are <= 12 digits so the O(n*m) table is tiny. */
+function digitEditDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let previous = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const current = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] === b[j - 1] ? 0 : 1));
+      previous = current;
+    }
+  }
+  return row[b.length];
+}
+
+/**
+ * Focused re-read of the printed shipment ID.
+ *
+ * Crops (1) the header ID line found by the page pass, widened to the right
+ * where a dropped final digit sits, and (2) the small caption printed under
+ * the barcode, which repeats the same ID. Each crop is upscaled so digits are
+ * ~40px tall and read with a digits-only single-line pass, plain and
+ * binarized. A read is accepted only when it is an exact mapping-sheet ID.
+ * When no read is exact but the upload filename names a sheet ID that is a
+ * single digit away (dropped, extra or misread) from a confident read, the
+ * filename and sheet jointly disambiguate it. Nothing else is guessed.
+ */
+async function rereadPrintedShipmentId(input, meta, header, idSet, filenameMatch) {
+  if (!meta?.width || !meta?.height || !idSet?.size) return null;
+  const crops = [];
+  if (header?.bbox) {
+    const h = Math.max(6, header.bbox.y1 - header.bbox.y0);
+    crops.push({
+      left: header.bbox.x0 - h * 0.6,
+      top: header.bbox.y0 - h * 0.45,
+      right: header.bbox.x1 + h * 2.2,
+      bottom: header.bbox.y1 + h * 0.45,
+      glyphHeight: h,
+    });
+  } else {
+    // No header token at all: the ID line sits left of the barcode, top-right.
+    crops.push({
+      left: meta.width * 0.5, top: 0, right: meta.width * 0.78, bottom: meta.height * 0.12,
+      glyphHeight: meta.height * 0.03,
+    });
+  }
+  // Barcode caption: top-right corner, under the bars.
+  crops.push({
+    left: meta.width * 0.68, top: 0, right: meta.width, bottom: meta.height * 0.13,
+    glyphHeight: meta.height * 0.012,
+  });
+
+  const reads = [];
+  for (const crop of crops) {
+    const left = Math.max(0, Math.floor(crop.left));
+    const top = Math.max(0, Math.floor(crop.top));
+    const width = Math.min(meta.width - left, Math.ceil(crop.right) - left);
+    const height = Math.min(meta.height - top, Math.ceil(crop.bottom) - top);
+    if (width < 8 || height < 6) continue;
+    const scale = boundedOcrScale(width, height,
+      Math.max(2, Math.min(8, 40 / Math.max(4, crop.glyphHeight))));
+    const base = sharp(input).extract({ left, top, width, height })
+      .resize({ width: Math.round(width * scale), height: Math.round(height * scale), kernel: 'lanczos3' })
+      .greyscale().normalize();
+    const variants = [
+      await base.clone().sharpen().png().toBuffer(),
+      await base.clone().threshold(150).png().toBuffer(),
+    ];
+    for (const variant of variants) {
+      for (const psm of [7, 11]) {
+        // eslint-disable-next-line no-await-in-loop
+        const { words: found } = await ocrService.recognize(variant, { psm, whitelist: '0123456789' });
+        for (const word of found) {
+          const digits = String(word.text || '').replace(NON_DIGIT, '');
+          if (/^\d{7,12}$/.test(digits)) reads.push({ digits, confidence: word.confidence });
+        }
+        // Words split by a gap: also consider the whole line joined.
+        const joined = found.map((word) => String(word.text || '').replace(NON_DIGIT, '')).join('');
+        if (/^\d{8,12}$/.test(joined)) {
+          reads.push({ digits: joined, confidence: Math.min(...found.map((w) => w.confidence)) });
+        }
+      }
+    }
+  }
+
+  const exact = reads.filter((read) => idSet.has(read.digits))
+    .sort((a, b) => b.confidence - a.confidence)[0];
+  if (exact) {
+    return {
+      id: exact.digits, distance: 0, confidence: exact.confidence, score: exact.confidence,
+      source: 'header_id_reread', words: [],
+    };
+  }
+  if (filenameMatch) {
+    const supporting = reads.concat(header ? [{ digits: header.id, confidence: header.confidence }] : [])
+      .filter((read) => read.confidence >= 60 &&
+        digitEditDistance(read.digits, filenameMatch.id) === 1);
+    if (supporting.length) {
+      return { ...filenameMatch, source: 'header_filename_repair' };
+    }
+  }
+  return null;
+}
 
 function boundedOcrScale(width, height, desiredScale) {
   const safeWidth = Math.max(1, Number(width) || 1);
@@ -614,7 +719,18 @@ async function processImage({
     analysis = fullAnalysis;
   }
 
-  const { input: processingInput, words, match, anchors } = analysis;
+  const { input: processingInput, words, anchors } = analysis;
+  let { match } = analysis;
+  // The page-level OCR pass sometimes drops or merges a digit of the large
+  // printed shipment ID (306477176 -> 30647717) because the barcode starts
+  // right after it. Before declaring the label unmatched, re-read just that
+  // ID line - and the small caption printed under the barcode - at high
+  // resolution with a digits-only, single-line OCR pass.
+  if (!match || match.distance > 0) {
+    const header = analysis.headerId || findHeaderShipmentId(words, analysis.meta);
+    const reread = await rereadPrintedShipmentId(processingInput, analysis.meta, header, idSet, filenameMatch);
+    if (reread) match = reread;
+  }
   let { regions } = analysis;
   let strictAlignedPairProven = false;
   let singleStructuralAttempt = [];
@@ -2242,7 +2358,10 @@ async function processImage({
     const currentRowCenter = (region.bbox.y0 + region.bbox.y1) / 2;
     const visibleValue = words
       .map((word) => {
-        const match = String(word.text || '').match(/\d{1,6}(?:[.,]\d{1,3})/);
+        // Low-quality scans can drop the decimal point entirely (128.42 ->
+        // 12842). Within a header-owned weight cell, that compact numeric OCR
+        // token is still a safer glyph location than a guessed lower row.
+        const match = String(word.text || '').match(/\d{1,6}(?:[.,]\d{1,3})|\b\d{3,6}\b/);
         return match ? { word, text: match[0].replace(',', '.') } : null;
       })
       .filter(Boolean)
@@ -2800,6 +2919,46 @@ async function processImage({
       b.bbox.x1 - a.bbox.x1
     );
   const bestReferencePriority = localReferenceCandidates[0]?.priority;
+  // Only actual dimension values may drive the pixel-exact rendering path.
+  // BOXES labels and arbitrary numbers remain useful fallback style samples,
+  // but cannot establish the primary face, scale, or ink.
+  const primaryRasterReferences = [];
+  const strictDimensionPattern = /\d{1,4}(?:[.,]\d+)?[xX\u00d7]\d{1,4}(?:[.,]\d+)?[xX\u00d7]\d{1,4}(?:[.,]\d+)?/;
+  for (const candidate of localReferenceCandidates) {
+    if (candidate.priority > 1) continue;
+    const compact = String(candidate.text || '').replace(/\s/g, '');
+    const dimensionMatch = compact.match(strictDimensionPattern);
+    if (!dimensionMatch) continue;
+
+    // Tesseract often returns the whole printed row as one word, e.g.
+    // `1 Box: 66x41x24`. The editor must receive only the dimension glyphs;
+    // otherwise its strict raster matcher rejects the specimen and silently
+    // falls back to generic/old-weight typography. Approximate the substring's
+    // horizontal crop from character advances while retaining a small edge
+    // margin for antialiasing.
+    const boxWidth = candidate.bbox.x1 - candidate.bbox.x0;
+    const averageAdvance = boxWidth / Math.max(1, compact.length);
+    const matchStart = dimensionMatch.index || 0;
+    const matchEnd = matchStart + dimensionMatch[0].length;
+    const bbox = matchStart === 0 && matchEnd === compact.length
+      ? { ...candidate.bbox }
+      : {
+          ...candidate.bbox,
+          x0: Math.max(candidate.bbox.x0,
+            candidate.bbox.x0 + matchStart * averageAdvance - averageAdvance * 0.35),
+          x1: Math.min(candidate.bbox.x1,
+            candidate.bbox.x0 + matchEnd * averageAdvance + averageAdvance * 0.35),
+        };
+    if (bbox.x1 - bbox.x0 < 4) continue;
+    primaryRasterReferences.push({ bbox, text: dimensionMatch[0] });
+    // Candidates are already ordered by exactness and row distance, so the
+    // nearest same-row specimen is tried first. Supply a couple of backups
+    // too: OCR sometimes drops a leading digit (for example `88x43x31` read as
+    // `5x43x31`), and comparing that string against the real ink makes the
+    // strict matcher reject an otherwise perfect row. Without a backup the
+    // whole label then fell back to generic SVG typography.
+    if (primaryRasterReferences.length >= 3) break;
+  }
   const preferredStyleReferences = [];
   for (const candidate of localReferenceCandidates) {
     if (candidate.priority !== bestReferencePriority) continue;
@@ -2836,22 +2995,43 @@ async function processImage({
     if (styleReferences.length >= 60) break;
   }
 
-  const editedBuffer = await imageEditor.replaceWeightRegions(
+    const authoritativeStyleReferences = primaryRasterReferences.length
+      ? primaryRasterReferences
+      : preferredStyleReferences;
+    const typographyDiagnostics = process.env.POD_TYPOGRAPHY_DEBUG ? { events: [] } : null;
+    const editStartedAtMs = Date.now();
+    const editedBuffer = await imageEditor.replaceWeightRegions(
     processingInput,
     replacements,
     {
+    diagnostics: typographyDiagnostics,
     styleReferences,
-    preferredStyleReferences,
-    // The left-side BOXES/DIMENSION rows are the requested visual target for
-    // size, ink and stroke. Old weight values can use a different print style.
-    validationStyleReferences: preferredStyleReferences,
+    preferredStyleReferences: authoritativeStyleReferences,
+    primaryRasterReferences,
+    // Nearby dimension values establish the requested body-text appearance.
+    // Local weight ink is retained only if no usable dimension specimen exists.
+    validationStyleReferences: authoritativeStyleReferences,
     matchValidationInk: true,
-    preferSourceInk: false,
+    preferSourceInk: true,
+    separateInkTone: true,
+    matchNeighborTypography: true,
     // Lock out malformed OCR box scaling, but derive the actual size, weight,
-    // stroke and ink from a consensus of this image's BOXES/DIMENSION rows.
+    // and stroke from a consensus of this image's BOXES/DIMENSION rows.
     lockBodyTypography: true,
+    // Reject the experimental source fit that can interpret scan noise as
+    // tall, widely tracked monospace text. Keep the established body limits.
+    matchSourceText: true,
+    // Prefer composing the new value from digits printed on this label; the
+    // composite must OCR back as exactly the new value or font rendering is
+    // used instead.
+    glyphTransplant: process.env.POD_GLYPH_TRANSPLANT !== '0',
+    verifyTransplantText: async (png) => {
+      const { words: read } = await ocrService.recognize(png, { psm: 7, whitelist: '0123456789.' });
+      return read.map((word) => word.text).join('');
+    },
     }
   );
+  const editMs = Date.now() - editStartedAtMs;
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   const outputImageId = detectedImageId?.id || match.id;
   const writtenOutput = await writeOutputNamedByShipmentId(outputPath, outputImageId, editedBuffer);
@@ -2863,6 +3043,19 @@ async function processImage({
     detectedImageId: detectedImageId?.id || null,
     outputImageId,
     appliedRotation: analysis.rotation,
+    ...(typographyDiagnostics ? {
+      typographyDiagnostics: {
+        editMs,
+        events: typographyDiagnostics.events,
+        primaryRasterReferences: primaryRasterReferences.map((ref) => ({
+          text: ref.text, bbox: ref.bbox,
+        })),
+        preferredStyleReferences: preferredStyleReferences.map((ref) => ({
+          text: ref.text, bbox: ref.bbox,
+        })),
+        styleReferences: styleReferences.map((ref) => ({ text: ref.text, bbox: ref.bbox })),
+      },
+    } : {}),
     newWeight,
     processingMs: elapsedMs(),
     replacedRegions: replacements
@@ -2893,7 +3086,9 @@ parentPort.on('message', async (msg) => {
   if (msg.type === 'task') {
     const { taskId } = msg;
     try {
-      const result = await processImage(msg.payload);
+      const result = msg.payload?.taskType === 'remarks-check'
+        ? await processRemarksImage(msg.payload)
+        : await processImage(msg.payload);
       parentPort.postMessage({ taskId, ok: true, result });
     } catch (err) {
       parentPort.postMessage({
