@@ -43,6 +43,7 @@
     apiOnline: false,
     currentFilter: 'all',
     currentJobId: null,
+    currentJobType: 'weight-update',
     pollTimer: null,
     lastResults: [],
     searchIds: new Set(),
@@ -68,6 +69,7 @@
       (result) =>
         matchesCurrentFilter(result) &&
         result.downloadable !== false &&
+        (state.currentJobType !== 'weight-update' || result.status === 'ok') &&
         result.outputFilename
     );
   }
@@ -418,6 +420,7 @@
 
   function renderJob(jobId, job) {
     state.currentJobId = jobId;
+    state.currentJobType = job.jobType || 'weight-update';
     state.lastResults = job.results || [];
 
     const total = job.totalFiles || 0;
@@ -514,7 +517,8 @@
 
     card.dataset.status = status;
     card.dataset.filename = artifactFilename || '';
-    checkbox.disabled = !artifactFilename || result.downloadable === false;
+    checkbox.disabled = !artifactFilename || result.downloadable === false ||
+      (state.currentJobType === 'weight-update' && result.status !== 'ok');
     checkbox.checked = state.selectedFilenames.has(artifactFilename);
     checkbox.addEventListener('change', () => {
       if (checkbox.checked) state.selectedFilenames.add(artifactFilename);

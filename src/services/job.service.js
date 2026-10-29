@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const fsSync = require('fs');
 const fs = require('fs/promises');
 const { randomUUID } = require('crypto');
 
@@ -260,8 +261,14 @@ async function runJob(jobId, imagePaths, idWeightMap, tempUploadsDir) {
     await persist(state);
   });
 
+  // The weight-update download is an image export. Do not include correction
+  // JSON sidecars, failed-input copies, or any other files from the job folder.
+  const correctedImagePaths = state.results
+    .filter((result) => result.status === 'ok' && result.downloadable !== false && result.outputFilename)
+    .map((result) => path.join(outputsDir, path.basename(result.outputFilename)))
+    .filter((filePath) => fsSync.existsSync(filePath));
   const zipPath = storage.jobZipFile(jobId);
-  await zipDirectory(outputsDir, zipPath);
+  await zipDirectory(outputsDir, zipPath, correctedImagePaths);
 
   if (tempUploadsDir) {
     await fs.rm(tempUploadsDir, { recursive: true, force: true }).catch(() => {});

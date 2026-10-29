@@ -69,11 +69,30 @@ async function getJobStatus(req, res) {
   return res.json(job);
 }
 
-async function downloadJobZip(req, res) {
+async function downloadJobZip(req, res, next) {
   const job = await jobService.getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'completed') {
     return res.status(409).json({ error: `Job is not ready yet (status: ${job.status})` });
+  }
+
+  if (job.jobType !== 'remarks-check') {
+    const outputsDir = jobService.getOutputsDir(req.params.id);
+    const imagePaths = job.results
+      .filter((result) => result.status === 'ok' && result.downloadable !== false && result.outputFilename)
+      .map((result) => path.join(outputsDir, path.basename(result.outputFilename)))
+      .filter((filePath) => fs.existsSync(filePath));
+    if (!imagePaths.length) {
+      return res.status(404).json({ error: 'This job has no corrected images to download.' });
+    }
+
+    const zipPath = jobService.getSelectedZipPath(req.params.id, randomUUID());
+    const { zipDirectory } = require('../services/zip.service');
+    await zipDirectory(outputsDir, zipPath, imagePaths);
+    return res.download(zipPath, `corrected-images-${req.params.id}.zip`, (err) => {
+      fs.rm(zipPath, { force: true }, () => {});
+      if (err) next(err);
+    });
   }
 
   const zipPath = jobService.getZipPath(req.params.id);
@@ -105,7 +124,8 @@ async function downloadSelectedZip(req, res, next) {
 
   const safeFilenames = filenames.map((name) => path.basename(name));
   const selectedPaths = [];
-  const allowed = new Set(job.results.filter((result) => result.downloadable !== false)
+  const allowed = new Set(job.results.filter((result) => result.downloadable !== false &&
+    (job.jobType === 'remarks-check' || result.status === 'ok'))
     .map((result) => result.outputFilename).filter(Boolean));
   const outputsDir = jobService.getOutputsDir(req.params.id);
   for (const name of safeFilenames) {
@@ -125,11 +145,7 @@ async function downloadSelectedZip(req, res, next) {
   const { ensureJobDirs } = require('../services/storage.service');
 
   await ensureJobDirs(req.params.id);
-  const archivePaths = [...selectedPaths];
-  for (const selected of selectedPaths) {
-    if (fs.existsSync(`${selected}.correction.json`)) archivePaths.push(`${selected}.correction.json`);
-  }
-  await zipDirectory(outputsDir, zipPath, archivePaths);
+  await zipDirectory(outputsDir, zipPath, selectedPaths);
 
   res.setHeader('X-Selected-Ready-Count', String(selectedPaths.length));
   res.setHeader('X-Selected-Requested-Count', String(safeFilenames.length));
